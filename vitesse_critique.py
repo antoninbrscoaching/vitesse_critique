@@ -7,84 +7,148 @@ import pandas as pd
 st.set_page_config(page_title="Calculateur VC", layout="wide")
 st.title("Calculateur de Vitesse Critique")
 
-# Entrées utilisateur
-st.header("Entrez vos performances")
-D1 = st.number_input("Distance 1 (m)", value=1460.0, min_value=1.0, step=10.0)
-T1 = st.number_input("Temps 1 (s)", value=360.0, min_value=1.0, step=10.0)
-D2 = st.number_input("Distance 2 (m)", value=2690.0, min_value=1.0, step=10.0)
-T2 = st.number_input("Temps 2 (s)", value=720.0, min_value=1.0, step=10.0)
+# --------------------------------------------------------
+# SECTION : Entrée des performances (2 à 6 tests)
+# --------------------------------------------------------
+st.header("Entrez vos performances terrain (2 à 6 tests)")
 
+performances = []
+
+# Deux tests minimum
+for i in range(1, 3):
+    st.subheader(f"Test {i}")
+    D = st.number_input(f"Distance {i} (m)", min_value=1.0, step=10.0, key=f"D{i}")
+    T = st.number_input(f"Temps {i} (s)", min_value=1.0, step=10.0, key=f"T{i}")
+    performances.append((D, T))
+
+# Possibilité d'ajouter jusqu'à 4 tests supplémentaires
+st.subheader("Tests supplémentaires")
+nb_extra = st.number_input("Nombre de tests en plus (0 à 4)", min_value=0, max_value=4, step=1)
+
+for i in range(3, 3 + nb_extra):
+    st.subheader(f"Test {i}")
+    D = st.number_input(f"Distance {i} (m)", min_value=1.0, step=10.0, key=f"D{i}")
+    T = st.number_input(f"Temps {i} (s)", min_value=1.0, step=10.0, key=f"T{i}")
+    performances.append((D, T))
+
+# --------------------------------------------------------
+# BOUTON
+# --------------------------------------------------------
 if st.button("Calculer VC"):
-    if T2 == T1:
-        st.error("Erreur : Temps 1 et Temps 2 sont identiques (division par zéro).")
-    elif D1 <= 0 or D2 <= 0 or T1 <= 0 or T2 <= 0:
-        st.error("Les distances et temps doivent être strictement positifs.")
-    else:
-        CS = (D2 - D1) / (T2 - T1)
-        D_prime = D1 - CS * T1
-        V_kmh = CS * 3.6
 
-        if V_kmh <= 0 or not math.isfinite(V_kmh):
-            st.error("Vitesse critique non calculable (vérifiez les données).")
+    # --------------------------------------------------------
+    # Vérification des données
+    # --------------------------------------------------------
+    if len(performances) < 2:
+        st.error("Veuillez entrer au moins deux tests.")
+        st.stop()
+
+    # --------------------------------------------------------
+    # EXTRACTION des deux points pour VC / D′
+    # --------------------------------------------------------
+    D1, T1 = performances[0]
+    D2, T2 = performances[1]
+
+    if T1 == T2:
+        st.error("Les deux premiers temps doivent être différents.")
+        st.stop()
+
+    # Calcul VC / D′
+    CS = (D2 - D1) / (T2 - T1)
+    D_prime = D1 - CS * T1
+    V_kmh = CS * 3.6
+
+    if V_kmh <= 0 or not math.isfinite(V_kmh):
+        st.error("Vitesse critique non calculable (données invalides).")
+        st.stop()
+
+    # --------------------------------------------------------
+    # Conversion des performances en liste pour le modèle log
+    # --------------------------------------------------------
+    # V = vitesse moyenne (m/s), T = temps (s)
+    V_list = []
+    T_list = []
+    for D, T in performances:
+        if D > 0 and T > 0:
+            V = D / T
+            V_list.append(V)
+            T_list.append(T)
+
+    if len(V_list) < 2:
+        st.error("Il faut au moins deux tests valides pour le modèle log.")
+        st.stop()
+
+    # --------------------------------------------------------
+    # RÉGRESSION LOG-LOG
+    # T = A * V^{-k}
+    # ln(T) = ln(A) - k ln(V)
+    # --------------------------------------------------------
+    X = np.log(1 / np.array(V_list))
+    Y = np.log(np.array(T_list))
+
+    k, lnA = np.polyfit(X, Y, 1)
+    A = np.exp(lnA)
+
+    # --------------------------------------------------------
+    # AFFICHAGE DES RÉSULTATS VC
+    # --------------------------------------------------------
+    min_per_km = 60.0 / V_kmh
+    total_seconds = int(round(min_per_km * 60.0))
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+
+    st.subheader("Résultats VC / D′")
+    st.write(f"Vitesse critique = {CS:.2f} m/s")
+    st.write(f"Vitesse critique = {V_kmh:.2f} km/h")
+    st.write(f"Vitesse critique = {minutes}:{seconds:02d} min/km  ({min_per_km:.2f} min/km)")
+    st.write(f"Capacité anaérobie (D′) = {D_prime:.2f} m")
+
+    # --------------------------------------------------------
+    # TABLEAU DES ALLURES (80% → 130%)
+    # --------------------------------------------------------
+    st.subheader("Temps limites et allures (modèle log & D′)")
+
+    pourcentages = list(range(80, 100, 2)) + list(range(102, 132, 2))
+    rows = []
+
+    for p in pourcentages:
+        v = V_kmh * (p / 100.0)  # km/h
+        v_ms = v / 3.6
+
+        # -------------------------
+        # Zone <100% → modèle log
+        # -------------------------
+        if p < 100:
+            Tlim = A * (v_ms ** (-k))
+
+        # -------------------------
+        # Zone >100% → modèle D′
+        # -------------------------
         else:
-            min_per_km = 60.0 / V_kmh
-            total_seconds = int(round(min_per_km * 60.0))
-            minutes = total_seconds // 60
-            seconds = total_seconds % 60
+            denom = v_ms - CS
+            if denom <= 0:
+                continue
+            Tlim = D_prime / denom
 
-            st.subheader("Résultats")
-            st.write(f"Vitesse critique = {CS:.2f} m/s")
-            st.write(f"Vitesse critique = {V_kmh:.2f} km/h")
-            st.write(f"Vitesse critique = {minutes}:{seconds:02d} min/km  ({min_per_km:.2f} min/km)")
-            st.write(f"Capacité anaérobie (D′) = {D_prime:.2f} m")
+        if Tlim > 0 and math.isfinite(Tlim):
+            # Format mm:ss
+            m = int(Tlim // 60)
+            s = int(Tlim % 60)
+            T_format = f"{m}:{s:02d}"
 
-            T_max = max(T1, T2) * 2.0
-            T_plot = np.linspace(max(5.0, T_max * 0.01), T_max, 500)
-            D_plot = CS * T_plot + D_prime * (1.0 - np.exp(-T_plot / 500.0))
-            V_plot = np.gradient(D_plot, T_plot) * 3.6
+            # Allure min/km
+            pace_min = 60 / v
+            total_pace_sec = int(round(pace_min * 60))
+            pm = total_pace_sec // 60
+            ps = total_pace_sec % 60
+            pace_format = f"{pm}:{ps:02d}"
 
-            fig, ax1 = plt.subplots(figsize=(9, 5))
-            ax1.plot(T_plot / 60.0, D_plot / 1000.0, label="Distance (km)", color="tab:blue")
-            ax1.scatter([T1 / 60.0, T2 / 60.0], [D1 / 1000.0, D2 / 1000.0],
-                        color="tab:green", label="Performances", zorder=5, s=40)
-            ax1.set_xlabel("Temps (min)")
-            ax1.set_ylabel("Distance (km)")
-            ax1.grid(True)
+            rows.append({
+                "% VC": f"{p}%",
+                "Temps limite (mm:ss)": T_format,
+                "Allure (min/km)": pace_format,
+                "Modèle": "Log" if p < 100 else "D′"
+            })
 
-            ax2 = ax1.twinx()
-            ax2.plot(T_plot / 60.0, V_plot, label="Vitesse (km/h)", color="tab:orange")
-            ax2.axhline(y=V_kmh, color="red", linestyle="--", label=f"VC = {V_kmh:.2f} km/h")
-            ax2.set_ylabel("Vitesse (km/h)")
-
-            lines, labels = ax1.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines + lines2, labels + labels2, loc="upper right")
-
-            st.pyplot(fig)
-
-            # Tableau des intensités
-            pourcentages = list(range(102, 132, 2))
-            rows = []
-            for p in pourcentages:
-                vitesse = V_kmh * (p / 100.0)
-                temps_limite = D_prime / ((vitesse / 3.6) - CS)
-                if temps_limite > 0 and math.isfinite(temps_limite):
-                    minutes_lim = int(temps_limite // 60)
-                    seconds_lim = int(temps_limite % 60)
-                    temps_format = f"{minutes_lim}:{seconds_lim:02d}"
-
-                    min_per_km = 60 / vitesse
-                    total_sec = int(round(min_per_km * 60))
-                    minutes_allure = total_sec // 60
-                    seconds_allure = total_sec % 60
-                    allure_format = f"{minutes_allure}:{seconds_allure:02d}"
-
-                    rows.append({
-                        "% VC": f"{p}%",
-                        "Temps limite (mm:ss)": temps_format,
-                        "Allure (min/km)": allure_format
-                    })
-
-            df = pd.DataFrame(rows)
-            st.subheader("Temps limites et allures selon intensité")
-            st.table(df)
+    df = pd.DataFrame(rows)
+    st.table(df)
