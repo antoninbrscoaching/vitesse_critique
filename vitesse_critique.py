@@ -68,16 +68,7 @@ st.markdown("""
 }
 .test-card h4 { margin: 0 0 8px 0; color: #1f77b4; font-size: 1rem; }
 .result-metric { text-align: center; font-size: 1.4rem; font-weight: 700; }
-.ic-badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 12px;
-    font-weight: 700;
-    font-size: 0.85rem;
-}
-.ic-good  { background: #d4edda; color: #155724; }
-.ic-mid   { background: #dce8fb; color: #1a4a8a; }
-.ic-bad   { background: #f8d7da; color: #721c24; }
+
 .sidebar-label {
     background: #e8f4fd;
     border-radius: 4px;
@@ -112,16 +103,7 @@ def param_help(text_up: str, text_down: str, note: str = ""):
     )
 
 
-def ic_badge(ic_val):
-    if ic_val is None:
-        return '<span class="ic-badge ic-mid">—</span>'
-    if ic_val >= 0.85:
-        cls, lbl = "ic-good", f"IC {ic_val:.2f} ✅ Bonne endurance"
-    elif ic_val >= 0.60:
-        cls, lbl = "ic-mid", f"IC {ic_val:.2f} ⚠️ Endurance moyenne"
-    else:
-        cls, lbl = "ic-bad", f"IC {ic_val:.2f} ❌ Endurance faible"
-    return f'<span class="ic-badge {cls}">{lbl}</span>'
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -765,12 +747,6 @@ def analyze_speed_kinetics(df: pd.DataFrame) -> dict:
             "slope":round(slope,5),"r_value":round(r,3)}
 
 
-def compute_index_cinetique(drift_short: float, drift_long: float) -> float | None:
-    if drift_short is None or drift_short == 0: return None
-    ic = 1.0 - (drift_long / drift_short)
-    return float(ic)
-
-
 # ══════════════════════════════════════════════════════════════
 # VITESSE CRITIQUE (VC)
 # ══════════════════════════════════════════════════════════════
@@ -783,37 +759,72 @@ def compute_vc(distances_m: list, durations_s: list):
     return float(slope), float(intercept), float(r**2)
 
 
-def fit_power_law(speeds_ms: list, hold_times_s: list):
-    v = np.array(speeds_ms, dtype=float)
-    t = np.array(hold_times_s, dtype=float)
-    mask = (v>0)&(t>0)
-    if mask.sum() < 2: return None, None, None
-    lv = np.log(v[mask]); lt = np.log(t[mask])
-    slope, intercept, r, p, _ = sp_stats.linregress(lv, lt)
-    k = -float(slope)
-    A = float(np.exp(intercept))
-    return A, k, float(r**2)
+def build_holding_table(vc_ms: float, d_prime: float,
+                        refs_fit: list, K_riegel: float) -> pd.DataFrame:
+    """
+    Table des temps de maintien :
+    - 80 % VC ≤ v < VC  : Riegel log-log calé sur les références
+                           T = a × (v×T/1000)^K  →  T = [a × (v/1000)^K]^(1/(1-K))
+    - v ≥ VC             : Modèle D'  →  T = D' / (v − VC)
+    """
+    if vc_ms is None or vc_ms <= 0:
+        return pd.DataFrame()
 
+    # Recalculer a et K depuis les refs
+    X, Y = [], []
+    for r in refs_fit:
+        d_m = float(r.get("distance", 0))
+        t_s = float(r.get("temps", 0))
+        if d_m > 0 and t_s > 0:
+            X.append(math.log(d_m / 1000.0))
+            Y.append(math.log(t_s))
+    if len(X) >= 2:
+        K_fit, loga, _, _, _ = sp_stats.linregress(X, Y)
+        K_fit = float(max(0.85, min(1.25, K_fit)))
+        a_fit = math.exp(float(loga))
+    elif len(X) == 1:
+        K_fit = float(K_riegel)
+        a_fit = math.exp(Y[0]) / math.exp(X[0])
+    else:
+        K_fit = float(K_riegel)
+        a_fit = 240.0
 
-def build_hybrid_holding_table(vc_ms, d_prime, A_pl, k_pl, speeds_range=None):
-    if speeds_range is None:
-        if vc_ms is None or vc_ms <= 0: return pd.DataFrame()
-        speeds_range = np.arange(max(0.5, vc_ms*0.4), vc_ms*2.5, vc_ms*0.05)
+    v_lo = vc_ms * 0.80
+    v_hi = vc_ms * 2.50
+    step = vc_ms * 0.04
+
     rows = []
-    for v in speeds_range:
-        pace = pace_str(1000.0/v) if v > 0 else "—"
-        if v < vc_ms and A_pl is not None and k_pl is not None:
-            t = A_pl * (v**(-k_pl))
-            modele = "Loi puissance"
-        elif v >= vc_ms and d_prime is not None and (v-vc_ms) > 0.01:
-            t = d_prime / (v - vc_ms)
-            modele = "Modèle D'"
+    v = v_lo
+    while v <= v_hi + 1e-6:
+        if v <= 0:
+            v += step; continue
+        pace = pace_str(1000.0 / v)
+        if v < vc_ms:
+            # Riegel : T^(1-K) = a × (v/1000)^K
+            if abs(1.0 - K_fit) < 1e-6:
+                v += step; continue
+            try:
+                t = (a_fit * (v / 1000.0) ** K_fit) ** (1.0 / (1.0 - K_fit))
+            except Exception:
+                v += step; continue
+            modele = "Riegel"
         else:
-            continue
-        t = max(0, min(t, 7200))
-        rows.append({"Vitesse (m/s)":round(v,2),"Allure (/km)":pace,
-                     "Temps de maintien":seconds_to_hms(t),"Durée (min)":round(t/60,1),
-                     "Modèle":modele})
+            if d_prime is not None and (v - vc_ms) > 0.01:
+                t = d_prime / (v - vc_ms)
+            else:
+                v += step; continue
+            modele = "Modèle D'"
+        t = max(0.0, min(t, 72000.0))
+        if t > 0:
+            rows.append({
+                "Vitesse (m/s)": round(v, 2),
+                "Allure (/km)":  pace,
+                "Temps de maintien": seconds_to_hms(t),
+                "Durée (min)":   round(t / 60.0, 1),
+                "Modèle":        modele,
+            })
+        v += step
+
     return pd.DataFrame(rows)
 
 
@@ -1496,7 +1507,10 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
                         objective_hms=temps_objectif if force_temps else None,
                         show_smooth_pace=show_smooth_pace,smooth_window_km=smooth_window_km,
                         dem_elevations=dem_elevations)
-                    st.session_state["res"]=res
+                    st.session_state["res"] = res
+                    # Partager les refs calibrées et K avec l'onglet VC
+                    st.session_state["refs_fit_vc"]  = res.get("refs_fit", [])
+                    st.session_state["K_riegel_vc"]  = res.get("K", 1.06)
                 except Exception as e:
                     import traceback; st.error(f"Erreur : {e}"); st.code(traceback.format_exc())
 
@@ -1589,7 +1603,6 @@ with main_tabs[1]:
 <div class="highlight-box">
 <strong>Principe :</strong> réalise 3 à 6 efforts à intensités variées (ex : 6 min, 12 min, 20 min, 30 min).
 La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut maintenir indéfiniment.
-L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs longue durée.
 </div>""", unsafe_allow_html=True)
 
     if not HAS_FITDECODE:
@@ -1752,53 +1765,42 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                     st.pyplot(fig_vc); plt.close(fig_vc)
 
                     st.markdown("---")
-                    st.subheader("📊 Index Cinétique (IC)")
-                    drifts = [(item["name"], item["hr"].get("drift_abs"), item["dur_s"])
-                               for item in loaded if item["hr"].get("available")]
-                    drifts.sort(key=lambda x: x[2])
-                    if len(drifts) >= 2:
-                        name_short, drift_short, dur_short = drifts[0]
-                        name_long,  drift_long,  dur_long  = drifts[-1]
-                        ic_val = compute_index_cinetique(drift_short, drift_long)
-                        ic1, ic2, ic3 = st.columns(3)
-                        ic1.metric(f"Dérive courte ({name_short})", f"+{drift_short:.1f} bpm" if drift_short else "—")
-                        ic2.metric(f"Dérive longue ({name_long})",  f"+{drift_long:.1f} bpm"  if drift_long  else "—")
-                        ic3.metric("Index Cinétique (IC)", f"{ic_val:.2f}" if ic_val else "—")
-                        st.markdown(ic_badge(ic_val), unsafe_allow_html=True)
-                    else:
-                        st.info("Besoin d'au moins 2 tests avec données FC pour calculer l'IC.")
-
-                    st.markdown("---")
-                    st.subheader("⚡ Loi de puissance (T = A × v⁻ᵏ)")
-                    speeds_for_pl = [item["dist_m"]/item["dur_s"]
-                                      for item in loaded if item["dist_m"] and item["dur_s"]>0]
-                    times_for_pl  = [item["dur_s"] for item in loaded if item["dist_m"] and item["dur_s"]>0]
-                    A_pl, k_pl, r2_pl = fit_power_law(speeds_for_pl, times_for_pl)
-                    if A_pl is not None:
-                        pl1,pl2,pl3 = st.columns(3)
-                        pl1.metric("Coefficient A", f"{A_pl:.1f}")
-                        pl2.metric("Exposant k", f"{k_pl:.3f}")
-                        pl3.metric("R² loi puissance", f"{r2_pl:.3f}")
-                        st.markdown("---")
-                        st.subheader("📋 Table de maintien hybride")
-                        df_hybrid = build_hybrid_holding_table(vc, d_prime, A_pl, k_pl)
-                        if not df_hybrid.empty:
-                            st.dataframe(df_hybrid, use_container_width=True)
-                            fig_hold, ax_hold = plt.subplots(figsize=(8,4))
-                            mask_pl = df_hybrid["Modèle"]=="Loi puissance"
-                            mask_dp = df_hybrid["Modèle"]=="Modèle D'"
-                            if mask_pl.any():
-                                ax_hold.plot(df_hybrid.loc[mask_pl,"Vitesse (m/s)"],
-                                             df_hybrid.loc[mask_pl,"Durée (min)"],
-                                             color="#1f77b4", lw=2.5, label="Loi de puissance (<VC)")
-                            if mask_dp.any():
-                                ax_hold.plot(df_hybrid.loc[mask_dp,"Vitesse (m/s)"],
-                                             df_hybrid.loc[mask_dp,"Durée (min)"],
-                                             color="#d62728", lw=2.5, ls="--", label="Modèle D' (>VC)")
-                            ax_hold.axvline(vc, color="gray", lw=1.5, ls=":", label=f"VC = {vc:.2f} m/s")
-                            ax_hold.set_xlabel("Vitesse (m/s)"); ax_hold.set_ylabel("Temps de maintien (min)")
-                            ax_hold.set_title("Courbe de tolérance"); ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
-                            st.pyplot(fig_hold); plt.close(fig_hold)
+                    st.subheader("📋 Table des temps de maintien")
+                    st.caption(
+                        "**80 % VC → VC** : modèle Riegel calé sur vos références. "
+                        "**Au-dessus de VC** : modèle D' (réserve anaérobie)."
+                    )
+                    # On a besoin des refs_fit issues de l'onglet Prédiction.
+                    # Si elles ne sont pas disponibles, on utilise les données des tests eux-mêmes.
+                    refs_for_table = st.session_state.get("refs_fit_vc", [])
+                    if not refs_for_table:
+                        # Construire des refs synthétiques depuis les tests chargés
+                        refs_for_table = [
+                            {"distance": item["dist_m"], "temps": item["dur_s"]}
+                            for item in loaded if item["dist_m"] and item["dur_s"] > 0
+                        ]
+                    K_for_table = st.session_state.get("K_riegel_vc", 1.06)
+                    df_hold = build_holding_table(vc, d_prime, refs_for_table, K_for_table)
+                    if not df_hold.empty:
+                        st.dataframe(df_hold, use_container_width=True)
+                        fig_hold, ax_hold = plt.subplots(figsize=(9, 4))
+                        mask_ri = df_hold["Modèle"] == "Riegel"
+                        mask_dp = df_hold["Modèle"] == "Modèle D'"
+                        if mask_ri.any():
+                            ax_hold.plot(df_hold.loc[mask_ri, "Vitesse (m/s)"],
+                                         df_hold.loc[mask_ri, "Durée (min)"],
+                                         color="#1f77b4", lw=2.5, label="Riegel (80%–100% VC)")
+                        if mask_dp.any():
+                            ax_hold.plot(df_hold.loc[mask_dp, "Vitesse (m/s)"],
+                                         df_hold.loc[mask_dp, "Durée (min)"],
+                                         color="#d62728", lw=2.5, ls="--", label="Modèle D' (>VC)")
+                        ax_hold.axvline(vc, color="gray", lw=1.5, ls=":",
+                                        label=f"VC = {vc:.2f} m/s ({pace_str(1000/vc)}/km)")
+                        ax_hold.set_xlabel("Vitesse (m/s)")
+                        ax_hold.set_ylabel("Temps de maintien (min)")
+                        ax_hold.set_title("Courbe de tolérance par vitesse")
+                        ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
+                        st.pyplot(fig_hold); plt.close(fig_hold)
 
                     st.markdown("---")
                     st.subheader("📄 Export PDF")
@@ -1811,14 +1813,14 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                                          label=f"VC = {vc:.2f} m/s | D' = {d_prime:.0f} m")
                             axes[0].set_xlabel("Durée (min)"); axes[0].set_ylabel("Distance (km)")
                             axes[0].set_title("Modèle Vitesse Critique"); axes[0].legend(); axes[0].grid(alpha=0.3)
-                            if not df_hybrid.empty:
-                                if mask_pl.any():
-                                    axes[1].plot(df_hybrid.loc[mask_pl,"Vitesse (m/s)"],
-                                                 df_hybrid.loc[mask_pl,"Durée (min)"],
-                                                 color="#1f77b4", lw=2, label="Loi puissance")
+                            if not df_hold.empty:
+                                if mask_ri.any():
+                                    axes[1].plot(df_hold.loc[mask_ri, "Vitesse (m/s)"],
+                                                 df_hold.loc[mask_ri, "Durée (min)"],
+                                                 color="#1f77b4", lw=2, label="Riegel")
                                 if mask_dp.any():
-                                    axes[1].plot(df_hybrid.loc[mask_dp,"Vitesse (m/s)"],
-                                                 df_hybrid.loc[mask_dp,"Durée (min)"],
+                                    axes[1].plot(df_hold.loc[mask_dp, "Vitesse (m/s)"],
+                                                 df_hold.loc[mask_dp, "Durée (min)"],
                                                  color="#d62728", lw=2, ls="--", label="Modèle D'")
                                 axes[1].axvline(vc, color="gray", lw=1.5, ls=":")
                                 axes[1].set_xlabel("Vitesse (m/s)"); axes[1].set_ylabel("Durée (min)")
@@ -1828,7 +1830,7 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                                 df_act = item["df"]
                                 if "heart_rate" not in df_act.columns or not df_act["heart_rate"].notna().any():
                                     continue
-                                fig_fc, ax_fc = plt.subplots(figsize=(8.27,4))
+                                fig_fc, ax_fc = plt.subplots(figsize=(8.27, 4))
                                 hr_s = smooth_hr(df_act["heart_rate"].ffill(), window=15)
                                 ax_fc.plot(df_act["elapsed_s"]/60.0, hr_s, color="#d62728", lw=1.5)
                                 ax_fc.set_xlabel("Temps (min)"); ax_fc.set_ylabel("FC (bpm)")
@@ -1953,11 +1955,11 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
 
                     drift = hr_stats["drift_abs"]
                     if drift < 5:
-                        st.success(f"✅ Dérive faible (+{drift:.1f} bpm) — endurance solide.")
+                        st.success(f"✅ Dérive faible (+{drift:.1f} bpm).")
                     elif drift < 12:
-                        st.warning(f"⚠️ Dérive modérée (+{drift:.1f} bpm) — fatigue en cours d'accumulation.")
+                        st.warning(f"⚠️ Dérive modérée (+{drift:.1f} bpm).")
                     else:
-                        st.error(f"❌ Dérive élevée (+{drift:.1f} bpm) — effort trop intense ou endurance insuffisante.")
+                        st.error(f"❌ Dérive élevée (+{drift:.1f} bpm).")
 
                 # ── Cinétique de vitesse ──
                 if show_speed:
