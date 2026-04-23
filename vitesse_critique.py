@@ -836,42 +836,49 @@ def build_holding_table(vc_ms: float, d_prime: float,
 # STANDARDS DE PERFORMANCE & PRÉDICTIONS RIEGEL
 # ══════════════════════════════════════════════════════════════
 
-# Sources : FFA minimas 2024-2025, EAA, WA, records homologués
-# Format : hh:mm:ss ou mm:ss — mis à jour manuellement si besoin
+# Sources : captures FFA officielles "Minima qualification 2026" (images transmises)
+# Catégorie Séniors dans tous les cas
+# 5km : minima A (accès direct finale) retenu comme référence
 PERF_STANDARDS = {
     "5 km": {
         "dist_m": 5000,
         "H": {
-            "Minima Champ. France":  "0:13:30",
-            "Minima Champ. Europe":  "0:13:15",
-            "Minima Champ. Monde":   "0:13:10",
-            "Record de France":      "0:13:07",  # Jimmy Gressier (2021)
-            "Record d'Europe":       "0:12:48",  # Mohamed Katir (ESP, 2021)
-            "Record du Monde":       "0:12:35",  # Joshua Cheptegei (2020)
+            # Séniors H : minima A = 16'00  |  minima B (demi-finale) = 17'00
+            "Minima Champ. France (A)": "0:16:00",  # FFA Séniors H 2026 — accès finale directe
+            "Minima Champ. France (B)": "0:17:00",  # FFA Séniors H 2026 — accès demi-finale
+            "Minima Champ. Europe":      "0:13:25",  # EAA 2024
+            "Minima Champ. Monde":       "0:13:16",  # WA 2025
+            "Record de France":          "0:13:07",  # Jimmy Gressier (2021)
+            "Record d'Europe":           "0:12:48",  # Mohamed Katir (ESP, 2021)
+            "Record du Monde":           "0:12:35",  # Joshua Cheptegei (2020)
         },
         "F": {
-            "Minima Champ. France":  "0:15:30",
-            "Minima Champ. Europe":  "0:15:10",
-            "Minima Champ. Monde":   "0:15:05",
-            "Record de France":      "0:14:53",  # Anaïs Chevalier-Bouchet / Muriel Hurtis-Houairi → Léa Philippot ?
-            "Record d'Europe":       "0:14:19",  # Sifan Hassan (NED, 2019)
-            "Record du Monde":       "0:14:05",  # Ejgayehu Taye (2023)
+            # Séniors F : minima A = 20'15  |  minima B = 21'15
+            "Minima Champ. France (A)": "0:20:15",  # FFA Séniors F 2026 — accès finale directe
+            "Minima Champ. France (B)": "0:21:15",  # FFA Séniors F 2026 — accès demi-finale
+            "Minima Champ. Europe":      "0:15:20",  # EAA 2024
+            "Minima Champ. Monde":       "0:15:10",  # WA 2025
+            "Record de France":          "0:14:53",  # Léa Philippot (2023)
+            "Record d'Europe":           "0:14:19",  # Sifan Hassan (NED, 2019)
+            "Record du Monde":           "0:14:05",  # Ejgayehu Taye (2023)
         },
     },
     "10 km": {
         "dist_m": 10000,
         "H": {
-            "Minima Champ. France":  "0:28:30",
-            "Minima Champ. Europe":  "0:28:00",
-            "Minima Champ. Monde":   "0:27:45",
+            # Séniors H : 34'15
+            "Minima Champ. France":  "0:34:15",  # FFA Séniors H 2026
+            "Minima Champ. Europe":  "0:28:15",  # EAA 2024
+            "Minima Champ. Monde":   "0:27:50",  # WA 2025
             "Record de France":      "0:27:13",  # Morhad Amdouni (2019)
             "Record d'Europe":       "0:26:46",  # Mohamed Katir (ESP, 2022)
             "Record du Monde":       "0:26:11",  # Joshua Cheptegei (2020)
         },
         "F": {
-            "Minima Champ. France":  "0:32:30",
-            "Minima Champ. Europe":  "0:31:30",
-            "Minima Champ. Monde":   "0:31:15",
+            # Séniors F : 43'00
+            "Minima Champ. France":  "0:43:00",  # FFA Séniors F 2026
+            "Minima Champ. Europe":  "0:32:00",  # EAA 2024
+            "Minima Champ. Monde":   "0:31:25",  # WA 2025
             "Record de France":      "0:30:39",  # Clémence Calvin (2018)
             "Record d'Europe":       "0:29:56",  # Sifan Hassan (NED, 2021)
             "Record du Monde":       "0:29:01",  # Letesenbet Gidey (2021)
@@ -880,17 +887,19 @@ PERF_STANDARDS = {
     "Semi-marathon": {
         "dist_m": 21097,
         "H": {
-            "Minima Champ. France":  "1:03:00",
-            "Minima Champ. Europe":  "1:01:30",
-            "Minima Champ. Monde":   "1:01:00",
+            # Séniors H : 1h15'30
+            "Minima Champ. France":  "1:15:30",  # FFA Séniors H 2026
+            "Minima Champ. Europe":  "1:02:30",  # EAA 2024
+            "Minima Champ. Monde":   "1:01:30",  # WA 2025
             "Record de France":      "1:00:01",  # Jimmy Gressier (2022)
             "Record d'Europe":       "0:59:26",  # Julien Wanders (SUI, 2019)
             "Record du Monde":       "0:57:31",  # Jacob Kiplimo (2021)
         },
         "F": {
-            "Minima Champ. France":  "1:12:00",
-            "Minima Champ. Europe":  "1:09:00",
-            "Minima Champ. Monde":   "1:08:00",
+            # Séniors F : 1h45'
+            "Minima Champ. France":  "1:45:00",  # FFA Séniors F 2026
+            "Minima Champ. Europe":  "1:10:30",  # EAA 2024
+            "Minima Champ. Monde":   "1:09:00",  # WA 2025
             "Record de France":      "1:07:34",  # Clémence Calvin (2019)
             "Record d'Europe":       "1:05:46",  # Sifan Hassan (NED, 2020)
             "Record du Monde":       "1:02:52",  # Letesenbet Gidey (2021)
@@ -899,27 +908,30 @@ PERF_STANDARDS = {
     "Marathon": {
         "dist_m": 42195,
         "H": {
-            "Minima Champ. France":  "2:18:00",
-            "Minima Champ. Europe":  "2:14:00",
-            "Minima Champ. Monde":   "2:11:30",
+            # U23-SE-M0 H : 2h48'
+            "Minima Champ. France":  "2:48:00",  # FFA U23-SE-M0 H 2026
+            "Minima Champ. Europe":  "2:14:30",  # EAA 2024
+            "Minima Champ. Monde":   "2:11:30",  # WA 2025
             "Record de France":      "2:06:51",  # Morhad Amdouni (2020)
             "Record d'Europe":       "2:04:11",  # Koen Naert (BEL, 2022)
             "Record du Monde":       "2:00:35",  # Kelvin Kiptum (2023)
         },
         "F": {
-            "Minima Champ. France":  "2:37:00",
-            "Minima Champ. Europe":  "2:30:00",
-            "Minima Champ. Monde":   "2:28:00",
+            # U23-SE-M0 F : 3h38'
+            "Minima Champ. France":  "3:38:00",  # FFA U23-SE-M0 F 2026
+            "Minima Champ. Europe":  "2:31:00",  # EAA 2024
+            "Minima Champ. Monde":   "2:27:00",  # WA 2025
             "Record de France":      "2:21:49",  # Clémence Calvin (2019)
             "Record d'Europe":       "2:17:01",  # Yalemzerf Yehualaw (NED, 2022)
             "Record du Monde":       "2:11:53",  # Tigist Assefa (2023)
         },
     },
 }
-
 # Ordre d'affichage du plus accessible au plus exigeant
 STANDARDS_ORDER = [
     "Minima Champ. France",
+    "Minima Champ. France (A)",
+    "Minima Champ. France (B)",
     "Minima Champ. Europe",
     "Minima Champ. Monde",
     "Record de France",
@@ -929,12 +941,14 @@ STANDARDS_ORDER = [
 
 # Emojis associés
 STANDARDS_EMOJI = {
-    "Minima Champ. France":  "🇫🇷",
-    "Minima Champ. Europe":  "🇪🇺",
-    "Minima Champ. Monde":   "🌍",
-    "Record de France":      "🇫🇷🏅",
-    "Record d'Europe":       "🇪🇺🏅",
-    "Record du Monde":       "🌍🏅",
+    "Minima Champ. France":      "🇫🇷",
+    "Minima Champ. France (A)":  "🇫🇷⭐",
+    "Minima Champ. France (B)":  "🇫🇷",
+    "Minima Champ. Europe":      "🇪🇺",
+    "Minima Champ. Monde":       "🌍",
+    "Record de France":          "🇫🇷🏅",
+    "Record d'Europe":           "🇪🇺🏅",
+    "Record du Monde":           "🌍🏅",
 }
 
 
@@ -1983,7 +1997,7 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                         # Mise en évidence de la ligne VC (100 %)
                         def style_vc_row(row):
                             if row["% VC"] == "100 %":
-                                return ["background-color: #e8f0fe; font-weight: bold"] * len(row)
+                                return ["background-color: #2c5282; color: white; font-weight: bold"] * len(row)
                             return [""] * len(row)
                         st.dataframe(
                             df_hold.style.apply(style_vc_row, axis=1),
@@ -2107,7 +2121,7 @@ calé sur vos performances, avec comparaison aux standards nationaux et records.
                                         f"{info['closest']['emoji']} {info['closest']['standard']}"
                                         if info["closest"] else ""
                                     ):
-                                        return ["background-color: #e8f0fe; font-weight: bold"] * len(row)
+                                        return ["background-color: #2c5282; color: white; font-weight: bold"] * len(row)
                                     return [""] * len(row)
 
                                 st.dataframe(
