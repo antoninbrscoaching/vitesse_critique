@@ -1663,7 +1663,13 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                 st.warning(f"Test {i+1} ({name}) : données vides après troncature de la plage.")
                 continue
             dur_s = float(df_act["elapsed_s"].max())
-            dist_m = float(df_act["distance_m"].max()) if df_act["distance_m"].notna().any() else None
+            if df_act["distance_m"].notna().any():
+                d_valid = df_act["distance_m"].dropna()
+                dist_m = float(d_valid.iloc[-1] - d_valid.iloc[0])
+                if dist_m <= 0:
+                    dist_m = float(d_valid.max() - d_valid.min())
+            else:
+                dist_m = None
             hr_stats  = analyze_heart_rate(df_act)
             spd_stats = analyze_speed_kinetics(df_act)
             loaded.append({"name":name,"idx":i,"df":df_act,"dur_s":dur_s,
@@ -1893,7 +1899,13 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
                 st.error("Après troncature, il ne reste plus de données. Réduisez les marges.")
             else:
                 dur_s  = float(df_entr["elapsed_s"].max())
-                dist_m = float(df_entr["distance_m"].max()) if df_entr["distance_m"].notna().any() else None
+                if df_entr["distance_m"].notna().any():
+                    d_valid_e = df_entr["distance_m"].dropna()
+                    dist_m = float(d_valid_e.iloc[-1] - d_valid_e.iloc[0])
+                    if dist_m <= 0:
+                        dist_m = float(d_valid_e.max() - d_valid_e.min())
+                else:
+                    dist_m = None
 
                 st.subheader("📊 Vue d'ensemble")
                 mg1,mg2,mg3,mg4 = st.columns(4)
