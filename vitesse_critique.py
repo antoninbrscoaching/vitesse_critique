@@ -750,8 +750,173 @@ def analyze_speed_kinetics(df: pd.DataFrame) -> dict:
 # ══════════════════════════════════════════════════════════════
 # VITESSE CRITIQUE (VC)
 # ══════════════════════════════════════════════════════════════
+# PARSEUR MASQUE ZONE X (Pairfs) + DÉTECTION SV1/SV2
+# ══════════════════════════════════════════════════════════════
 
-def compute_vc(distances_m: list, durations_s: list):
+def parse_zonex_csv(file) -> pd.DataFrame | None:
+    """
+    Charge un CSV exporté par l'app Zone X de Pairfs.
+    Colonnes attendues : timestamp, VIn, VE, rhythm, VE/breath,
+                         eqCO2, VCO2, FeCO2, HR, Power, Cadence,
+                         Event, aux1 (=eqO2=VE/VO2), aux2 (=VE brut mL/min)
+    Retourne un DataFrame enrichi avec VO2, RQ, eqO2 et numéro de palier.
+    """
+    try:
+        file.seek(0)
+        df = pd.read_csv(file)
+        df.columns = [c.strip() for c in df.columns]
+
+        # Normaliser les noms de colonnes (robustesse aux variantes)
+        renames = {}
+        for c in df.columns:
+            cl = c.lower().replace(" ", "").replace("(", "").replace(")", "")
+            if cl.startswith("vin"):            renames[c] = "VIn"
+            elif cl.startswith("vel/min") or cl == "vel/min": renames[c] = "VE"
+            elif "vel/breath" in cl:            renames[c] = "VE_per_breath"
+            elif cl == "velmin" or cl == "vel": renames[c] = "VE"
+            elif cl == "rhythm":                renames[c] = "RR"
+            elif cl == "eqco2":                 renames[c] = "eqCO2"
+            elif cl == "vco2":                  renames[c] = "VCO2"
+            elif cl == "feco2":                 renames[c] = "FeCO2"
+            elif cl == "hr":                    renames[c] = "HR"
+            elif cl == "power":                 renames[c] = "Power"
+            elif cl == "cadence":               renames[c] = "Cadence"
+            elif cl == "event":                 renames[c] = "palier"
+            elif cl == "aux1":                  renames[c] = "eqO2_raw"
+            elif cl == "aux2":                  renames[c] = "aux2"
+        df.rename(columns=renames, inplace=True)
+
+        # Détecter la colonne VE si renommée différemment
+        if "VE" not in df.columns:
+            for c in df.columns:
+                if "VE" in c and "L/min" in c:
+                    df.rename(columns={c: "VE"}, inplace=True)
+                    break
+
+        required = ["timestamp", "VE", "VCO2", "eqO2_raw", "HR", "palier"]
+        missing = [r for r in required if r not in df.columns]
+        if missing:
+            return None
+
+        # Temps relatif
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        df["elapsed_s"] = df["timestamp"] - df["timestamp"].iloc[0]
+        df["elapsed_min"] = df["elapsed_s"] / 60.0
+
+        # Forcer numérique
+        for col in ["VE", "VCO2", "eqO2_raw", "HR", "Cadence", "FeCO2", "eqCO2"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # VO2 = VE / eqO2  (eqO2 = VE/VO2 → VO2 = VE/eqO2)
+        df["VO2_Lmin"] = df["VE"] / df["eqO2_raw"].replace(0, np.nan)
+        # QR = VCO2 / VO2
+        df["RQ"] = df["VCO2"] / df["VO2_Lmin"].replace(0, np.nan)
+        df["eqO2"] = df["eqO2_raw"]
+
+        df["palier"] = pd.to_numeric(df["palier"], errors="coerce").fillna(0).astype(int)
+        return df
+
+    except Exception as e:
+        return None
+
+
+def aggregate_by_palier(df: pd.DataFrame) -> pd.DataFrame:
+    """Moyenne par palier des variables clés."""
+    cols = ["elapsed_min", "HR", "VE", "VO2_Lmin", "VCO2", "RQ", "eqO2", "eqCO2", "Cadence"]
+    cols = [c for c in cols if c in df.columns]
+    agg = df.groupby("palier")[cols].mean().reset_index()
+    agg = agg[agg["palier"] > 0].sort_values("palier")
+    return agg
+
+
+def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
+    """
+    Détecte SV1 et SV2 à partir des données agrégées par palier.
+
+    SV1 (premier seuil ventilatoire) :
+      Méthode combinée :
+      1. Premier palier où le RQ dépasse 0.85 durablement
+      2. eqO2 commence à monter alors que eqCO2 est encore stable ou baisse
+      → Point le plus précoce des deux critères
+
+    SV2 (deuxième seuil ventilatoire / anaérobie) :
+      1. Premier palier où RQ ≥ 1.00
+      2. eqCO2 commence à monter (tampon bicarbonate épuisé)
+      → Point le plus précoce des deux critères
+
+    Retourne un dict avec les paliers, FC et métriques aux seuils.
+    """
+    result = {"sv1": None, "sv2": None}
+    if df_pal.empty or len(df_pal) < 3:
+        return result
+
+    pals = df_pal.sort_values("palier").reset_index(drop=True)
+    n = len(pals)
+
+    # ── SV1 ──────────────────────────────────────────────────
+    sv1_idx = None
+
+    # Critère 1 : RQ > 0.85 sur ≥2 paliers consécutifs
+    for i in range(n - 1):
+        if pals.loc[i, "RQ"] >= 0.85 and pals.loc[i+1, "RQ"] >= 0.85:
+            sv1_idx = i
+            break
+
+    # Critère 2 : eqO2 monte alors que eqCO2 est stable/descend
+    # (nadir de eqCO2 pas encore atteint)
+    if "eqCO2" in pals.columns:
+        for i in range(1, n - 1):
+            deqo2  = pals.loc[i, "eqO2"]  - pals.loc[i-1, "eqO2"]
+            deqco2 = pals.loc[i, "eqCO2"] - pals.loc[i-1, "eqCO2"]
+            if deqo2 > 0.5 and deqco2 <= 0.3:
+                vent_sv1 = i
+                if sv1_idx is None or vent_sv1 < sv1_idx:
+                    sv1_idx = vent_sv1
+                break
+
+    # ── SV2 ──────────────────────────────────────────────────
+    sv2_idx = None
+
+    # Critère 1 : RQ ≥ 1.00 pour la première fois
+    for i in range(n):
+        if pals.loc[i, "RQ"] >= 1.00:
+            sv2_idx = i
+            break
+
+    # Critère 2 : eqCO2 monte durablement (après son nadir)
+    if "eqCO2" in pals.columns and sv2_idx is not None:
+        # Chercher le nadir de eqCO2 AVANT sv2_idx
+        nadir_idx = pals.loc[:sv2_idx, "eqCO2"].idxmin()
+        for i in range(nadir_idx + 1, n - 1):
+            deqco2 = pals.loc[i, "eqCO2"] - pals.loc[i-1, "eqCO2"]
+            if deqco2 > 0.3:
+                vent_sv2 = i
+                sv2_idx = min(sv2_idx, vent_sv2)
+                break
+
+    # ── Résultats ──────────────────────────────────────────────
+    for key, idx in [("sv1", sv1_idx), ("sv2", sv2_idx)]:
+        if idx is not None and 0 <= idx < n:
+            row = pals.iloc[idx]
+            result[key] = {
+                "palier":    int(row["palier"]),
+                "t_min":     round(float(row["elapsed_min"]), 1),
+                "HR":        round(float(row["HR"])),
+                "VO2":       round(float(row.get("VO2_Lmin", 0)), 3),
+                "VCO2":      round(float(row.get("VCO2", 0)), 3),
+                "RQ":        round(float(row["RQ"]), 3),
+                "eqO2":      round(float(row["eqO2"]), 1),
+                "eqCO2":     round(float(row.get("eqCO2", 0)), 1),
+                "VE":        round(float(row["VE"]), 1),
+                "Cadence":   round(float(row.get("Cadence", 0)), 2),
+            }
+
+    return result
+
+
+
     T = np.array(durations_s, dtype=float)
     D = np.array(distances_m, dtype=float)
     if len(T) < 2: return None, None, None
@@ -1978,6 +2143,139 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     ax_vc.set_title("Modèle D = VC × T + D'"); ax_vc.legend(); ax_vc.grid(alpha=0.3)
                     st.pyplot(fig_vc); plt.close(fig_vc)
 
+                    # ── Seuils physiologiques ──────────────────────────────────────────
+                    st.markdown("---")
+                    st.subheader("📊 Seuils physiologiques (SV1 & SV2)")
+
+                    col_sv1, col_sv2 = st.columns(2)
+                    with col_sv1:
+                        sv1_input = hms_input(
+                            "🟢 SV1 — allure (mm:ss/km)",
+                            default="0:05:00", key="sv1_pace_input",
+                            help="Premier seuil ventilatoire — allure de footing rapide, conversation encore possible"
+                        )
+                    with col_sv2:
+                        sv2_input = hms_input(
+                            "🔴 SV2 — allure (mm:ss/km)",
+                            default="0:04:00", key="sv2_pace_input",
+                            help="Deuxième seuil ventilatoire — allure maximale tenable ~30-60 min"
+                        )
+
+                    sv1_pace_s = hms_to_seconds(sv1_input)
+                    sv2_pace_s = hms_to_seconds(sv2_input)
+                    sv1_ms = (1000.0 / sv1_pace_s) if sv1_pace_s > 0 else None
+                    sv2_ms = (1000.0 / sv2_pace_s) if sv2_pace_s > 0 else None
+
+                    if sv1_ms and sv2_ms and sv1_ms > 0 and sv2_ms > 0 and sv1_ms < sv2_ms:
+
+                        # ── Métriques principales ──
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("🟢 SV1",
+                                  pace_str(1000/sv1_ms) + "/km",
+                                  delta=f"{sv1_ms/vc*100:.1f}% de VC")
+                        m2.metric("🔴 SV2",
+                                  pace_str(1000/sv2_ms) + "/km",
+                                  delta=f"{sv2_ms/vc*100:.1f}% de VC")
+                        m3.metric("🔵 VC",
+                                  pace_str(1000/vc) + "/km",
+                                  delta="100% VC — référence")
+
+                        ecart_sv1_sv2_pct = (sv2_ms - sv1_ms) / sv1_ms * 100
+                        ecart_sv2_vc_pct  = (vc - sv2_ms) / sv2_ms * 100
+                        m4.metric("Écart SV1→SV2",
+                                  f"+{ecart_sv1_sv2_pct:.1f}%",
+                                  delta=f"SV2→VC : +{ecart_sv2_vc_pct:.1f}%")
+
+                        # ── Analyse et conseil ──
+                        st.markdown("#### 📋 Analyse")
+
+                        sv1_pct_vc = sv1_ms / vc * 100
+                        sv2_pct_vc = sv2_ms / vc * 100
+
+                        # Largeur de la zone aérobie (entre SV1 et SV2)
+                        zone_aerob_pct = sv2_pct_vc - sv1_pct_vc
+
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            st.markdown(f"""
+| Indicateur | Valeur |
+|---|---|
+| SV1 / VC | **{sv1_pct_vc:.1f} %** |
+| SV2 / VC | **{sv2_pct_vc:.1f} %** |
+| Zone aérobie (SV1→SV2) | **{zone_aerob_pct:.1f} points de % VC** |
+| Écart SV1→SV2 | **+{ecart_sv1_sv2_pct:.1f} %** |
+| Écart SV2→VC | **+{ecart_sv2_vc_pct:.1f} %** |
+""")
+
+                        with col_b:
+                            # Conseil prioritaire
+                            if sv1_pct_vc < 65:
+                                conseil = ("🟢 **SV1 bas** (< 65% VC) — priorité à l'**endurance fondamentale** : "
+                                           "volume à basse intensité (Z2) pour repousser SV1 vers le haut.")
+                                couleur = "success"
+                            elif sv2_pct_vc < 85:
+                                conseil = ("🔴 **SV2 bas** (< 85% VC) — priorité au travail au **seuil** : "
+                                           "tempo, allure marathon, séances à SV2 pour rapprocher SV2 de VC.")
+                                couleur = "warning"
+                            elif ecart_sv2_vc_pct > 15:
+                                conseil = ("🔵 **Bon profil aérobie** — SV2 proche de VC. "
+                                           "Priorité à la **VC elle-même** : intervalles longs (8-15 min à VC) "
+                                           "pour repousser la limite supérieure.")
+                                couleur = "info"
+                            else:
+                                conseil = ("✅ **Profil équilibré** — SV1, SV2 et VC bien répartis. "
+                                           "Travail polyvalent : maintenir l'endurance (Z2) et "
+                                           "entretenir le seuil (Z4).")
+                                couleur = "success"
+
+                            if couleur == "success":
+                                st.success(conseil)
+                            elif couleur == "warning":
+                                st.warning(conseil)
+                            else:
+                                st.info(conseil)
+
+                        # ── Représentation graphique ──
+                        fig_sv, ax_sv = plt.subplots(figsize=(9, 2.5))
+
+                        zones_def = [
+                            ("Z1 Récup",        0.0,        sv1_ms*0.85, "#81c784"),
+                            ("Z2 EF",           sv1_ms*0.85, sv1_ms,     "#aed581"),
+                            ("Z3 Tempo",        sv1_ms,     sv2_ms,      "#ffb74d"),
+                            ("Z4 Seuil",        sv2_ms,     vc,          "#ef5350"),
+                            ("Z5 >VC",          vc,         vc * 1.15,   "#ab47bc"),
+                        ]
+                        for (label, v_lo, v_hi, color) in zones_def:
+                            if v_hi <= v_lo: continue
+                            ax_sv.barh(0, v_hi - v_lo, left=v_lo, height=0.5,
+                                       color=color, alpha=0.85)
+                            ax_sv.text((v_lo+v_hi)/2, 0, label,
+                                       ha="center", va="center", fontsize=7.5,
+                                       color="white", fontweight="bold")
+
+                        # Marqueurs SV1, SV2, VC
+                        for v_mark, lbl, col_m in [
+                            (sv1_ms, f"SV1 {pace_str(1000/sv1_ms)}/km {sv1_pct_vc:.0f}%VC", "#2e7d32"),
+                            (sv2_ms, f"SV2 {pace_str(1000/sv2_ms)}/km {sv2_pct_vc:.0f}%VC", "#b71c1c"),
+                            (vc,     f"VC {pace_str(1000/vc)}/km 100%",                       "#4a148c"),
+                        ]:
+                            ax_sv.axvline(v_mark, color=col_m, lw=2)
+                            ax_sv.text(v_mark, 0.32, lbl, ha="center",
+                                       fontsize=7, color=col_m, fontweight="bold",
+                                       va="bottom")
+
+                        ax_sv.set_xlabel("Vitesse (m/s)")
+                        ax_sv.set_yticks([])
+                        ax_sv.set_xlim(sv1_ms * 0.75, vc * 1.20)
+                        ax_sv.set_title("Positionnement SV1 / SV2 / VC")
+                        ax_sv.grid(axis="x", alpha=0.3)
+                        fig_sv.tight_layout()
+                        st.pyplot(fig_sv); plt.close(fig_sv)
+
+                    elif sv1_ms and sv2_ms and sv1_ms >= sv2_ms:
+                        st.warning("⚠️ SV1 doit être inférieur à SV2 (allure SV1 plus lente = plus de secondes/km).")
+                    else:
+                        st.info("Entrez vos allures SV1 et SV2 pour voir l'analyse.")
                     st.markdown("---")
                     st.subheader("📋 Table des temps de maintien")
                     st.caption(
