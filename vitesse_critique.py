@@ -790,8 +790,8 @@ def build_holding_table(vc_ms: float, d_prime: float,
         K_fit = float(K_riegel)
         a_fit = 240.0
 
-    # Paliers fixes de 80 % à 120 % par pas de 4 %
-    pct_steps = [pct / 100.0 for pct in range(80, 121, 4)]
+    # Paliers fixes de 80 % à 120 % par pas de 2 %
+    pct_steps = [pct / 100.0 for pct in range(80, 121, 2)]
 
     rows = []
     for pct in pct_steps:
@@ -1773,7 +1773,7 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     st.caption(
                         "**80 % → 100 % VC** : modèle Riegel calé sur vos références. "
                         "**100 % → 120 % VC** : modèle D' (réserve anaérobie). "
-                        "Paliers de 4 % de VC."
+                        "Paliers de 2 % de VC."
                     )
                     refs_for_table = st.session_state.get("refs_fit_vc", [])
                     if not refs_for_table:
