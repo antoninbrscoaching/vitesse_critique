@@ -51,11 +51,12 @@ st.markdown("""
 .param-up   { color: #d62728; font-weight: 600; }
 .param-down { color: #2ca02c; font-weight: 600; }
 .highlight-box {
-    background: #fff3cd;
-    border: 1px solid #ffc107;
+    background: #e8f0fe;
+    border: 1px solid #6c8ebf;
     border-radius: 6px;
     padding: 12px 16px;
     margin: 8px 0;
+    color: #1a3a5c;
 }
 .test-card {
     background: #ffffff;
@@ -75,7 +76,7 @@ st.markdown("""
     font-size: 0.85rem;
 }
 .ic-good  { background: #d4edda; color: #155724; }
-.ic-mid   { background: #fff3cd; color: #856404; }
+.ic-mid   { background: #dce8fb; color: #1a4a8a; }
 .ic-bad   { background: #f8d7da; color: #721c24; }
 .sidebar-label {
     background: #e8f4fd;
@@ -1600,34 +1601,50 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
 
     st.info(f"**{n_tests} tests** à charger. Conseil : mélanger des efforts courts (6 min) et longs (20-30 min).")
 
-    test_files = []; test_names = []; test_durations = []
+    # test_ranges : liste de (start_s, end_s) ou (None, None) si pas de plage
+    test_files = []; test_names = []; test_ranges = []
 
     for i in range(int(n_tests)):
         with st.expander(f"📁 Test {i+1}", expanded=(i<2)):
-            c_name, c_file, c_dur = st.columns([2,3,2])
+            c_name, c_file = st.columns([2, 3])
             with c_name:
                 t_name = st.text_input("Nom du test", value=f"Test {i+1}", key=f"tname_{i}")
             with c_file:
                 t_file = st.file_uploader("Fichier activité", type=["fit","gpx","tcx","csv"], key=f"tfile_{i}")
-            with c_dur:
-                force_dur = st.checkbox("Durée imposée", key=f"fdur_{i}",
-                                         help="Cocher si le test avait une durée fixe (ex: 6 min maxi)")
-                if force_dur:
-                    # ── Durée imposée au format hh:mm:ss ──
-                    t_dur_hms = hms_input("Durée du test", "0:20:00", key=f"tdur_hms_{i}",
-                                           help="Durée fixe du test (hh:mm:ss)")
-                    t_dur_s = float(hms_to_seconds(t_dur_hms)) if validate_hms(t_dur_hms) else None
-                else:
-                    t_dur_s = None
+
+            # ── Plage de temps hh:mm:ss (optionnelle) ──
+            use_range = st.checkbox("Délimiter une plage de temps dans le fichier",
+                                     key=f"frange_{i}",
+                                     help="Utile si le fichier contient l'échauffement ou la récupération")
+            if use_range:
+                cr1, cr2 = st.columns(2)
+                with cr1:
+                    t_start_hms = hms_input("Début de l'effort", "0:00:00",
+                                             key=f"tstart_hms_{i}",
+                                             help="Temps relatif depuis le début du fichier (hh:mm:ss)")
+                with cr2:
+                    t_end_hms = hms_input("Fin de l'effort", "0:20:00",
+                                           key=f"tend_hms_{i}",
+                                           help="Temps relatif depuis le début du fichier (hh:mm:ss)")
+                t_start_s = float(hms_to_seconds(t_start_hms)) if validate_hms(t_start_hms) else 0.0
+                t_end_s   = float(hms_to_seconds(t_end_hms))   if validate_hms(t_end_hms)   else None
+                if t_end_s is not None and t_end_s <= t_start_s:
+                    st.warning("⚠️ La fin doit être postérieure au début.")
+                    t_start_s, t_end_s = None, None
+                st.caption(f"→ Plage sélectionnée : **{t_start_hms}** → **{t_end_hms}** "
+                           f"({seconds_to_hms(t_end_s - t_start_s) if t_end_s else '—'} d'effort)")
+            else:
+                t_start_s, t_end_s = None, None
+
             test_files.append(t_file)
             test_names.append(t_name)
-            test_durations.append(t_dur_s)
+            test_ranges.append((t_start_s, t_end_s))
 
     st.markdown("---")
 
     if st.button("🔍 Analyser tous les tests", type="primary", key="btn_analyze_vc"):
         loaded = []
-        for i, (f, name, imposed_dur) in enumerate(zip(test_files, test_names, test_durations)):
+        for i, (f, name, (rng_start, rng_end)) in enumerate(zip(test_files, test_names, test_ranges)):
             if f is None:
                 st.warning(f"Test {i+1} ({name}) : aucun fichier chargé — ignoré.")
                 continue
@@ -1635,10 +1652,15 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
             if df_act is None or df_act.empty:
                 st.warning(f"Test {i+1} ({name}) : impossible de lire le fichier.")
                 continue
-            if imposed_dur is not None:
-                df_act = df_act[df_act["elapsed_s"] <= imposed_dur].copy()
+            # Appliquer la plage de temps si définie
+            if rng_start is not None or rng_end is not None:
+                t0_act = float(df_act["elapsed_s"].min())
+                t_lo = (rng_start if rng_start is not None else t0_act)
+                t_hi = (rng_end   if rng_end   is not None else float(df_act["elapsed_s"].max()))
+                df_act = df_act[(df_act["elapsed_s"] >= t_lo) & (df_act["elapsed_s"] <= t_hi)].copy()
+                df_act["elapsed_s"] = df_act["elapsed_s"] - t_lo
             if df_act.empty:
-                st.warning(f"Test {i+1} ({name}) : données vides après troncature.")
+                st.warning(f"Test {i+1} ({name}) : données vides après troncature de la plage.")
                 continue
             dur_s = float(df_act["elapsed_s"].max())
             dist_m = float(df_act["distance_m"].max()) if df_act["distance_m"].notna().any() else None
