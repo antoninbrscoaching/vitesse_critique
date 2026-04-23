@@ -1,8 +1,8 @@
-# analyse_course_v3_merged.py
+# analyse_course_v4.py
 # Application Streamlit unifiée — 3 onglets
 #   [0] 🏃 Prédiction de course (v3)
 #   [1] 🧪 Tests d'endurance + Vitesse Critique
-#   [2] ⚙️  Analyse entraînement
+#   [2] ⚙️  Analyse entraînement (avec analyse fractionnés)
 #
 # pip install streamlit gpxpy fitparse fitdecode pandas numpy pydeck matplotlib requests scipy
 
@@ -40,7 +40,6 @@ TZ_NAME_DEFAULT = "Europe/Paris"
 # ══════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-/* Boîtes pédagogiques (⬆️/⬇️) */
 .param-box {
     background: #f8f9fa;
     border-left: 4px solid #1f77b4;
@@ -51,8 +50,6 @@ st.markdown("""
 }
 .param-up   { color: #d62728; font-weight: 600; }
 .param-down { color: #2ca02c; font-weight: 600; }
-
-/* Encadré highlight jaune */
 .highlight-box {
     background: #fff3cd;
     border: 1px solid #ffc107;
@@ -60,8 +57,6 @@ st.markdown("""
     padding: 12px 16px;
     margin: 8px 0;
 }
-
-/* Carte de test (onglet Tests) */
 .test-card {
     background: #ffffff;
     border: 1px solid #dee2e6;
@@ -71,15 +66,7 @@ st.markdown("""
     box-shadow: 0 1px 3px rgba(0,0,0,0.07);
 }
 .test-card h4 { margin: 0 0 8px 0; color: #1f77b4; font-size: 1rem; }
-
-/* Métriques résultat */
-.result-metric {
-    text-align: center;
-    font-size: 1.4rem;
-    font-weight: 700;
-}
-
-/* Badge IC */
+.result-metric { text-align: center; font-size: 1.4rem; font-weight: 700; }
 .ic-badge {
     display: inline-block;
     padding: 2px 10px;
@@ -90,8 +77,6 @@ st.markdown("""
 .ic-good  { background: #d4edda; color: #155724; }
 .ic-mid   { background: #fff3cd; color: #856404; }
 .ic-bad   { background: #f8d7da; color: #721c24; }
-
-/* Sidebar label */
 .sidebar-label {
     background: #e8f4fd;
     border-radius: 4px;
@@ -99,6 +84,13 @@ st.markdown("""
     font-size: 0.80rem;
     color: #1f77b4;
     margin-bottom: 10px;
+}
+.interval-card {
+    background: #f0f4ff;
+    border: 1px solid #b0c4de;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -151,6 +143,7 @@ def safe_float(val, default=0.0):
 
 
 def hms_to_seconds(hms: str) -> int:
+    """Convertit hh:mm:ss, mm:ss ou ss en secondes entières."""
     if hms is None: return 0
     try:
         parts = [int(p) for p in str(hms).strip().split(":")]
@@ -165,12 +158,44 @@ def hms_to_seconds(hms: str) -> int:
 
 
 def seconds_to_hms(s: float) -> str:
+    """Convertit des secondes en hh:mm:ss."""
     s = int(round(s))
     return f"{s//3600}:{(s%3600)//60:02d}:{s%60:02d}"
 
 
 def hms_to_timedelta(hms: str) -> timedelta:
     return timedelta(seconds=hms_to_seconds(hms))
+
+
+def validate_hms(val: str) -> bool:
+    """Retourne True si le format hh:mm:ss / mm:ss est valide."""
+    try:
+        parts = [int(p) for p in val.strip().split(":")]
+        if len(parts) == 3:
+            return 0 <= parts[1] <= 59 and 0 <= parts[2] <= 59
+        if len(parts) == 2:
+            return 0 <= parts[0] <= 59 and 0 <= parts[1] <= 59
+        return False
+    except Exception:
+        return False
+
+
+def hms_input(label: str, default: str = "0:00:00", key: str = None,
+              help: str = None, compact: bool = False) -> str:
+    """
+    Champ de saisie d'un temps au format hh:mm:ss.
+    Retourne la valeur saisie (chaîne). Affiche un avertissement si format invalide.
+    """
+    val = st.text_input(
+        label,
+        value=str(st.session_state.get(key, default)) if key else default,
+        key=key,
+        help=help or "Format : hh:mm:ss  (ex: 1:23:45)",
+        placeholder="hh:mm:ss",
+    )
+    if val and not validate_hms(val):
+        st.warning(f"⚠️ Format invalide : **{val}** — attendu hh:mm:ss (ex: 0:45:00)")
+    return val
 
 
 def pace_str(secs_per_km: float) -> str:
@@ -584,7 +609,6 @@ def load_activity(file):
     fname = file.name.lower()
     df = None
 
-    # ── FIT via fitdecode ──
     if fname.endswith(".fit"):
         if not HAS_FITDECODE:
             st.error("Installez 'fitdecode' : pip install fitdecode"); return None
@@ -599,8 +623,8 @@ def load_activity(file):
                     except: return default
                 ts   = fv("timestamp")
                 hr   = fv("heart_rate")
-                spd  = fv("speed")          # m/s
-                dist = fv("distance")       # m
+                spd  = fv("speed")
+                dist = fv("distance")
                 alt  = fv("enhanced_altitude") or fv("altitude")
                 if ts is None: continue
                 rows.append({"timestamp": ts, "heart_rate": hr,
@@ -612,12 +636,10 @@ def load_activity(file):
         t0 = df["timestamp"].iloc[0]
         df["elapsed_s"] = (df["timestamp"] - t0).dt.total_seconds()
 
-    # ── GPX ──
     elif fname.endswith(".gpx"):
         file.seek(0)
         gpx = gpxpy.parse(file)
         rows = []
-        t0 = None
         for track in gpx.tracks:
             for seg in track.segments:
                 for pt in seg.points:
@@ -631,7 +653,6 @@ def load_activity(file):
         df = df.sort_values("timestamp").reset_index(drop=True)
         t0 = df["timestamp"].iloc[0]
         df["elapsed_s"] = (df["timestamp"]-t0).dt.total_seconds()
-        # compute distance cumulée
         lats = []
         file.seek(0)
         gpx2 = gpxpy.parse(file)
@@ -644,7 +665,6 @@ def load_activity(file):
             cumd.append(cumd[-1]+haversine_m(lats[i-1][0],lats[i-1][1],lats[i][0],lats[i][1]))
         df["distance_m"] = cumd[:len(df)]
 
-    # ── TCX ──
     elif fname.endswith(".tcx"):
         file.seek(0); root = ET.parse(file).getroot()
         ns = {"tcx":"http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
@@ -669,7 +689,6 @@ def load_activity(file):
         t0 = df["timestamp"].iloc[0]
         df["elapsed_s"] = (df["timestamp"]-t0).dt.total_seconds()
 
-    # ── CSV ──
     elif fname.endswith(".csv"):
         file.seek(0); df = pd.read_csv(file)
         df.columns = [c.lower().strip() for c in df.columns]
@@ -685,7 +704,6 @@ def load_activity(file):
 
     if df is None: return None
 
-    # Harmoniser types
     for col in ["heart_rate","speed_ms","distance_m","altitude_m","elapsed_s"]:
         if col not in df.columns: df[col] = None
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -695,11 +713,10 @@ def load_activity(file):
 
 
 # ══════════════════════════════════════════════════════════════
-# ANALYSE FC + CINÉTIQUE (onglets Tests + Entraînement)
+# ANALYSE FC + CINÉTIQUE
 # ══════════════════════════════════════════════════════════════
 
 def smooth_hr(series: pd.Series, window: int = None) -> pd.Series:
-    """Lissage FC adaptatif (fenêtre auto si None)."""
     n = len(series)
     if n < 5: return series
     if window is None: window = max(3, n//20)
@@ -708,7 +725,6 @@ def smooth_hr(series: pd.Series, window: int = None) -> pd.Series:
 
 
 def analyze_heart_rate(df: pd.DataFrame) -> dict:
-    """Stats FC + dérive linéaire sur la durée."""
     col = "heart_rate"
     if col not in df.columns: return {}
     hr = df[col].dropna()
@@ -719,14 +735,12 @@ def analyze_heart_rate(df: pd.DataFrame) -> dict:
     fc_max = float(np.percentile(arr, 95))
     fc_avg = float(np.mean(arr))
     fc_min = float(np.percentile(arr, 5))
-    # Dérive Q1/Q3
     q1, q3 = int(n*0.25), int(n*0.75)
     drift_abs = float(np.mean(arr[q3:])) - float(np.mean(arr[:q1]))
     drift_pct = drift_abs/max(1.0,float(np.mean(arr[:q1])))*100.0
-    # Tendance linéaire
     x = np.arange(n, dtype=float)
     slope, intercept, r, p, _ = sp_stats.linregress(x, arr)
-    trend_bpm_per_min = slope * 60.0  # si 1 point/sec
+    trend_bpm_per_min = slope * 60.0
     reliability = ("haute" if abs(drift_abs)<5 else
                    "moyenne" if abs(drift_abs)<12 else "basse (dérive élevée)")
     return {"available":True,"fc_max":round(fc_max),"fc_avg":round(fc_avg,1),
@@ -737,7 +751,6 @@ def analyze_heart_rate(df: pd.DataFrame) -> dict:
 
 
 def analyze_speed_kinetics(df: pd.DataFrame) -> dict:
-    """Dérive de la vitesse sur la durée (tendance linéaire)."""
     col = "speed_ms"
     if col not in df.columns: return {}
     spd = df[col].dropna()
@@ -752,41 +765,24 @@ def analyze_speed_kinetics(df: pd.DataFrame) -> dict:
 
 
 def compute_index_cinetique(drift_short: float, drift_long: float) -> float | None:
-    """
-    IC = 1 - (dérive_longue / dérive_courte)
-    IC proche de 1 → endurance solide (la longue durée ne dégrade pas plus la FC)
-    IC < 0.6       → dérive élevée sur longue durée → endurance à travailler
-    """
     if drift_short is None or drift_short == 0: return None
     ic = 1.0 - (drift_long / drift_short)
     return float(ic)
 
 
 # ══════════════════════════════════════════════════════════════
-# VITESSE CRITIQUE (VC) + LOI DE PUISSANCE
+# VITESSE CRITIQUE (VC)
 # ══════════════════════════════════════════════════════════════
 
 def compute_vc(distances_m: list, durations_s: list):
-    """
-    Régression linéaire D = VC * T + D'
-    Retourne (VC en m/s, D' en m, R²)
-    """
     T = np.array(durations_s, dtype=float)
     D = np.array(distances_m, dtype=float)
     if len(T) < 2: return None, None, None
     slope, intercept, r, p, se = sp_stats.linregress(T, D)
-    vc = float(slope)       # m/s
-    d_prime = float(intercept)  # m
-    r2 = float(r**2)
-    return vc, d_prime, r2
+    return float(slope), float(intercept), float(r**2)
 
 
 def fit_power_law(speeds_ms: list, hold_times_s: list):
-    """
-    Loi de puissance : T = A * v^(-k)
-    → log(T) = log(A) - k*log(v)
-    Retourne (A, k, R²)
-    """
     v = np.array(speeds_ms, dtype=float)
     t = np.array(hold_times_s, dtype=float)
     mask = (v>0)&(t>0)
@@ -799,11 +795,6 @@ def fit_power_law(speeds_ms: list, hold_times_s: list):
 
 
 def build_hybrid_holding_table(vc_ms, d_prime, A_pl, k_pl, speeds_range=None):
-    """
-    Table des temps de maintien hybride :
-    - Au-dessous de VC : Loi de Puissance  T = A * v^(-k)
-    - Au-dessus de VC  : Modèle D'          T = D' / (v - VC)
-    """
     if speeds_range is None:
         if vc_ms is None or vc_ms <= 0: return pd.DataFrame()
         speeds_range = np.arange(max(0.5, vc_ms*0.4), vc_ms*2.5, vc_ms*0.05)
@@ -1118,12 +1109,51 @@ def run_prediction(
 
 
 # ══════════════════════════════════════════════════════════════
+# ANALYSE FRACTIONNÉ
+# ══════════════════════════════════════════════════════════════
+
+def extract_interval_df(df: pd.DataFrame, start_hms: str, end_hms: str) -> pd.DataFrame:
+    """Extrait un sous-DataFrame entre start_hms et end_hms (relatif au début de l'activité)."""
+    t_start = float(hms_to_seconds(start_hms))
+    t_end   = float(hms_to_seconds(end_hms))
+    if t_end <= t_start:
+        return pd.DataFrame()
+    sub = df[(df["elapsed_s"] >= t_start) & (df["elapsed_s"] <= t_end)].copy()
+    sub["elapsed_s"] = sub["elapsed_s"] - t_start
+    return sub.reset_index(drop=True)
+
+
+def analyze_interval(df_int: pd.DataFrame, name: str) -> dict:
+    """Calcule les stats clés d'un intervalle."""
+    if df_int.empty:
+        return {"name": name, "valid": False}
+    dur_s = float(df_int["elapsed_s"].max())
+    dist_m = None
+    if "distance_m" in df_int.columns and df_int["distance_m"].notna().any():
+        d0 = df_int["distance_m"].dropna().iloc[0]
+        d1 = df_int["distance_m"].dropna().iloc[-1]
+        dist_m = float(d1 - d0) if d1 > d0 else float(df_int["distance_m"].dropna().max() - df_int["distance_m"].dropna().min())
+    hr_stats  = analyze_heart_rate(df_int)
+    spd_stats = analyze_speed_kinetics(df_int)
+    avg_speed = None
+    if dist_m and dur_s > 0:
+        avg_speed = dist_m / dur_s
+    return {
+        "name": name,
+        "valid": True,
+        "dur_s": dur_s,
+        "dist_m": dist_m,
+        "avg_speed": avg_speed,
+        "hr": hr_stats,
+        "spd": spd_stats,
+        "df": df_int,
+    }
+
+
 # ══════════════════════════════════════════════════════════════
 # UI PRINCIPALE
 # ══════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
 
-# ── Sidebar (coefficients utilisés par onglets 2 et 3) ──
 with st.sidebar:
     st.markdown('<div class="sidebar-label">⚙️ Paramètres — onglets Tests & Entraînement</div>',
                 unsafe_allow_html=True)
@@ -1135,15 +1165,15 @@ with st.sidebar:
     sb_k_temp_cold = st.number_input("Sensibilité froid",    value=0.0012, step=0.0002, format="%.4f", key="sb_ktc")
     st.caption("Ces paramètres n'affectent que les onglets 🧪 et ⚙️")
 
-# ── Onglets principaux ──
 main_tabs = st.tabs(["🏃 Prédiction de course", "🧪 Tests d'endurance + VC", "⚙️ Analyse entraînement"])
 
+
 # ══════════════════════════════════════════════════════════════
-# ONGLET 0 — PRÉDICTION DE COURSE (v3 complet)
+# ONGLET 0 — PRÉDICTION DE COURSE (v3)
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v3 — WBGT · Minetti · DEM · Recalibration · Interface pédagogique")
+    st.caption("v4 — WBGT · Minetti · DEM · Recalibration · Saisie hh:mm:ss")
 
     col_mode1, col_mode2 = st.columns([2,3])
     with col_mode1:
@@ -1152,7 +1182,6 @@ with main_tabs[0]:
                         horizontal=True, key="pred_mode")
     EXPERT = "Expert" in mode
 
-    # ── Section 1 — GPX ──
     st.markdown("---")
     st.header("1️⃣  Parcours GPX")
     gpx_file = st.file_uploader("📂 Importer le GPX de la course cible", type=["gpx"], key="gpx_main")
@@ -1172,7 +1201,7 @@ with main_tabs[0]:
             c3.metric("D- GPS",f"{ddn_tmp:.0f} m")
             c4.metric("Alt. moy.",f"{avg_alt_tmp:.0f} m")
 
-    with st.expander("🏔️ Correction altimétrique DEM (optionnel — recommandé en montagne)"):
+    with st.expander("🏔️ Correction altimétrique DEM (optionnel)"):
         st.info("Le GPS vertical a une précision de ±5-15 m. Le DEM donne l'altitude réelle à ±1 m.")
         use_dem = st.checkbox("Activer la correction DEM", value=False, key="use_dem")
         dem_dataset = "srtm30m"
@@ -1189,7 +1218,6 @@ with main_tabs[0]:
         if "dem_elevations" in st.session_state:
             dem_elevations = st.session_state["dem_elevations"]
 
-    # ── Section 2 — Références ──
     st.markdown("---")
     st.header("2️⃣  Courses de référence")
     st.info("Calibrent le modèle sur l'athlète. Minimum conseillé : **3 références** variées (5 km, semi, marathon…).")
@@ -1209,7 +1237,8 @@ with main_tabs[0]:
             use_file = st.checkbox(f"Importer depuis fichier FIT/TCX", key=f"use_file_{i}")
             c1,c2,c3,c4 = st.columns(4)
             dist  = c1.number_input("Distance (m)", value=float(st.session_state.get(f"dist_{i}",5000*i)), key=f"dist_{i}")
-            temps = c2.text_input("Temps (h:mm:ss)", value=str(st.session_state.get(f"temps_{i}","0:40:00")), key=f"temps_{i}")
+            # ── Temps au format hh:mm:ss ──
+            temps = hms_input("Temps (hh:mm:ss)", default="0:40:00", key=f"temps_{i}")
             dup   = c3.number_input("D+ (m)", value=float(st.session_state.get(f"dup_{i}",0.0)), key=f"dup_{i}")
             ddn   = c4.number_input("D- (m)", value=float(st.session_state.get(f"ddn_{i}",0.0)), key=f"ddn_{i}")
             file_in = st.file_uploader(f"Fichier FIT/TCX", type=["fit","tcx"], key=f"fileref_{i}") if use_file else None
@@ -1232,9 +1261,10 @@ with main_tabs[0]:
                         dist,dup,ddn=tcx_data["distance"],tcx_data["D_up"],tcx_data["D_down"]
                         dur_hms_file=tcx_data["duration_hms"]
                         avg_temp_ref,avg_wind_ref,avg_hum_ref=tcx_data["avg_temp"],tcx_data["avg_wind"],tcx_data["avg_humidity"]
+                # ── Segment hh:mm:ss ──
                 cs,ce=st.columns(2)
-                sh=cs.text_input("Début segment (hh:mm:ss)","00:00:00",key=f"start_{i}")
-                eh=ce.text_input("Fin segment (hh:mm:ss)","23:59:59",key=f"end_{i}")
+                sh = hms_input("Début segment", "0:00:00", key=f"start_{i}", compact=True)
+                eh = hms_input("Fin segment",   "23:59:59", key=f"end_{i}",   compact=True)
                 start_td,end_td=hms_to_timedelta(sh),hms_to_timedelta(eh)
                 if start_td.total_seconds()>0 or end_td.total_seconds()<86399:
                     pts_src=None
@@ -1278,47 +1308,32 @@ with main_tabs[0]:
                               "avg_temp":avg_temp_ref,"avg_humidity":avg_hum_ref,"avg_wind":avg_wind_ref,
                               "hr_analysis":hr_ref})
 
-    # ── Section 3 — Recalibration ──
     st.markdown("---")
     st.header("3️⃣  Recalibration des références vers les conditions idéales")
     st.markdown("""
 <div class="highlight-box">
 <strong>Pourquoi recalibrer ?</strong><br>
 Une course réalisée par 30°C et 80% d'humidité vaut <em>physiologiquement mieux</em>
-qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-estime la performance.<br><br>
-La recalibration <em>restitue</em> chaque référence à ce qu'aurait été le résultat
-dans des conditions parfaites (plat, température optimale) avant de construire le modèle.
+qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-estime la performance.
 </div>""", unsafe_allow_html=True)
 
     use_recalibrated = st.checkbox(
         "✅ Recalibrer les références vers les conditions idéales (fortement recommandé)", value=True)
-    if use_recalibrated:
-        st.success("Les références seront normalisées avant le fit.")
-    else:
-        st.warning("Références brutes utilisées — peut sous-estimer la performance si conditions difficiles.")
 
-    # Defaults (overridden inside expander)
     opt_temp=12.0; use_wbgt=True; elev_ref_power=0.60; temp_ref_power=0.85
     with st.expander("⚙️ Paramètres de recalibration"):
         opt_temp = st.slider("Température optimale de course (°C)", 5.0, 20.0, 12.0, 0.5)
-        param_help("Athlète avantagé par des températures plus basses",
-                   "Optimal à des températures plus élevées", "12°C = valeur standard")
         use_wbgt = st.checkbox("Utiliser le WBGT (chaleur+humidité) — recommandé", value=True)
         col_ep1,col_ep2 = st.columns(2)
         with col_ep1:
             elev_ref_power = st.slider("Force correction pente des références", 0.0, 1.0, 0.60, 0.05)
-            param_help("Correction pente plus agressive sur refs en montagne",
-                       "Correction plus prudente", "0.5-0.7 recommandé")
         with col_ep2:
             temp_ref_power = st.slider("Force correction température des références", 0.0, 1.0, 0.85, 0.05)
-            param_help("Ref par 30°C fortement améliorée","Météo moins d'influence","0.8-0.9 recommandé")
 
-    # Tableau récap recalibration
     st.subheader("📋 Résumé de la recalibration")
     _k_up_prev=st.session_state.get("k_up_val",12.0); _k_down_prev=st.session_state.get("k_down_val",5.0)
     _g0u_prev=st.session_state.get("g0_up_val",3.0); _g0d_prev=st.session_state.get("g0_down_val",2.5)
-    calib_rows=[]
-    cold_quad=0.0012; hot_quad=0.0016; temp_max_penalty=0.10
+    calib_rows=[]; cold_quad=0.0012; hot_quad=0.0016; temp_max_penalty=0.10
     for r in refs_raw:
         t_brut=hms_to_seconds(r.get("duration_hms_file") or r.get("temps",""))
         dist_km=safe_float(r.get("distance",1.0))/1000.0
@@ -1343,7 +1358,6 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
                             "Gain correction":f"-{seconds_to_hms(gain_s)}" if gain_s>0 else (f"+{seconds_to_hms(-gain_s)}" if gain_s<0 else "0")})
     st.dataframe(pd.DataFrame(calib_rows), use_container_width=True)
 
-    # ── Section 4 — Paramètres modèle ──
     st.markdown("---")
     st.header("4️⃣  Paramètres du modèle")
 
@@ -1355,64 +1369,42 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
             hot_quad =c2.number_input("Sensibilité chaleur",value=0.0016,step=0.0002,format="%.4f")
             temp_max_penalty=st.slider("Pénalité max température (%)",0.00,0.20,0.10,0.01)
             temp_power=st.slider("Damping température (puissance)",0.2,1.2,1.0,0.05)
-        if use_wbgt:
-            st.markdown("**Aperçu WBGT**")
-            ex_t=st.slider("Température (°C)",-5,40,20,1,key="demo_temp")
-            ex_h=st.slider("Humidité (%)",10,100,60,5,key="demo_hum")
-            ex_wbgt=wbgt_simplified(ex_t,ex_h)
-            ex_mult=temp_multiplier(ex_wbgt,opt_temp,cold_quad,hot_quad,temp_max_penalty)
-            pen_pct=(ex_mult-1.0)*100.0
-            cd1,cd2,cd3=st.columns(3)
-            cd1.metric("WBGT",f"{ex_wbgt:.1f}°C")
-            cd2.metric("Multiplicateur",f"{ex_mult:.3f}")
-            cd3.metric("Pénalité",f"+{pen_pct:.1f}%" if pen_pct>0 else f"{pen_pct:.1f}%")
 
     with st.expander("🏔️ Altitude physiologique (hypoxie)"):
-        apply_altitude=st.checkbox("Appliquer la pénalité d'altitude (VO2 réduite au-dessus de 1500 m)",value=True)
+        apply_altitude=st.checkbox("Appliquer la pénalité d'altitude",value=True)
         altitude_ref_m=0.0
         if apply_altitude:
-            altitude_ref_m=st.number_input("Altitude d'entraînement habituelle de l'athlète (m)",value=0.0,step=100.0)
-            param_help("Réduction pénalité (athlète acclimaté)","Pénalité maximale",
-                       "~1% de pénalité par 100 m au-dessus de max(1500m, altitude_ref)")
-            if points and len(points)>0:
-                avg_alt_gx=np.mean([getattr(p,"elevation",0.0) or 0.0 for p in points])
-                alt_mult_preview=altitude_vo2_multiplier(avg_alt_gx,altitude_ref_m)
-                st.caption(f"→ Alt. moy. parcours : {avg_alt_gx:.0f} m | Mult. prévu : **{alt_mult_preview:.3f}** ({(alt_mult_preview-1)*100:.1f}%)")
+            altitude_ref_m=st.number_input("Altitude d'entraînement habituelle (m)",value=0.0,step=100.0)
 
     with st.expander("🎢 Modèle de pente"):
         apply_grade=st.checkbox("Prendre en compte la pente",value=True)
-        use_minetti=st.checkbox("Modèle Minetti (Minetti et al. 2002 — base physiologique)",value=True)
+        use_minetti=st.checkbox("Modèle Minetti",value=True)
         minetti_weight=0.6; elev_smooth_window=11; grade_power=0.85
         k_up=12.0; k_down=5.0; down_cap=-0.08; g0_up=3.0; g0_down=2.5; max_up=0.30; max_down=-0.06
         if use_minetti:
-            minetti_weight=st.slider("Part de Minetti dans le calcul",0.0,1.0,0.6,0.1)
-            param_help("Modèle physiologique — mieux pour pentes extrêmes",
-                       "Modèle heuristique — plus souple à régler","0.6 = bon compromis")
+            minetti_weight=st.slider("Part de Minetti",0.0,1.0,0.6,0.1)
         if EXPERT:
             elev_smooth_window=st.slider("Lissage altitude (fenêtre pts GPS)",1,51,11,2)
-            grade_power=st.slider("Amortissement effet pente (puissance)",0.2,1.0,0.85,0.05)
+            grade_power=st.slider("Amortissement effet pente",0.2,1.0,0.85,0.05)
             c1,c2,c3=st.columns(3)
-            k_up  =c1.number_input("Sensibilité montée (k_up)",  value=12.0,step=0.5)
-            k_down=c2.number_input("Sensibilité descente (k_down)",value=5.0,step=0.5)
-            down_cap=c3.number_input("Cap bonus descente",value=-0.08,step=0.01,format="%.2f")
+            k_up  =c1.number_input("k_up",  value=12.0,step=0.5)
+            k_down=c2.number_input("k_down",value=5.0,step=0.5)
+            down_cap=c3.number_input("Cap descente",value=-0.08,step=0.01,format="%.2f")
             st.session_state["k_up_val"]=k_up; st.session_state["k_down_val"]=k_down
-            st.session_state["g0_up_val"]=g0_up; st.session_state["g0_down_val"]=g0_down
 
     with st.expander("💨 Vent"):
         apply_wind=st.checkbox("Appliquer l'effet du vent",value=True)
         wind_mode="Lissé"; wind_smooth_km=5
         drag_coeff=0.012; tail_credit=0.35; wind_cap_head=0.10; wind_cap_tail=-0.04; wind_power=1.0
         wind_gate_g1=2.0; wind_gate_g2=8.0; wind_gate_min=0.25
-        if apply_wind:
-            st.info("Vent de face ralentit davantage qu'un vent de dos n'accélère. En montée, effet réduit automatiquement.")
-            if EXPERT:
-                wind_mode=st.selectbox("Mode calcul vent",["Lissé","Global"],key="wmode").split()[0]
-                wind_smooth_km=st.slider("Lissage vent (km)",1,11,5,2)
-                c1,c2=st.columns(2)
-                drag_coeff =c1.number_input("Coeff. aérodynamique",value=0.012,step=0.002,format="%.3f")
-                tail_credit=c2.slider("Crédit vent arrière",0.0,0.8,0.35,0.05)
-                wind_cap_head=st.slider("Pénalité max vent face (%)",0.00,0.20,0.10,0.01)
-                wind_cap_tail=st.slider("Gain max vent dos (%)",-0.10,0.00,-0.04,0.01)
+        if apply_wind and EXPERT:
+            wind_mode=st.selectbox("Mode calcul vent",["Lissé","Global"],key="wmode").split()[0]
+            wind_smooth_km=st.slider("Lissage vent (km)",1,11,5,2)
+            c1,c2=st.columns(2)
+            drag_coeff =c1.number_input("Coeff. aérodynamique",value=0.012,step=0.002,format="%.3f")
+            tail_credit=c2.slider("Crédit vent arrière",0.0,0.8,0.35,0.05)
+            wind_cap_head=st.slider("Pénalité max vent face (%)",0.00,0.20,0.10,0.01)
+            wind_cap_tail=st.slider("Gain max vent dos (%)",-0.10,0.00,-0.04,0.01)
 
     base_cap=0.08; extra_per_pct=0.004; max_cap=0.18
     if EXPERT:
@@ -1423,16 +1415,14 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
             max_cap=c3.slider("Plafond absolu (%)",0.05,0.40,0.18,0.01)
 
     with st.expander("🔋 Fatigue en course"):
-        st.markdown("Modélise le ralentissement progressif de l'athlète (D+ cumulé + distance).")
         apply_fatigue=st.checkbox("Activer la fatigue",value=False)
         fatigue_rate=0.0; fatigue_mode="mixte"
         if apply_fatigue:
             fatigue_rate=st.slider("Ralentissement total fin de course (%)",0.0,30.0,8.0,0.5)
-            param_help("Fin de course nettement plus lente (marathon/ultra)","Athlète gère bien son allure","8-12% marathon | 15-25% ultra")
             fatigue_mode=st.selectbox("Type de fatigue",["mixte (recommandé)","distance (plat)","d_plus (montagne)"]).split()[0]
 
     with st.expander("⚡ Stratégie de pacing Ultra"):
-        apply_ultra=st.checkbox("Activer le pacing ultra (positive split)",value=False)
+        apply_ultra=st.checkbox("Activer le pacing ultra",value=False)
         ultra_amp=0.0
         if apply_ultra:
             ultra_amp=st.slider("Amplitude (%)",0.0,40.0,10.0,0.5)
@@ -1442,7 +1432,6 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
         show_smooth_pace=st.checkbox("Afficher l'allure lissée",value=True)
         smooth_window_km=st.slider("Fenêtre lissage (km)",1,9,3,2) if show_smooth_pace else 3
 
-    # ── Section 5 — Course cible ──
     st.markdown("---")
     st.header("5️⃣  Paramètres de la course cible")
     c1,c2=st.columns(2)
@@ -1450,14 +1439,14 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
     heure_course = c2.time_input("⏰ Heure de départ",value=time(9,0))
     colf1,colf2=st.columns(2)
     with colf1:
-        force_dist=st.checkbox("Forcer la distance (si GPX ≠ distance officielle)",value=False)
+        force_dist=st.checkbox("Forcer la distance",value=False)
         dist_forcee=st.number_input("Distance (km)",value=42.195,format="%.3f") if force_dist else None
     with colf2:
         force_temps=st.checkbox("Travailler à partir d'un objectif de temps",value=False)
-        temps_objectif=st.text_input("Temps objectif (h:mm:ss)",value="3:30:00") if force_temps else None
+        # ── Objectif au format hh:mm:ss ──
+        temps_objectif = hms_input("Temps objectif", "3:30:00", key="temps_objectif_target") if force_temps else None
     st.markdown("---")
 
-    # Cross-validation
     with st.expander("🔬 Cross-validation (fiabilité du modèle)"):
         st.info("LOO : prédit chaque référence avec les autres. MAPE < 3% = excellent | < 7% = correct.")
         if st.button("Lancer la cross-validation"):
@@ -1474,11 +1463,7 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
                 c1,c2=st.columns(2)
                 c1.metric("Erreur absolue moyenne",f"{seconds_to_hms(mae)} ({mae:.0f}s)")
                 c2.metric("MAPE",f"{mape:.2f} %")
-                if mape<3:   st.success("✅ Modèle bien calibré.")
-                elif mape<7: st.warning("⚠️ Calibration acceptable — ajouter des références.")
-                else:        st.error("❌ Calibration faible — vérifier les références.")
 
-    # ── Section 6 — Calcul ──
     st.header("6️⃣  Calcul & Résultats")
     if st.button("▶️ Calculer la prédiction", type="primary"):
         if not gpx_file or points is None:
@@ -1486,7 +1471,7 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
         elif not any(safe_float(r.get("distance",0))>0 and hms_to_seconds(r.get("temps","0"))>0 for r in refs_raw):
             st.error("⚠️ Renseigne au moins une référence valide.")
         else:
-            with st.spinner("Calcul en cours (météo + prédiction)..."):
+            with st.spinner("Calcul en cours..."):
                 try:
                     res=run_prediction(
                         distance_cible_km=dist_forcee if force_dist else None,
@@ -1524,7 +1509,6 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
         c3.metric("Fourchette −5%",res["ci_low"])
         c4.metric("Fourchette +5%",res["ci_high"])
         c5.metric("K Riegel",f"{res['K']:.3f}")
-        st.caption(f"Distance GPX : {res['dist_gpx_km']:.3f} km | D+ total : {res['d_plus_total']:.0f} m | Alt. moy. : {res['avg_alt']:.0f} m")
 
         df_out=res["df"]
         if not df_out.empty:
@@ -1549,18 +1533,16 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
             with res_t2:
                 fig2,ax2=plt.subplots(figsize=(12,4))
                 x=list(range(1,len(df_out)+1))
-                ax2.plot(x,df_out["Mult Pente"].values,label="Pente (Minetti+heu)",lw=2)
-                if "Mult Temp" in df_out.columns: ax2.plot(x,df_out["Mult Temp"].values,label="Température/WBGT",lw=2)
+                ax2.plot(x,df_out["Mult Pente"].values,label="Pente",lw=2)
+                if "Mult Temp" in df_out.columns: ax2.plot(x,df_out["Mult Temp"].values,label="Température",lw=2)
                 if "Mult Vent" in df_out.columns: ax2.plot(x,df_out["Mult Vent"].values,label="Vent",lw=2)
                 if "Mult Fatigue" in df_out.columns: ax2.plot(x,df_out["Mult Fatigue"].values,label="Fatigue",lw=2,ls=":")
-                if "Mult Altitude" in df_out.columns: ax2.plot(x,df_out["Mult Altitude"].values,label="Altitude physio",lw=1.5,ls="--")
                 ax2.axhline(1.0,color="gray",lw=0.8); ax2.set_xlabel("Kilomètre")
-                ax2.set_ylabel("Multiplicateur (1.0 = neutre)"); ax2.set_title("Décomposition des facteurs")
+                ax2.set_ylabel("Multiplicateur"); ax2.set_title("Décomposition des facteurs")
                 ax2.legend(); ax2.grid(alpha=0.3); st.pyplot(fig2); plt.close(fig2)
             with res_t3:
                 st.dataframe(df_out,use_container_width=True)
 
-    # Carte & Profil
     if gpx_file and points:
         with st.expander("🗺️ Carte & Profil d'altitude",expanded=False):
             try:
@@ -1596,26 +1578,6 @@ dans des conditions parfaites (plat, température optimale) avant de construire 
             except Exception as e:
                 st.error(f"Impossible d'afficher la carte : {e}")
 
-    st.markdown("---")
-    with st.expander("💡 Pistes d'amélioration futures"):
-        st.markdown("""
-**1. Intervalle de confiance probabiliste** — calculé à partir des résidus LOO-CV (MAPE réel) plutôt qu'un ±5% fixe.
-
-**2. Puissance de course (Stryd)** — capteur qui mesure le travail mécanique réel indépendamment pente/vent. Idéal pour modéliser le potentiel de l'athlète.
-
-**3. Charge d'entraînement CTL/ATL/TSB** — la forme TSB = CTL−ATL prédit si l'athlète arrive frais. Intégration possible via API Garmin/Strava.
-
-**4. Type de surface et technicité** — trail technique ≠ route. Croisement OpenStreetMap pour adapter les multiplicateurs de pente.
-
-**5. CdA individuel** — coefficient aérodynamique selon la morphologie. Paramètre "gabarit athlète" qui ajuste drag_coeff.
-
-**6. Hydratation et sodium** — 1% masse perdue → −2% performance. En combinant WBGT + durée + sudation → plan d'hydratation automatique.
-
-**7. Modélisation pauses ultra** — stops ravitaillement + marche en côte > X% → simulation par tronçons GPX.
-
-*Ce modèle est un outil d'aide à la décision — validez toujours avec le ressenti de l'athlète.*
-""")
-
 
 # ══════════════════════════════════════════════════════════════
 # ONGLET 1 — TESTS D'ENDURANCE + VITESSE CRITIQUE
@@ -1626,44 +1588,43 @@ with main_tabs[1]:
 <div class="highlight-box">
 <strong>Principe :</strong> réalise 3 à 6 efforts à intensités variées (ex : 6 min, 12 min, 20 min, 30 min).
 La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut maintenir indéfiniment.
-L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs longue durée — plus il est proche de 1, meilleure est l'endurance.
+L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs longue durée.
 </div>""", unsafe_allow_html=True)
 
     if not HAS_FITDECODE:
-        st.warning("⚠️ La bibliothèque `fitdecode` n'est pas installée. Les fichiers FIT ne peuvent pas être lus dans cet onglet. "
-                   "Installez-la : `pip install fitdecode`")
+        st.warning("⚠️ `fitdecode` non installé — fichiers FIT non disponibles. `pip install fitdecode`")
 
-    # Nombre de tests
     col_nt1, col_nt2 = st.columns([1,3])
     with col_nt1:
         n_tests = st.number_input("Nombre de tests", min_value=2, max_value=6, value=3, step=1, key="n_tests_vc")
 
     st.info(f"**{n_tests} tests** à charger. Conseil : mélanger des efforts courts (6 min) et longs (20-30 min).")
 
-    # Collecte des fichiers + durées imposées
-    test_files = []
-    test_names = []
-    test_durations = []
+    test_files = []; test_names = []; test_durations = []
 
     for i in range(int(n_tests)):
         with st.expander(f"📁 Test {i+1}", expanded=(i<2)):
             c_name, c_file, c_dur = st.columns([2,3,2])
             with c_name:
-                t_name = st.text_input(f"Nom du test", value=f"Test {i+1}", key=f"tname_{i}")
+                t_name = st.text_input("Nom du test", value=f"Test {i+1}", key=f"tname_{i}")
             with c_file:
-                t_file = st.file_uploader(f"Fichier activité", type=["fit","gpx","tcx","csv"], key=f"tfile_{i}")
+                t_file = st.file_uploader("Fichier activité", type=["fit","gpx","tcx","csv"], key=f"tfile_{i}")
             with c_dur:
                 force_dur = st.checkbox("Durée imposée", key=f"fdur_{i}",
                                          help="Cocher si le test avait une durée fixe (ex: 6 min maxi)")
-                t_dur_min = st.number_input("Durée (min)", value=20.0, min_value=1.0, max_value=120.0,
-                                             step=1.0, key=f"tdur_{i}") if force_dur else None
+                if force_dur:
+                    # ── Durée imposée au format hh:mm:ss ──
+                    t_dur_hms = hms_input("Durée du test", "0:20:00", key=f"tdur_hms_{i}",
+                                           help="Durée fixe du test (hh:mm:ss)")
+                    t_dur_s = float(hms_to_seconds(t_dur_hms)) if validate_hms(t_dur_hms) else None
+                else:
+                    t_dur_s = None
             test_files.append(t_file)
             test_names.append(t_name)
-            test_durations.append(t_dur_min*60.0 if t_dur_min is not None else None)
+            test_durations.append(t_dur_s)
 
     st.markdown("---")
 
-    # ── Bouton d'analyse ──
     if st.button("🔍 Analyser tous les tests", type="primary", key="btn_analyze_vc"):
         loaded = []
         for i, (f, name, imposed_dur) in enumerate(zip(test_files, test_names, test_durations)):
@@ -1674,7 +1635,6 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
             if df_act is None or df_act.empty:
                 st.warning(f"Test {i+1} ({name}) : impossible de lire le fichier.")
                 continue
-            # Tronquer à la durée imposée si demandé
             if imposed_dur is not None:
                 df_act = df_act[df_act["elapsed_s"] <= imposed_dur].copy()
             if df_act.empty:
@@ -1686,18 +1646,14 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
             spd_stats = analyze_speed_kinetics(df_act)
             loaded.append({"name":name,"idx":i,"df":df_act,"dur_s":dur_s,
                            "dist_m":dist_m,"hr":hr_stats,"spd":spd_stats})
-
         st.session_state["vc_loaded"] = loaded
 
-    # ── Affichage des résultats tests ──
     if "vc_loaded" in st.session_state:
         loaded = st.session_state["vc_loaded"]
         if not loaded:
             st.error("Aucun test valide chargé.")
         else:
             st.subheader(f"📊 Résultats des {len(loaded)} tests")
-
-            # Grille 2 colonnes — indexation correcte pour 3+ tests
             n_cols = 2
             for row_start in range(0, len(loaded), n_cols):
                 row_items = loaded[row_start : row_start + n_cols]
@@ -1709,13 +1665,11 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                         dur_str = seconds_to_hms(item["dur_s"])
                         dist_str = f"{item['dist_m']/1000:.2f} km" if item["dist_m"] else "—"
                         avg_v = (item["dist_m"] / item["dur_s"]) if item["dist_m"] and item["dur_s"] > 0 else None
-
                         st.markdown(f'<div class="test-card"><h4>🔵 {item["name"]}</h4>', unsafe_allow_html=True)
                         m1,m2,m3 = st.columns(3)
                         m1.metric("Durée", dur_str)
                         m2.metric("Distance", dist_str)
                         m3.metric("Vitesse moy.", f"{avg_v:.2f} m/s" if avg_v else "—")
-
                         if hr.get("available"):
                             st.markdown("**Fréquence cardiaque**")
                             h1,h2,h3 = st.columns(3)
@@ -1723,8 +1677,6 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                             h2.metric("FC moy.", f"{hr['fc_avg']:.0f} bpm")
                             h3.metric("Dérive", f"+{hr['drift_abs']:.1f} bpm")
                             st.caption(f"Seuil estimé ~{hr['seuil_estime']} bpm · Fiabilité : {hr['reliability']}")
-
-                            # Courbe FC lissée
                             df_act = item["df"]
                             if "heart_rate" in df_act.columns and df_act["heart_rate"].notna().any():
                                 hr_s = smooth_hr(df_act["heart_rate"].ffill(), window=15)
@@ -1736,63 +1688,46 @@ L'<em>Index Cinétique (IC)</em> compare la dérive cardiaque sur courte vs long
                                 st.pyplot(fig_hr); plt.close(fig_hr)
                         else:
                             st.caption("FC non disponible dans ce fichier.")
-
                         if spd.get("available"):
                             pace_avg = pace_str(1000.0/spd["speed_avg_ms"]) if spd["speed_avg_ms"]>0 else "—"
-                            st.caption(f"Vitesse moy. : {spd['speed_avg_ms']:.2f} m/s ({pace_avg}/km) | "
-                                       f"Dérive vitesse : r={spd['r_value']:.2f}")
-
+                            st.caption(f"Vitesse moy. : {spd['speed_avg_ms']:.2f} m/s ({pace_avg}/km) | r={spd['r_value']:.2f}")
                         st.markdown('</div>', unsafe_allow_html=True)
 
-            # ── Calcul Vitesse Critique ──
             st.markdown("---")
             st.subheader("📐 Vitesse Critique (D = VC × T + D')")
-
             vc_points = [(item["dist_m"], item["dur_s"])
                          for item in loaded if item["dist_m"] is not None and item["dur_s"] > 0]
             if len(vc_points) >= 2:
                 dists_vc = [p[0] for p in vc_points]
                 durs_vc  = [p[1] for p in vc_points]
                 vc, d_prime, r2 = compute_vc(dists_vc, durs_vc)
-
                 cv1,cv2,cv3,cv4 = st.columns(4)
                 if vc and vc > 0:
                     cv1.metric("Vitesse Critique (VC)", f"{vc:.2f} m/s")
                     cv2.metric("Allure VC", pace_str(1000.0/vc)+"/km")
                     cv3.metric("D' (réserve anaérobie)", f"{d_prime:.0f} m" if d_prime else "—")
                     cv4.metric("R² régression", f"{r2:.3f}")
-
                     if r2 < 0.90:
-                        st.warning(f"⚠️ R²={r2:.3f} — la régression est faible. Vérifiez la cohérence des tests (évitez les tests trop similaires en durée).")
+                        st.warning(f"⚠️ R²={r2:.3f} — régression faible.")
                     else:
-                        st.success(f"✅ R²={r2:.3f} — bonne qualité de régression. VC fiable.")
+                        st.success(f"✅ R²={r2:.3f} — bonne qualité.")
 
-                    # Graphique D = f(T)
                     fig_vc, ax_vc = plt.subplots(figsize=(7,4))
                     T_arr = np.array(durs_vc); D_arr = np.array(dists_vc)
                     T_line = np.linspace(T_arr.min()*0.8, T_arr.max()*1.2, 100)
                     D_line = vc * T_line + d_prime
-                    ax_vc.scatter(T_arr/60, D_arr/1000, s=80, color="#1f77b4",
-                                  zorder=5, label="Tests réels")
+                    ax_vc.scatter(T_arr/60, D_arr/1000, s=80, color="#1f77b4", zorder=5, label="Tests réels")
                     ax_vc.plot(T_line/60, D_line/1000, color="#d62728", lw=2,
                                label=f"VC = {vc:.2f} m/s | D' = {d_prime:.0f} m")
                     ax_vc.set_xlabel("Durée (min)"); ax_vc.set_ylabel("Distance (km)")
                     ax_vc.set_title("Modèle D = VC × T + D'"); ax_vc.legend(); ax_vc.grid(alpha=0.3)
                     st.pyplot(fig_vc); plt.close(fig_vc)
 
-                    # ── Index Cinétique ──
                     st.markdown("---")
                     st.subheader("📊 Index Cinétique (IC)")
-                    st.markdown("""
-L'**Index Cinétique** compare la dérive cardiaque entre un test court et un test long.
-- IC ≥ 0.85 → endurance solide ✅
-- IC 0.60-0.85 → à développer ⚠️
-- IC < 0.60 → endurance insuffisante ❌
-""")
                     drifts = [(item["name"], item["hr"].get("drift_abs"), item["dur_s"])
                                for item in loaded if item["hr"].get("available")]
-                    drifts.sort(key=lambda x: x[2])  # tri par durée
-
+                    drifts.sort(key=lambda x: x[2])
                     if len(drifts) >= 2:
                         name_short, drift_short, dur_short = drifts[0]
                         name_long,  drift_long,  dur_long  = drifts[-1]
@@ -1805,31 +1740,22 @@ L'**Index Cinétique** compare la dérive cardiaque entre un test court et un te
                     else:
                         st.info("Besoin d'au moins 2 tests avec données FC pour calculer l'IC.")
 
-                    # ── Loi de puissance ──
                     st.markdown("---")
                     st.subheader("⚡ Loi de puissance (T = A × v⁻ᵏ)")
-                    st.caption("Modélise le temps de maintien en dessous de la VC. Complémentaire au modèle D'.")
-
                     speeds_for_pl = [item["dist_m"]/item["dur_s"]
                                       for item in loaded if item["dist_m"] and item["dur_s"]>0]
                     times_for_pl  = [item["dur_s"] for item in loaded if item["dist_m"] and item["dur_s"]>0]
-
                     A_pl, k_pl, r2_pl = fit_power_law(speeds_for_pl, times_for_pl)
                     if A_pl is not None:
                         pl1,pl2,pl3 = st.columns(3)
                         pl1.metric("Coefficient A", f"{A_pl:.1f}")
                         pl2.metric("Exposant k", f"{k_pl:.3f}")
                         pl3.metric("R² loi puissance", f"{r2_pl:.3f}")
-
-                        # ── Table hybride ──
                         st.markdown("---")
                         st.subheader("📋 Table de maintien hybride")
-                        st.caption("Loi de puissance sous VC · Modèle D' au-dessus de VC")
                         df_hybrid = build_hybrid_holding_table(vc, d_prime, A_pl, k_pl)
                         if not df_hybrid.empty:
                             st.dataframe(df_hybrid, use_container_width=True)
-
-                            # Graphique temps de maintien
                             fig_hold, ax_hold = plt.subplots(figsize=(8,4))
                             mask_pl = df_hybrid["Modèle"]=="Loi puissance"
                             mask_dp = df_hybrid["Modèle"]=="Modèle D'"
@@ -1843,25 +1769,20 @@ L'**Index Cinétique** compare la dérive cardiaque entre un test court et un te
                                              color="#d62728", lw=2.5, ls="--", label="Modèle D' (>VC)")
                             ax_hold.axvline(vc, color="gray", lw=1.5, ls=":", label=f"VC = {vc:.2f} m/s")
                             ax_hold.set_xlabel("Vitesse (m/s)"); ax_hold.set_ylabel("Temps de maintien (min)")
-                            ax_hold.set_title("Courbe de tolérance — temps par vitesse")
-                            ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
+                            ax_hold.set_title("Courbe de tolérance"); ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
                             st.pyplot(fig_hold); plt.close(fig_hold)
 
-                    # ── Export PDF ──
                     st.markdown("---")
-                    st.subheader("📄 Export PDF du rapport")
+                    st.subheader("📄 Export PDF")
                     if st.button("Générer le PDF", key="btn_pdf_vc"):
                         buf = io.BytesIO()
                         with PdfPages(buf) as pdf:
-                            # Page 1 — résumé VC
                             fig_p1, axes = plt.subplots(2, 1, figsize=(8.27, 11.69))
                             axes[0].scatter(T_arr/60, D_arr/1000, s=80, color="#1f77b4", label="Tests réels", zorder=5)
                             axes[0].plot(T_line/60, D_line/1000, color="#d62728", lw=2,
                                          label=f"VC = {vc:.2f} m/s | D' = {d_prime:.0f} m")
                             axes[0].set_xlabel("Durée (min)"); axes[0].set_ylabel("Distance (km)")
-                            axes[0].set_title("Modèle Vitesse Critique — D = VC × T + D'")
-                            axes[0].legend(); axes[0].grid(alpha=0.3)
-
+                            axes[0].set_title("Modèle Vitesse Critique"); axes[0].legend(); axes[0].grid(alpha=0.3)
                             if not df_hybrid.empty:
                                 if mask_pl.any():
                                     axes[1].plot(df_hybrid.loc[mask_pl,"Vitesse (m/s)"],
@@ -1875,8 +1796,6 @@ L'**Index Cinétique** compare la dérive cardiaque entre un test court et un te
                                 axes[1].set_xlabel("Vitesse (m/s)"); axes[1].set_ylabel("Durée (min)")
                                 axes[1].set_title("Courbe de tolérance"); axes[1].legend(); axes[1].grid(alpha=0.3)
                             fig_p1.tight_layout(); pdf.savefig(fig_p1); plt.close(fig_p1)
-
-                            # Page 2 — FC par test
                             for item in loaded:
                                 df_act = item["df"]
                                 if "heart_rate" not in df_act.columns or not df_act["heart_rate"].notna().any():
@@ -1885,71 +1804,75 @@ L'**Index Cinétique** compare la dérive cardiaque entre un test court et un te
                                 hr_s = smooth_hr(df_act["heart_rate"].ffill(), window=15)
                                 ax_fc.plot(df_act["elapsed_s"]/60.0, hr_s, color="#d62728", lw=1.5)
                                 ax_fc.set_xlabel("Temps (min)"); ax_fc.set_ylabel("FC (bpm)")
-                                ax_fc.set_title(f"Fréquence cardiaque — {item['name']}")
-                                ax_fc.grid(alpha=0.3); fig_fc.tight_layout()
+                                ax_fc.set_title(f"FC — {item['name']}"); ax_fc.grid(alpha=0.3); fig_fc.tight_layout()
                                 pdf.savefig(fig_fc); plt.close(fig_fc)
-
                         buf.seek(0)
                         st.download_button("⬇️ Télécharger le rapport PDF",
-                                           data=buf, file_name="rapport_vc.pdf",
-                                           mime="application/pdf")
-                    else:
-                        st.info("R² insuffisant pour construire la table de maintien. Vérifiez les tests.")
-
+                                           data=buf, file_name="rapport_vc.pdf", mime="application/pdf")
             else:
                 st.info("Chargez au moins 2 tests pour calculer la Vitesse Critique.")
 
 
 # ══════════════════════════════════════════════════════════════
-# ONGLET 2 — ANALYSE ENTRAÎNEMENT
+# ONGLET 2 — ANALYSE ENTRAÎNEMENT (avec analyse fractionné)
 # ══════════════════════════════════════════════════════════════
 with main_tabs[2]:
     st.title("⚙️  Analyse d'entraînement")
     st.markdown("""
 Chargez une activité (sortie longue, fartlek, tempo...) pour analyser la **dérive cardiaque**,
 la **cinétique de vitesse** et la **qualité de l'effort**.
+Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
 """)
 
     if not HAS_FITDECODE:
-        st.warning("⚠️ `fitdecode` non installé — fichiers FIT non disponibles. `pip install fitdecode`")
+        st.warning("⚠️ `fitdecode` non installé — `pip install fitdecode`")
 
     act_file = st.file_uploader("📂 Importer une activité (FIT, GPX, TCX ou CSV)",
                                  type=["fit","gpx","tcx","csv"], key="entr_file")
 
-    # Paramètres d'analyse
     with st.expander("⚙️ Options d'analyse"):
         col_o1,col_o2 = st.columns(2)
         with col_o1:
-            hr_smooth_win = st.slider("Lissage FC (fenêtre points)", 3, 61, 15, 2,
-                                       help="Fenêtre de lissage glissant pour la FC")
-            trim_start_min = st.number_input("Écarter début (min)", value=0.0, step=0.5,
-                                              help="Ignorer les N premières minutes (chauffe)")
+            hr_smooth_win = st.slider("Lissage FC (fenêtre points)", 3, 61, 15, 2)
+            # ── Début d'analyse au format hh:mm:ss ──
+            trim_start_hms = hms_input("Écarter début (hh:mm:ss)", "0:00:00",
+                                        key="trim_start_hms",
+                                        help="Ignorer les N premières minutes (chauffe)")
+            trim_start_s = float(hms_to_seconds(trim_start_hms))
         with col_o2:
-            trim_end_min = st.number_input("Écarter fin (min)", value=0.0, step=0.5,
-                                            help="Ignorer les N dernières minutes (récup)")
-            show_speed   = st.checkbox("Afficher la cinétique de vitesse", value=True)
+            show_speed = st.checkbox("Afficher la cinétique de vitesse", value=True)
+            # ── Fin d'analyse au format hh:mm:ss ──
+            trim_end_hms = hms_input("Écarter fin (hh:mm:ss)", "0:00:00",
+                                      key="trim_end_hms",
+                                      help="Ignorer les N dernières minutes (récup)")
+            trim_end_s = float(hms_to_seconds(trim_end_hms))
 
     if act_file is not None:
         with st.spinner("Chargement de l'activité..."):
-            df_entr = load_activity(act_file)
+            df_entr_raw = load_activity(act_file)
 
-        if df_entr is None or df_entr.empty:
-            st.error("Impossible de lire ce fichier. Vérifiez le format (FIT via fitdecode, GPX, TCX, CSV).")
+        if df_entr_raw is None or df_entr_raw.empty:
+            st.error("Impossible de lire ce fichier.")
         else:
-            # Tronquer début/fin
-            t_max = float(df_entr["elapsed_s"].max())
-            t_start = trim_start_min * 60.0
-            t_end   = t_max - trim_end_min * 60.0
-            if t_start > 0 or trim_end_min > 0:
-                df_entr = df_entr[(df_entr["elapsed_s"] >= t_start) & (df_entr["elapsed_s"] <= t_end)].copy()
+            t_max_raw = float(df_entr_raw["elapsed_s"].max())
+            # Durée totale affichée pour aider l'utilisateur
+            st.info(f"⏱ Durée totale de l'activité : **{seconds_to_hms(t_max_raw)}** "
+                    f"({t_max_raw/60:.1f} min) — utilisez ce repère pour vos plages de temps.")
+
+            t_start = trim_start_s
+            t_end   = t_max_raw - trim_end_s
+            if t_start > 0 or trim_end_s > 0:
+                df_entr = df_entr_raw[(df_entr_raw["elapsed_s"] >= t_start) & (df_entr_raw["elapsed_s"] <= t_end)].copy()
                 df_entr["elapsed_s"] = df_entr["elapsed_s"] - t_start
+            else:
+                df_entr = df_entr_raw.copy()
+
             if df_entr.empty:
                 st.error("Après troncature, il ne reste plus de données. Réduisez les marges.")
             else:
-                dur_s = float(df_entr["elapsed_s"].max())
+                dur_s  = float(df_entr["elapsed_s"].max())
                 dist_m = float(df_entr["distance_m"].max()) if df_entr["distance_m"].notna().any() else None
 
-                # ── Métriques générales ──
                 st.subheader("📊 Vue d'ensemble")
                 mg1,mg2,mg3,mg4 = st.columns(4)
                 mg1.metric("Durée analysée", seconds_to_hms(dur_s))
@@ -1958,7 +1881,7 @@ la **cinétique de vitesse** et la **qualité de l'effort**.
                 mg3.metric("Vitesse moy.", f"{v_avg:.2f} m/s" if v_avg else "—")
                 mg4.metric("Allure moy.", pace_str(1000.0/v_avg)+"/km" if v_avg else "—")
 
-                # ── Analyse FC ──
+                # ── Analyse FC globale ──
                 hr_stats = analyze_heart_rate(df_entr)
                 st.subheader("💓 Analyse de la fréquence cardiaque")
                 if not hr_stats.get("available"):
@@ -1970,21 +1893,17 @@ la **cinétique de vitesse** et la **qualité de l'effort**.
                     fc3.metric("FC mini (P5)",  f"{hr_stats['fc_min']} bpm")
                     fc4.metric("Dérive (Q3−Q1)", f"+{hr_stats['drift_abs']:.1f} bpm ({hr_stats['drift_pct']:.1f}%)")
                     fc5.metric("Seuil estimé",  f"~{hr_stats['seuil_estime']} bpm")
-
-                    # Badge fiabilité
                     rel = hr_stats["reliability"]
                     if "haute" in rel:    st.success(f"✅ Fiabilité : {rel}")
                     elif "moyenne" in rel: st.warning(f"⚠️ Fiabilité : {rel}")
                     else:                 st.error(f"❌ Fiabilité : {rel}")
 
-                    # Courbe FC
                     hr_s = smooth_hr(df_entr["heart_rate"].ffill(), window=int(hr_smooth_win))
                     fig_hr, ax_hr = plt.subplots(figsize=(11,3))
                     ax_hr.plot(df_entr["elapsed_s"]/60.0, df_entr["heart_rate"],
                                color="#d62728", alpha=0.2, lw=1, label="FC brute")
                     ax_hr.plot(df_entr["elapsed_s"]/60.0, hr_s,
                                color="#d62728", lw=2, label="FC lissée")
-                    # Zones quartiles
                     n = len(df_entr)
                     q1_t = df_entr["elapsed_s"].iloc[int(n*0.25)]/60.0
                     q3_t = df_entr["elapsed_s"].iloc[int(n*0.75)]/60.0
@@ -1998,34 +1917,31 @@ la **cinétique de vitesse** et la **qualité de l'effort**.
                     ax_hr.set_title("Profil de fréquence cardiaque"); ax_hr.legend(fontsize=8); ax_hr.grid(alpha=0.3)
                     st.pyplot(fig_hr); plt.close(fig_hr)
 
-                    # Interprétation dérive
                     drift = hr_stats["drift_abs"]
                     if drift < 5:
-                        st.success(f"✅ Dérive faible (+{drift:.1f} bpm) — effort bien géré, endurance solide à cette intensité.")
+                        st.success(f"✅ Dérive faible (+{drift:.1f} bpm) — endurance solide.")
                     elif drift < 12:
-                        st.warning(f"⚠️ Dérive modérée (+{drift:.1f} bpm) — l'athlète commence à accumuler de la fatigue.")
+                        st.warning(f"⚠️ Dérive modérée (+{drift:.1f} bpm) — fatigue en cours d'accumulation.")
                     else:
-                        st.error(f"❌ Dérive élevée (+{drift:.1f} bpm) — effort trop intense ou endurance insuffisante à cette allure.")
+                        st.error(f"❌ Dérive élevée (+{drift:.1f} bpm) — effort trop intense ou endurance insuffisante.")
 
                 # ── Cinétique de vitesse ──
                 if show_speed:
                     st.subheader("🏃 Cinétique de vitesse")
                     spd_stats = analyze_speed_kinetics(df_entr)
                     if not spd_stats.get("available"):
-                        st.info("Données de vitesse non disponibles dans ce fichier.")
+                        st.info("Données de vitesse non disponibles.")
                     else:
                         sv1,sv2,sv3 = st.columns(3)
                         sv1.metric("Vitesse moy.",  f"{spd_stats['speed_avg_ms']:.2f} m/s")
                         sv2.metric("Vitesse max (P95)", f"{spd_stats['speed_max_ms']:.2f} m/s")
                         sv3.metric("Corrélation dérive", f"r = {spd_stats['r_value']:.3f}")
-
                         spd_s = df_entr["speed_ms"].rolling(int(hr_smooth_win), center=True, min_periods=1).mean()
                         fig_spd, ax_spd = plt.subplots(figsize=(11,3))
                         ax_spd.plot(df_entr["elapsed_s"]/60.0, df_entr["speed_ms"],
                                     color="#1f77b4", alpha=0.2, lw=1, label="Vitesse brute")
                         ax_spd.plot(df_entr["elapsed_s"]/60.0, spd_s,
                                     color="#1f77b4", lw=2, label="Vitesse lissée")
-                        # Tendance linéaire
                         x_arr = df_entr["elapsed_s"].values
                         v_arr = df_entr["speed_ms"].dropna().values
                         if len(v_arr) == len(x_arr):
@@ -2037,14 +1953,173 @@ la **cinétique de vitesse** et la **qualité de l'effort**.
                         ax_spd.set_title("Profil de vitesse"); ax_spd.legend(fontsize=8); ax_spd.grid(alpha=0.3)
                         st.pyplot(fig_spd); plt.close(fig_spd)
 
-                        if abs(spd_stats["r_value"]) < 0.3:
-                            st.success("✅ Vitesse stable — bonne gestion de l'allure.")
-                        elif spd_stats["slope"] < 0:
-                            st.warning(f"⚠️ Décélération progressive (r={spd_stats['r_value']:.2f}) — fatigue accumulée.")
-                        else:
-                            st.info(f"ℹ️ Légère accélération (r={spd_stats['r_value']:.2f}) — effort en negative split.")
+                # ══════════════════════════════════════════════════════════
+                # ANALYSE FRACTIONNÉ (nouveau bloc)
+                # ══════════════════════════════════════════════════════════
+                st.markdown("---")
+                st.subheader("🔁 Analyse des intervalles (fractionné)")
+                st.markdown("""
+Définissez jusqu'à **6 intervalles** en saisissant les bornes de début et fin au format **hh:mm:ss**,
+relatifs au **début de l'activité** (après troncature éventuelle).
+Chaque intervalle est analysé indépendamment : FC, vitesse, dérive, allure.
+""")
+                # Repère visuel de durée
+                st.caption(f"🕐 Durée disponible après troncature : **{seconds_to_hms(dur_s)}**")
 
-                # ── Recalibration simplifiée ──
+                if "n_intervals" not in st.session_state:
+                    st.session_state["n_intervals"] = 3
+
+                col_ia, col_ib = st.columns(2)
+                with col_ia:
+                    if st.button("➕ Ajouter un intervalle") and st.session_state["n_intervals"] < 6:
+                        st.session_state["n_intervals"] += 1
+                with col_ib:
+                    if st.button("➖ Retirer un intervalle") and st.session_state["n_intervals"] > 1:
+                        st.session_state["n_intervals"] -= 1
+
+                interval_defs = []
+                for iv in range(st.session_state["n_intervals"]):
+                    with st.expander(f"⏱ Intervalle {iv+1}", expanded=(iv < 2)):
+                        col_n, col_s, col_e = st.columns([2, 2, 2])
+                        with col_n:
+                            iv_name = st.text_input("Nom", value=f"Rép. {iv+1}", key=f"iv_name_{iv}")
+                        with col_s:
+                            iv_start = hms_input("Début (hh:mm:ss)", "0:00:00",
+                                                  key=f"iv_start_{iv}",
+                                                  help="Temps relatif depuis le début de l'activité")
+                        with col_e:
+                            iv_end = hms_input("Fin (hh:mm:ss)", "0:05:00",
+                                                key=f"iv_end_{iv}",
+                                                help="Temps relatif depuis le début de l'activité")
+                        # Validation rapide
+                        s_s = hms_to_seconds(iv_start)
+                        e_s = hms_to_seconds(iv_end)
+                        if e_s <= s_s:
+                            st.warning("⚠️ La fin doit être postérieure au début.")
+                        elif e_s > dur_s:
+                            st.warning(f"⚠️ La fin ({iv_end}) dépasse la durée analysée ({seconds_to_hms(dur_s)}).")
+                        interval_defs.append({"name": iv_name, "start": iv_start, "end": iv_end})
+
+                if st.button("🔍 Analyser les intervalles", type="primary", key="btn_analyze_intervals"):
+                    results_intervals = []
+                    for iv_def in interval_defs:
+                        df_int = extract_interval_df(df_entr, iv_def["start"], iv_def["end"])
+                        res_iv = analyze_interval(df_int, iv_def["name"])
+                        results_intervals.append(res_iv)
+                    st.session_state["interval_results"] = results_intervals
+
+                if "interval_results" in st.session_state:
+                    results_intervals = st.session_state["interval_results"]
+                    valid_ivs = [r for r in results_intervals if r.get("valid")]
+
+                    if not valid_ivs:
+                        st.error("Aucun intervalle valide. Vérifiez les bornes.")
+                    else:
+                        st.subheader(f"📈 Résultats — {len(valid_ivs)} intervalles analysés")
+
+                        # ── Tableau récapitulatif ──
+                        recap_rows = []
+                        for r in valid_ivs:
+                            hr = r["hr"]
+                            spd = r["spd"]
+                            recap_rows.append({
+                                "Intervalle": r["name"],
+                                "Durée": seconds_to_hms(r["dur_s"]),
+                                "Distance": f"{r['dist_m']/1000:.2f} km" if r["dist_m"] else "—",
+                                "Allure moy.": pace_str(1000.0/r["avg_speed"])+"/km" if r["avg_speed"] else "—",
+                                "FC moy. (bpm)": f"{hr['fc_avg']:.0f}" if hr.get("available") else "—",
+                                "FC max P95": f"{hr['fc_max']}" if hr.get("available") else "—",
+                                "Dérive FC": f"+{hr['drift_abs']:.1f} bpm" if hr.get("available") else "—",
+                                "Fiabilité FC": hr.get("reliability","—") if hr.get("available") else "—",
+                            })
+                        df_recap = pd.DataFrame(recap_rows)
+                        st.dataframe(df_recap, use_container_width=True)
+
+                        # ── Graphiques FC superposés ──
+                        has_hr_data = any(r["hr"].get("available") for r in valid_ivs)
+                        if has_hr_data:
+                            st.subheader("💓 Profils FC superposés")
+                            fig_comp, ax_comp = plt.subplots(figsize=(11, 4))
+                            colors_list = ["#d62728","#1f77b4","#2ca02c","#ff7f0e","#9467bd","#8c564b"]
+                            for idx_r, r in enumerate(valid_ivs):
+                                df_iv = r["df"]
+                                if "heart_rate" not in df_iv.columns or not df_iv["heart_rate"].notna().any():
+                                    continue
+                                hr_sv = smooth_hr(df_iv["heart_rate"].ffill(), window=15)
+                                col_iv = colors_list[idx_r % len(colors_list)]
+                                ax_comp.plot(df_iv["elapsed_s"]/60.0, hr_sv,
+                                             lw=2, color=col_iv, label=r["name"])
+                            ax_comp.set_xlabel("Temps depuis début de l'intervalle (min)")
+                            ax_comp.set_ylabel("FC (bpm)")
+                            ax_comp.set_title("Comparaison FC — intervalles superposés")
+                            ax_comp.legend(); ax_comp.grid(alpha=0.3)
+                            st.pyplot(fig_comp); plt.close(fig_comp)
+
+                        # ── Graphiques vitesse superposés ──
+                        has_spd_data = any(r["spd"].get("available") for r in valid_ivs)
+                        if has_spd_data and show_speed:
+                            st.subheader("🏃 Profils de vitesse superposés")
+                            fig_spd2, ax_spd2 = plt.subplots(figsize=(11, 4))
+                            for idx_r, r in enumerate(valid_ivs):
+                                df_iv = r["df"]
+                                if "speed_ms" not in df_iv.columns or not df_iv["speed_ms"].notna().any():
+                                    continue
+                                spd_sv = df_iv["speed_ms"].rolling(15, center=True, min_periods=1).mean()
+                                col_iv = colors_list[idx_r % len(colors_list)]
+                                ax_spd2.plot(df_iv["elapsed_s"]/60.0, spd_sv,
+                                             lw=2, color=col_iv, label=r["name"])
+                            ax_spd2.set_xlabel("Temps depuis début de l'intervalle (min)")
+                            ax_spd2.set_ylabel("Vitesse (m/s)")
+                            ax_spd2.set_title("Comparaison vitesse — intervalles superposés")
+                            ax_spd2.legend(); ax_spd2.grid(alpha=0.3)
+                            st.pyplot(fig_spd2); plt.close(fig_spd2)
+
+                        # ── Évolution des métriques clés d'un intervalle à l'autre ──
+                        if len(valid_ivs) >= 2:
+                            st.subheader("📉 Évolution inter-répétitions")
+                            fig_ev, axes_ev = plt.subplots(1, 2, figsize=(12, 4))
+                            iv_labels = [r["name"] for r in valid_ivs]
+                            # Allures
+                            allures = [1000.0/r["avg_speed"] if r["avg_speed"] else None for r in valid_ivs]
+                            allures_valid = [a for a in allures if a is not None]
+                            if allures_valid:
+                                axes_ev[0].plot(range(len(iv_labels)), allures, "o-",
+                                                color="#1f77b4", lw=2, ms=7)
+                                axes_ev[0].set_xticks(range(len(iv_labels))); axes_ev[0].set_xticklabels(iv_labels, rotation=20)
+                                axes_ev[0].set_ylabel("Allure (s/km)")
+                                axes_ev[0].set_title("Allure moyenne par répétition")
+                                axes_ev[0].invert_yaxis(); axes_ev[0].grid(alpha=0.3)
+                            # FC moyenne
+                            fc_avgs = [r["hr"]["fc_avg"] if r["hr"].get("available") else None for r in valid_ivs]
+                            fc_avgs_valid = [f for f in fc_avgs if f is not None]
+                            if fc_avgs_valid:
+                                axes_ev[1].plot(range(len(iv_labels)), fc_avgs, "o-",
+                                                color="#d62728", lw=2, ms=7)
+                                axes_ev[1].set_xticks(range(len(iv_labels))); axes_ev[1].set_xticklabels(iv_labels, rotation=20)
+                                axes_ev[1].set_ylabel("FC moyenne (bpm)")
+                                axes_ev[1].set_title("FC moyenne par répétition")
+                                axes_ev[1].grid(alpha=0.3)
+                            fig_ev.tight_layout()
+                            st.pyplot(fig_ev); plt.close(fig_ev)
+
+                            # Interprétation automatique
+                            if allures_valid and len(allures_valid) >= 2:
+                                trend_allure = allures_valid[-1] - allures_valid[0]
+                                if trend_allure > 15:
+                                    st.warning(f"⚠️ Dégradation d'allure : +{trend_allure:.0f} s/km entre la 1ère et la dernière répétition — fatigue progressive ou dosage excessif.")
+                                elif trend_allure < -5:
+                                    st.success(f"✅ Accélération inter-répétitions : {abs(trend_allure):.0f} s/km de gain — bonne montée en puissance.")
+                                else:
+                                    st.success("✅ Allure stable entre les répétitions — excellent contrôle de l'effort.")
+
+                            if fc_avgs_valid and len(fc_avgs_valid) >= 2:
+                                trend_fc = fc_avgs_valid[-1] - fc_avgs_valid[0]
+                                if trend_fc > 8:
+                                    st.warning(f"⚠️ Dérive de FC inter-répétitions : +{trend_fc:.0f} bpm — accumulation de fatigue cardiovasculaire.")
+                                else:
+                                    st.success(f"✅ FC stable entre les répétitions (+{trend_fc:.1f} bpm) — récupération bien gérée.")
+
+                # ── Recalibration météo ──
                 with st.expander("🌡️ Recalibration conditions météo (simplifié)"):
                     st.caption("Estime l'équivalent performance dans des conditions idéales.")
                     entr_t  = st.number_input("Température réelle (°C)", value=18.0, step=0.5, key="entr_t")
@@ -2070,7 +2145,7 @@ la **cinétique de vitesse** et la **qualité de l'effort**.
         st.markdown("""
 **Formats acceptés :**
 - **FIT** (Garmin, Polar, Suunto, etc.) — nécessite `fitdecode`
-- **GPX** — données GPS uniquement (pas de FC en général)
+- **GPX** — données GPS
 - **TCX** — format Garmin Training Center
 - **CSV** — colonnes : `elapsed_s`, `heart_rate`, `speed_ms`, `distance_m`, `altitude_m`
 """)
