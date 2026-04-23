@@ -762,10 +762,11 @@ def compute_vc(distances_m: list, durations_s: list):
 def build_holding_table(vc_ms: float, d_prime: float,
                         refs_fit: list, K_riegel: float) -> pd.DataFrame:
     """
-    Table des temps de maintien :
-    - 80 % VC ≤ v < VC  : Riegel log-log calé sur les références
-                           T = a × (v×T/1000)^K  →  T = [a × (v/1000)^K]^(1/(1-K))
-    - v ≥ VC             : Modèle D'  →  T = D' / (v − VC)
+    Table des temps de maintien de 80 % à 120 % de VC, par pas de 4 %.
+    - 80 % VC ≤ v < 100 % VC : Riegel log-log calé sur les références
+                                T = [a × (v/1000)^K]^(1/(1−K))
+    - 100 % VC ≤ v ≤ 120 % VC : Modèle D'  →  T = D' / (v − VC)
+    Colonnes : % VC, Vitesse, Allure, Temps de maintien, Durée (min), Modèle.
     """
     if vc_ms is None or vc_ms <= 0:
         return pd.DataFrame()
@@ -789,41 +790,44 @@ def build_holding_table(vc_ms: float, d_prime: float,
         K_fit = float(K_riegel)
         a_fit = 240.0
 
-    v_lo = vc_ms * 0.80
-    v_hi = vc_ms * 2.50
-    step = vc_ms * 0.04
+    # Paliers fixes de 80 % à 120 % par pas de 4 %
+    pct_steps = [pct / 100.0 for pct in range(80, 121, 4)]
 
     rows = []
-    v = v_lo
-    while v <= v_hi + 1e-6:
+    for pct in pct_steps:
+        v = vc_ms * pct
         if v <= 0:
-            v += step; continue
+            continue
+        pct_label = f"{round(pct * 100):.0f} %"
         pace = pace_str(1000.0 / v)
-        if v < vc_ms:
-            # Riegel : T^(1-K) = a × (v/1000)^K
+
+        if pct < 1.0:
+            # Riegel
             if abs(1.0 - K_fit) < 1e-6:
-                v += step; continue
+                continue
             try:
                 t = (a_fit * (v / 1000.0) ** K_fit) ** (1.0 / (1.0 - K_fit))
             except Exception:
-                v += step; continue
+                continue
             modele = "Riegel"
         else:
-            if d_prime is not None and (v - vc_ms) > 0.01:
-                t = d_prime / (v - vc_ms)
-            else:
-                v += step; continue
+            # Modèle D'
+            delta_v = v - vc_ms
+            if d_prime is None or delta_v < 0.01:
+                continue
+            t = d_prime / delta_v
             modele = "Modèle D'"
-        t = max(0.0, min(t, 72000.0))
+
+        t = max(0.0, min(t, 360000.0))   # plafond 100 h
         if t > 0:
             rows.append({
-                "Vitesse (m/s)": round(v, 2),
-                "Allure (/km)":  pace,
-                "Temps de maintien": seconds_to_hms(t),
-                "Durée (min)":   round(t / 60.0, 1),
-                "Modèle":        modele,
+                "% VC":               pct_label,
+                "Vitesse (m/s)":      round(v, 2),
+                "Allure (/km)":       pace,
+                "Temps de maintien":  seconds_to_hms(t),
+                "Durée (min)":        round(t / 60.0, 1),
+                "Modèle":             modele,
             })
-        v += step
 
     return pd.DataFrame(rows)
 
@@ -1767,14 +1771,12 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     st.markdown("---")
                     st.subheader("📋 Table des temps de maintien")
                     st.caption(
-                        "**80 % VC → VC** : modèle Riegel calé sur vos références. "
-                        "**Au-dessus de VC** : modèle D' (réserve anaérobie)."
+                        "**80 % → 100 % VC** : modèle Riegel calé sur vos références. "
+                        "**100 % → 120 % VC** : modèle D' (réserve anaérobie). "
+                        "Paliers de 4 % de VC."
                     )
-                    # On a besoin des refs_fit issues de l'onglet Prédiction.
-                    # Si elles ne sont pas disponibles, on utilise les données des tests eux-mêmes.
                     refs_for_table = st.session_state.get("refs_fit_vc", [])
                     if not refs_for_table:
-                        # Construire des refs synthétiques depuis les tests chargés
                         refs_for_table = [
                             {"distance": item["dist_m"], "temps": item["dur_s"]}
                             for item in loaded if item["dist_m"] and item["dur_s"] > 0
@@ -1782,24 +1784,52 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     K_for_table = st.session_state.get("K_riegel_vc", 1.06)
                     df_hold = build_holding_table(vc, d_prime, refs_for_table, K_for_table)
                     if not df_hold.empty:
-                        st.dataframe(df_hold, use_container_width=True)
+                        # Mise en évidence de la ligne VC (100 %)
+                        def style_vc_row(row):
+                            if row["% VC"] == "100 %":
+                                return ["background-color: #e8f0fe; font-weight: bold"] * len(row)
+                            return [""] * len(row)
+                        st.dataframe(
+                            df_hold.style.apply(style_vc_row, axis=1),
+                            use_container_width=True,
+                        )
+
+                        # Graphique en % VC
                         fig_hold, ax_hold = plt.subplots(figsize=(9, 4))
+                        pcts = [float(p.replace(" %", "")) for p in df_hold["% VC"]]
                         mask_ri = df_hold["Modèle"] == "Riegel"
                         mask_dp = df_hold["Modèle"] == "Modèle D'"
                         if mask_ri.any():
-                            ax_hold.plot(df_hold.loc[mask_ri, "Vitesse (m/s)"],
-                                         df_hold.loc[mask_ri, "Durée (min)"],
-                                         color="#1f77b4", lw=2.5, label="Riegel (80%–100% VC)")
+                            ax_hold.plot(
+                                [pcts[i] for i in df_hold.index[mask_ri]],
+                                df_hold.loc[mask_ri, "Durée (min)"],
+                                "o-", color="#1f77b4", lw=2.5, ms=6,
+                                label="Riegel (80 %–100 % VC)"
+                            )
                         if mask_dp.any():
-                            ax_hold.plot(df_hold.loc[mask_dp, "Vitesse (m/s)"],
-                                         df_hold.loc[mask_dp, "Durée (min)"],
-                                         color="#d62728", lw=2.5, ls="--", label="Modèle D' (>VC)")
-                        ax_hold.axvline(vc, color="gray", lw=1.5, ls=":",
-                                        label=f"VC = {vc:.2f} m/s ({pace_str(1000/vc)}/km)")
-                        ax_hold.set_xlabel("Vitesse (m/s)")
+                            ax_hold.plot(
+                                [pcts[i] for i in df_hold.index[mask_dp]],
+                                df_hold.loc[mask_dp, "Durée (min)"],
+                                "o--", color="#d62728", lw=2.5, ms=6,
+                                label="Modèle D' (100 %–120 % VC)"
+                            )
+                        ax_hold.axvline(100, color="gray", lw=1.5, ls=":",
+                                        label=f"VC = 100 % ({pace_str(1000/vc)}/km)")
+                        # Annoter chaque point avec l'allure
+                        for i, row in df_hold.iterrows():
+                            ax_hold.annotate(
+                                row["Allure (/km)"],
+                                xy=(pcts[i], row["Durée (min)"]),
+                                xytext=(0, 7), textcoords="offset points",
+                                ha="center", fontsize=7, color="#444"
+                            )
+                        ax_hold.set_xlabel("% de la Vitesse Critique")
                         ax_hold.set_ylabel("Temps de maintien (min)")
-                        ax_hold.set_title("Courbe de tolérance par vitesse")
+                        ax_hold.set_title("Temps de maintien par pourcentage de VC")
+                        ax_hold.set_xticks([float(p.replace(" %","")) for p in df_hold["% VC"]])
+                        ax_hold.set_xticklabels([p for p in df_hold["% VC"]], rotation=45, fontsize=8)
                         ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
+                        fig_hold.tight_layout()
                         st.pyplot(fig_hold); plt.close(fig_hold)
 
                     st.markdown("---")
@@ -1814,17 +1844,21 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                             axes[0].set_xlabel("Durée (min)"); axes[0].set_ylabel("Distance (km)")
                             axes[0].set_title("Modèle Vitesse Critique"); axes[0].legend(); axes[0].grid(alpha=0.3)
                             if not df_hold.empty:
+                                pcts_pdf = [float(p.replace(" %","")) for p in df_hold["% VC"]]
                                 if mask_ri.any():
-                                    axes[1].plot(df_hold.loc[mask_ri, "Vitesse (m/s)"],
-                                                 df_hold.loc[mask_ri, "Durée (min)"],
-                                                 color="#1f77b4", lw=2, label="Riegel")
+                                    axes[1].plot(
+                                        [pcts_pdf[i] for i in df_hold.index[mask_ri]],
+                                        df_hold.loc[mask_ri, "Durée (min)"],
+                                        "o-", color="#1f77b4", lw=2, label="Riegel")
                                 if mask_dp.any():
-                                    axes[1].plot(df_hold.loc[mask_dp, "Vitesse (m/s)"],
-                                                 df_hold.loc[mask_dp, "Durée (min)"],
-                                                 color="#d62728", lw=2, ls="--", label="Modèle D'")
-                                axes[1].axvline(vc, color="gray", lw=1.5, ls=":")
-                                axes[1].set_xlabel("Vitesse (m/s)"); axes[1].set_ylabel("Durée (min)")
-                                axes[1].set_title("Courbe de tolérance"); axes[1].legend(); axes[1].grid(alpha=0.3)
+                                    axes[1].plot(
+                                        [pcts_pdf[i] for i in df_hold.index[mask_dp]],
+                                        df_hold.loc[mask_dp, "Durée (min)"],
+                                        "o--", color="#d62728", lw=2, label="Modèle D'")
+                                axes[1].axvline(100, color="gray", lw=1.5, ls=":")
+                                axes[1].set_xlabel("% VC"); axes[1].set_ylabel("Durée (min)")
+                                axes[1].set_title("Temps de maintien par % VC")
+                                axes[1].legend(); axes[1].grid(alpha=0.3); axes[1].set_ylim(0)
                             fig_p1.tight_layout(); pdf.savefig(fig_p1); plt.close(fig_p1)
                             for item in loaded:
                                 df_act = item["df"]
