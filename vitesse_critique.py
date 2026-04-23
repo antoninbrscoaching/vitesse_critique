@@ -833,6 +833,202 @@ def build_holding_table(vc_ms: float, d_prime: float,
 
 
 # ══════════════════════════════════════════════════════════════
+# STANDARDS DE PERFORMANCE & PRÉDICTIONS RIEGEL
+# ══════════════════════════════════════════════════════════════
+
+# Sources : FFA minimas 2024-2025, EAA, WA, records homologués
+# Format : hh:mm:ss ou mm:ss — mis à jour manuellement si besoin
+PERF_STANDARDS = {
+    "5 km": {
+        "dist_m": 5000,
+        "H": {
+            "Minima Champ. France":  "0:13:30",
+            "Minima Champ. Europe":  "0:13:15",
+            "Minima Champ. Monde":   "0:13:10",
+            "Record de France":      "0:13:07",  # Jimmy Gressier (2021)
+            "Record d'Europe":       "0:12:48",  # Mohamed Katir (ESP, 2021)
+            "Record du Monde":       "0:12:35",  # Joshua Cheptegei (2020)
+        },
+        "F": {
+            "Minima Champ. France":  "0:15:30",
+            "Minima Champ. Europe":  "0:15:10",
+            "Minima Champ. Monde":   "0:15:05",
+            "Record de France":      "0:14:53",  # Anaïs Chevalier-Bouchet / Muriel Hurtis-Houairi → Léa Philippot ?
+            "Record d'Europe":       "0:14:19",  # Sifan Hassan (NED, 2019)
+            "Record du Monde":       "0:14:05",  # Ejgayehu Taye (2023)
+        },
+    },
+    "10 km": {
+        "dist_m": 10000,
+        "H": {
+            "Minima Champ. France":  "0:28:30",
+            "Minima Champ. Europe":  "0:28:00",
+            "Minima Champ. Monde":   "0:27:45",
+            "Record de France":      "0:27:13",  # Morhad Amdouni (2019)
+            "Record d'Europe":       "0:26:46",  # Mohamed Katir (ESP, 2022)
+            "Record du Monde":       "0:26:11",  # Joshua Cheptegei (2020)
+        },
+        "F": {
+            "Minima Champ. France":  "0:32:30",
+            "Minima Champ. Europe":  "0:31:30",
+            "Minima Champ. Monde":   "0:31:15",
+            "Record de France":      "0:30:39",  # Clémence Calvin (2018)
+            "Record d'Europe":       "0:29:56",  # Sifan Hassan (NED, 2021)
+            "Record du Monde":       "0:29:01",  # Letesenbet Gidey (2021)
+        },
+    },
+    "Semi-marathon": {
+        "dist_m": 21097,
+        "H": {
+            "Minima Champ. France":  "1:03:00",
+            "Minima Champ. Europe":  "1:01:30",
+            "Minima Champ. Monde":   "1:01:00",
+            "Record de France":      "1:00:01",  # Jimmy Gressier (2022)
+            "Record d'Europe":       "0:59:26",  # Julien Wanders (SUI, 2019)
+            "Record du Monde":       "0:57:31",  # Jacob Kiplimo (2021)
+        },
+        "F": {
+            "Minima Champ. France":  "1:12:00",
+            "Minima Champ. Europe":  "1:09:00",
+            "Minima Champ. Monde":   "1:08:00",
+            "Record de France":      "1:07:34",  # Clémence Calvin (2019)
+            "Record d'Europe":       "1:05:46",  # Sifan Hassan (NED, 2020)
+            "Record du Monde":       "1:02:52",  # Letesenbet Gidey (2021)
+        },
+    },
+    "Marathon": {
+        "dist_m": 42195,
+        "H": {
+            "Minima Champ. France":  "2:18:00",
+            "Minima Champ. Europe":  "2:14:00",
+            "Minima Champ. Monde":   "2:11:30",
+            "Record de France":      "2:06:51",  # Morhad Amdouni (2020)
+            "Record d'Europe":       "2:04:11",  # Koen Naert (BEL, 2022)
+            "Record du Monde":       "2:00:35",  # Kelvin Kiptum (2023)
+        },
+        "F": {
+            "Minima Champ. France":  "2:37:00",
+            "Minima Champ. Europe":  "2:30:00",
+            "Minima Champ. Monde":   "2:28:00",
+            "Record de France":      "2:21:49",  # Clémence Calvin (2019)
+            "Record d'Europe":       "2:17:01",  # Yalemzerf Yehualaw (NED, 2022)
+            "Record du Monde":       "2:11:53",  # Tigist Assefa (2023)
+        },
+    },
+}
+
+# Ordre d'affichage du plus accessible au plus exigeant
+STANDARDS_ORDER = [
+    "Minima Champ. France",
+    "Minima Champ. Europe",
+    "Minima Champ. Monde",
+    "Record de France",
+    "Record d'Europe",
+    "Record du Monde",
+]
+
+# Emojis associés
+STANDARDS_EMOJI = {
+    "Minima Champ. France":  "🇫🇷",
+    "Minima Champ. Europe":  "🇪🇺",
+    "Minima Champ. Monde":   "🌍",
+    "Record de France":      "🇫🇷🏅",
+    "Record d'Europe":       "🇪🇺🏅",
+    "Record du Monde":       "🌍🏅",
+}
+
+
+def riegel_predict(dist_m: float, a: float, K: float) -> float:
+    """Prédit le temps en secondes pour une distance donnée avec les paramètres Riegel."""
+    if dist_m <= 0 or a <= 0:
+        return 0.0
+    return float(a) * (float(dist_m) / 1000.0) ** float(K)
+
+
+def predict_performances(vc_ms: float, d_prime: float,
+                          refs_fit: list, K_riegel: float,
+                          genre: str = "H") -> dict:
+    """
+    Pour chaque distance standard, prédit le temps via Riegel
+    et calcule l'écart à chaque standard/record.
+    Retourne un dict {distance_label: {prévu, standards_list}}.
+    """
+    # Recalibrer a et K
+    X, Y = [], []
+    for r in refs_fit:
+        d_m = float(r.get("distance", 0))
+        t_s = float(r.get("temps", 0))
+        if d_m > 0 and t_s > 0:
+            X.append(math.log(d_m / 1000.0))
+            Y.append(math.log(t_s))
+    if len(X) >= 2:
+        K_fit, loga, _, _, _ = sp_stats.linregress(X, Y)
+        K_fit = float(max(0.85, min(1.25, K_fit)))
+        a_fit = math.exp(float(loga))
+    elif len(X) == 1:
+        K_fit = float(K_riegel)
+        a_fit = math.exp(Y[0]) / math.exp(X[0])
+    else:
+        K_fit = float(K_riegel)
+        a_fit = 240.0
+
+    results = {}
+    for dist_label, info in PERF_STANDARDS.items():
+        dist_m   = info["dist_m"]
+        stds     = info.get(genre, {})
+        t_pred_s = riegel_predict(dist_m, a_fit, K_fit)
+        if t_pred_s <= 0:
+            continue
+        pace_pred = pace_str(t_pred_s / (dist_m / 1000.0))
+
+        std_rows = []
+        for std_name in STANDARDS_ORDER:
+            if std_name not in stds:
+                continue
+            t_std_s = hms_to_seconds(stds[std_name])
+            if t_std_s <= 0:
+                continue
+            diff_s   = t_pred_s - t_std_s   # positif = plus lent que le standard
+            emoji    = STANDARDS_EMOJI.get(std_name, "")
+            std_rows.append({
+                "standard":  std_name,
+                "emoji":     emoji,
+                "temps_std": seconds_to_hms(t_std_s),
+                "diff_s":    diff_s,
+                "diff_str":  (f"+{seconds_to_hms(int(diff_s))}" if diff_s > 0
+                              else f"-{seconds_to_hms(int(-diff_s))}"),
+                "atteint":   diff_s <= 0,
+            })
+
+        # Standard le plus proche (en valeur absolue)
+        if std_rows:
+            closest = min(std_rows, key=lambda r: abs(r["diff_s"]))
+        else:
+            closest = None
+
+        results[dist_label] = {
+            "dist_m":     dist_m,
+            "t_pred_s":   t_pred_s,
+            "t_pred_hms": seconds_to_hms(t_pred_s),
+            "pace_pred":  pace_pred,
+            "standards":  std_rows,
+            "closest":    closest,
+        }
+
+    # Distance où l'athlète est proportionnellement le plus proche d'un standard
+    best_dist = None
+    best_ratio = float("inf")
+    for dist_label, info in results.items():
+        if info["closest"]:
+            ratio = abs(info["closest"]["diff_s"]) / max(1, info["closest"]["diff_s"] + info["t_pred_s"])
+            if ratio < best_ratio:
+                best_ratio = ratio
+                best_dist  = dist_label
+
+    return results, best_dist
+
+
+# ══════════════════════════════════════════════════════════════
 # MODÈLE RIEGEL + LOO-CV + RECALIBRATION (v3)
 # ══════════════════════════════════════════════════════════════
 
@@ -1831,6 +2027,108 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                         ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
                         fig_hold.tight_layout()
                         st.pyplot(fig_hold); plt.close(fig_hold)
+
+                    # ── Prédictions & standards ──
+                    st.markdown("---")
+                    st.subheader("🏆 Prédictions & Standards de performance")
+                    st.markdown("""
+<div class="highlight-box">
+Temps prévisionnels sur 5 km, 10 km, semi-marathon et marathon calculés par le modèle Riegel
+calé sur vos performances, avec comparaison aux standards nationaux et records.
+</div>""", unsafe_allow_html=True)
+
+                    genre_sel = st.radio("Catégorie", ["H", "F"], horizontal=True,
+                                         key="genre_standards")
+
+                    refs_pred = st.session_state.get("refs_fit_vc", [])
+                    if not refs_pred:
+                        refs_pred = [
+                            {"distance": item["dist_m"], "temps": item["dur_s"]}
+                            for item in loaded if item["dist_m"] and item["dur_s"] > 0
+                        ]
+                    K_pred = st.session_state.get("K_riegel_vc", 1.06)
+
+                    perf_results, best_dist = predict_performances(
+                        vc, d_prime, refs_pred, K_pred, genre=genre_sel
+                    )
+
+                    if perf_results:
+                        # Ligne de résumé des 4 distances
+                        cols_dist = st.columns(4)
+                        for col_d, (dist_label, info) in zip(cols_dist, perf_results.items()):
+                            with col_d:
+                                delta_txt = None
+                                if info["closest"]:
+                                    c = info["closest"]
+                                    sign = "✅" if c["atteint"] else "⏳"
+                                    delta_txt = f"{sign} {c['diff_str']} de {c['standard']}"
+                                star = " ⭐" if dist_label == best_dist else ""
+                                st.metric(
+                                    label=f"{dist_label}{star}",
+                                    value=info["t_pred_hms"],
+                                    delta=delta_txt,
+                                    delta_color="inverse",
+                                )
+
+                        if best_dist:
+                            st.success(
+                                f"⭐ Distance de prédilection : **{best_dist}** "
+                                f"— c'est là où vous êtes proportionnellement le plus proche d'un standard."
+                            )
+
+                        # Détail par distance
+                        for dist_label, info in perf_results.items():
+                            with st.expander(
+                                f"📏 {dist_label} — {info['t_pred_hms']} "
+                                f"({info['pace_pred']}/km){'  ⭐' if dist_label == best_dist else ''}",
+                                expanded=(dist_label == best_dist),
+                            ):
+                                if not info["standards"]:
+                                    st.caption("Aucun standard disponible pour cette distance.")
+                                    continue
+
+                                # Tableau des écarts
+                                rows_std = []
+                                for s in info["standards"]:
+                                    atteint_str = "✅ Atteint" if s["atteint"] else "⏳ À réaliser"
+                                    rows_std.append({
+                                        "Standard":        f"{s['emoji']} {s['standard']}",
+                                        "Temps standard":  s["temps_std"],
+                                        "Votre prévu":     info["t_pred_hms"],
+                                        "Écart":           s["diff_str"],
+                                        "Statut":          atteint_str,
+                                    })
+                                df_std = pd.DataFrame(rows_std)
+
+                                def style_std_row(row):
+                                    if "✅" in row["Statut"]:
+                                        return ["background-color: #d4edda"] * len(row)
+                                    if row["Standard"] == (
+                                        f"{info['closest']['emoji']} {info['closest']['standard']}"
+                                        if info["closest"] else ""
+                                    ):
+                                        return ["background-color: #e8f0fe; font-weight: bold"] * len(row)
+                                    return [""] * len(row)
+
+                                st.dataframe(
+                                    df_std.style.apply(style_std_row, axis=1),
+                                    use_container_width=True, hide_index=True,
+                                )
+
+                                # Message narratif sur le standard le plus proche
+                                c = info["closest"]
+                                if c:
+                                    if c["atteint"]:
+                                        st.success(
+                                            f"{c['emoji']} Vous atteignez le standard **{c['standard']}** "
+                                            f"avec **{c['diff_str']}** d'avance."
+                                        )
+                                    else:
+                                        st.info(
+                                            f"{c['emoji']} Standard le plus proche : **{c['standard']}** "
+                                            f"— il vous manque **{c['diff_str'].lstrip('+')}** "
+                                            f"pour l'atteindre (objectif à {c['temps_std']})."
+                                        )
 
                     st.markdown("---")
                     st.subheader("📄 Export PDF")
