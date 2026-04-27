@@ -2219,9 +2219,426 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                     else:
                         st.caption("Lancez d'abord le calcul de prédiction pour voir les temps de passage.")
 
+        # ── Animation style Tour de France ──────────────────────────────
+        st.markdown("---")
+        st.subheader("🎬 Animation du parcours — style présentation d'étape")
+        st.caption("Le tracé se dessine progressivement avec un point qui avance, coloré par altitude. "
+                   "Téléchargez le fichier HTML pour le partager ou le lire hors-ligne.")
 
-# ══════════════════════════════════════════════════════════════
-# ONGLET 1 — TESTS D'ENDURANCE + VITESSE CRITIQUE
+        with st.expander("⚙️ Paramètres de l'animation", expanded=True):
+            col_an1, col_an2, col_an3 = st.columns(3)
+            with col_an1:
+                anim_frames   = st.slider("Nombre de frames", 60, 300, 120, 10,
+                                          help="Plus = animation plus fluide mais fichier plus lourd")
+                anim_duration = st.slider("Durée totale (secondes)", 5, 60, 20, 5)
+            with col_an2:
+                anim_color = st.selectbox(
+                    "Colorier le tracé par",
+                    ["Altitude", "Pente", "Distance"],
+                    key="anim_color_by"
+                )
+                anim_style = st.selectbox(
+                    "Style de carte fond",
+                    ["Sombre (trail)", "Satellite ESRI", "Topo", "Blanc (épuré)"],
+                    key="anim_map_style"
+                )
+            with col_an3:
+                anim_width     = st.slider("Épaisseur du tracé", 2, 8, 4)
+                anim_dot_size  = st.slider("Taille du point", 8, 30, 16)
+                anim_show_elev = st.checkbox("Afficher profil d'altitude animé", value=True)
+                anim_show_cp   = st.checkbox("Afficher les checkpoints", value=True)
+
+        if st.button("🎬 Générer l'animation", type="primary", key="btn_generate_anim"):
+            with st.spinner("Génération de l'animation en cours..."):
+
+                # Sous-échantillonnage
+                n_pts   = len(points)
+                step_a  = max(1, n_pts // 600)
+                lats_a  = lats_m[::step_a]
+                lons_a  = lons_m[::step_a]
+                elev_a  = [getattr(p, "elevation", 0.0) or 0.0 for p in points][::step_a]
+                dist_a  = [cum_d_map[i] / 1000.0 for i in range(0, n_pts, step_a)]
+                n_sub   = len(lats_a)
+
+                # Calcul des pentes
+                slopes_a = [0.0]
+                for i in range(1, n_sub):
+                    dd = (dist_a[i] - dist_a[i-1]) * 1000.0
+                    de = elev_a[i] - elev_a[i-1]
+                    slopes_a.append((de / dd * 100.0) if dd > 0.5 else 0.0)
+
+                # Valeur de couleur selon choix
+                if anim_color == "Altitude":
+                    color_vals = elev_a
+                    color_label = "Altitude (m)"
+                elif anim_color == "Pente":
+                    color_vals = slopes_a
+                    color_label = "Pente (%)"
+                else:
+                    color_vals = dist_a
+                    color_label = "Distance (km)"
+
+                cv_min = min(color_vals)
+                cv_max = max(color_vals) if max(color_vals) != cv_min else cv_min + 1
+
+                # Normalisation 0-1
+                cv_norm = [(v - cv_min) / (cv_max - cv_min) for v in color_vals]
+
+                # Colorscale selon style
+                if anim_color == "Pente":
+                    colorscale = "RdYlGn_r"  # rouge montée, vert descente
+                else:
+                    colorscale = "plasma"     # bleu bas → jaune sommet
+
+                # Fond de carte
+                map_styles = {
+                    "Sombre (trail)":  "carto-darkmatter",
+                    "Satellite ESRI":  "white-bg",   # on overlay ESRI tiles
+                    "Topo":            "carto-voyager",
+                    "Blanc (épuré)":   "carto-positron",
+                }
+                mb_style = map_styles.get(anim_style, "carto-darkmatter")
+
+                # Couleur de texte selon fond
+                txt_color = "#ffffff" if "dark" in mb_style or "matter" in mb_style else "#111111"
+
+                # ── Génération des frames ──
+                import json as _json
+
+                frame_step = max(1, n_sub // anim_frames)
+                frame_indices = list(range(frame_step, n_sub + 1, frame_step))
+                if frame_indices[-1] < n_sub:
+                    frame_indices.append(n_sub)
+
+                # Construire le HTML avec Plotly CDN + animation JS pure
+                # (pas de dépendance Python plotly — tout en JS vanilla)
+
+                # Données complètes
+                all_lons_js   = _json.dumps(lons_a)
+                all_lats_js   = _json.dumps(lats_a)
+                all_dist_js   = _json.dumps([round(d, 2) for d in dist_a])
+                all_elev_js   = _json.dumps([round(e, 1) for e in elev_a])
+                all_slope_js  = _json.dumps([round(s, 1) for s in slopes_a])
+                all_cv_js     = _json.dumps([round(v, 4) for v in cv_norm])
+
+                # Checkpoints JS
+                cp_js = "[]"
+                if anim_show_cp and checkpoints:
+                    cp_list = [{"lat": c["lat"], "lon": c["lon"],
+                                "label": c["label"], "dist": c["dist_km"]}
+                               for c in sorted(checkpoints, key=lambda x: x["dist_km"])]
+                    cp_js = _json.dumps(cp_list)
+
+                frame_count  = len(frame_indices)
+                interval_ms  = int(anim_duration * 1000 / frame_count)
+                center_lat   = float(np.mean(lats_a))
+                center_lon   = float(np.mean(lons_a))
+                elev_min_v   = round(min(elev_a))
+                elev_max_v   = round(max(elev_a))
+                total_km_v   = round(dist_a[-1], 1)
+                dplus_v      = round(sum(max(0, elev_a[i]-elev_a[i-1]) for i in range(1, len(elev_a))))
+
+                # Tuiles ESRI si satellite
+                tile_layer_js = ""
+                if anim_style == "Satellite ESRI":
+                    tile_layer_js = """
+                        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                            {attribution: 'ESRI', maxZoom: 19}).addTo(map);
+                    """
+                    use_leaflet = True
+                else:
+                    use_leaflet = False
+
+                dot_color    = "#ff4444"
+                trace_width  = anim_width
+
+                html_anim = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<title>Animation parcours</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:#0d1117; font-family:'SF Pro Display',system-ui,sans-serif; color:#fff; overflow:hidden; }}
+  #main {{ display:flex; flex-direction:column; height:100vh; }}
+  #header {{ padding:16px 24px; background:rgba(0,0,0,0.6); backdrop-filter:blur(10px);
+             display:flex; justify-content:space-between; align-items:center; z-index:10; }}
+  #header h1 {{ font-size:1.1rem; font-weight:700; letter-spacing:.05em; color:#fff; }}
+  #stats {{ display:flex; gap:24px; }}
+  .stat {{ text-align:center; }}
+  .stat-val {{ font-size:1.3rem; font-weight:800; color:#f97316; }}
+  .stat-lbl {{ font-size:0.65rem; color:#999; text-transform:uppercase; letter-spacing:.1em; }}
+  #map-container {{ flex:1; position:relative; }}
+  #map {{ width:100%; height:100%; }}
+  #profile-bar {{ height:90px; background:rgba(0,0,0,0.75); backdrop-filter:blur(8px);
+                  padding:8px 24px; position:relative; }}
+  #profile-canvas {{ width:100%; height:100%; }}
+  #controls {{ position:absolute; bottom:110px; right:20px; display:flex; flex-direction:column;
+               gap:8px; z-index:1000; }}
+  .ctrl-btn {{ background:rgba(255,255,255,0.12); border:1px solid rgba(255,255,255,0.2);
+               color:#fff; border-radius:8px; padding:8px 16px; cursor:pointer; font-size:.8rem;
+               backdrop-filter:blur(8px); transition:all .2s; }}
+  .ctrl-btn:hover {{ background:rgba(255,255,255,0.25); }}
+  .ctrl-btn.active {{ background:#f97316; border-color:#f97316; }}
+  #progress-bar {{ position:absolute; bottom:0; left:0; height:3px;
+                   background:linear-gradient(90deg,#f97316,#ef4444); width:0%; transition:width .1s; }}
+  #dist-label {{ position:absolute; top:10px; left:50%; transform:translateX(-50%);
+                 background:rgba(0,0,0,0.7); padding:4px 12px; border-radius:20px;
+                 font-size:.85rem; font-weight:700; color:#f97316; letter-spacing:.05em; }}
+  #cp-popup {{ display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-60px);
+               background:rgba(0,0,0,0.85); border:1px solid #f97316; border-radius:10px;
+               padding:10px 18px; text-align:center; z-index:9999; pointer-events:none; }}
+  #cp-popup h3 {{ font-size:1rem; color:#f97316; margin-bottom:4px; }}
+  #cp-popup p  {{ font-size:.8rem; color:#ccc; }}
+</style>
+</head>
+<body>
+<div id="main">
+  <div id="header">
+    <h1>🏔 Parcours Trail — {total_km_v} km</h1>
+    <div id="stats">
+      <div class="stat"><div class="stat-val" id="stat-dist">0.0</div><div class="stat-lbl">km parcourus</div></div>
+      <div class="stat"><div class="stat-val" id="stat-elev">—</div><div class="stat-lbl">altitude (m)</div></div>
+      <div class="stat"><div class="stat-val" id="stat-slope">0</div><div class="stat-lbl">pente (%)</div></div>
+      <div class="stat"><div class="stat-val">{dplus_v}</div><div class="stat-lbl">D+ total (m)</div></div>
+    </div>
+  </div>
+  <div id="map-container">
+    <div id="map"></div>
+    <div id="controls">
+      <button class="ctrl-btn active" id="btn-play" onclick="togglePlay()">⏸ Pause</button>
+      <button class="ctrl-btn" onclick="restart()">↺ Restart</button>
+    </div>
+    <div id="cp-popup"><h3 id="cp-name"></h3><p id="cp-info"></p></div>
+    <div id="dist-label" id="dist-label">km 0.0</div>
+  </div>
+  {'<div id="profile-bar"><canvas id="profile-canvas"></canvas><div id="progress-bar"></div></div>' if anim_show_elev else ''}
+</div>
+
+<script>
+const LONS  = {all_lons_js};
+const LATS  = {all_lats_js};
+const DISTS = {all_dist_js};
+const ELEVS = {all_elev_js};
+const SLOPES= {all_slope_js};
+const CVS   = {all_cv_js};
+const CPS   = {cp_js};
+const N     = LONS.length;
+const INTERVAL_MS = {interval_ms};
+const FRAME_STEP  = {frame_step};
+const TOTAL_KM    = {total_km_v};
+const ELEV_MIN    = {elev_min_v};
+const ELEV_MAX    = {elev_max_v};
+
+// Leaflet map
+var map = L.map('map', {{zoomControl:false, attributionControl:false}})
+            .setView([{center_lat}, {center_lon}], 13);
+
+{'L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{maxZoom:19}).addTo(map);' if anim_style == 'Satellite ESRI' else
+ 'L.tileLayer("https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png",{maxZoom:19}).addTo(map);' if 'dark' in mb_style or 'matter' in mb_style else
+ 'L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",{maxZoom:19}).addTo(map);' if 'topo' in anim_style.lower() else
+ 'L.tileLayer("https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png",{maxZoom:19}).addTo(map);'}
+
+// Couleur par valeur normalisée (plasma: bleu→violet→orange→jaune)
+function getColor(t) {{
+  if ({1 if anim_color == 'Pente' else 0}) {{
+    // RdYlGn pour pente: rouge montée, vert descente
+    const slope = SLOPES[Math.min(Math.floor(t * N), N-1)];
+    if (slope > 15) return '#d62728';
+    if (slope > 8)  return '#ff7f0e';
+    if (slope > 3)  return '#ffd700';
+    if (slope > -3) return '#2ca02c';
+    if (slope > -8) return '#17becf';
+    return '#1f77b4';
+  }}
+  // Plasma colorscale
+  const r = Math.round(13 + t * 235);
+  const g = Math.round(8  + t * 150 * (1-t*0.6));
+  const b = Math.round(135 - t * 120);
+  return `rgb(${{r}},${{g}},${{b}})`;
+}}
+
+// Départ marker
+const startIcon = L.divIcon({{className:'',html:'<div style="background:#00ff44;width:14px;height:14px;border-radius:50%;border:2px solid white;box-shadow:0 0 8px #00ff44"></div>',iconAnchor:[7,7]}});
+L.marker([LATS[0], LONS[0]], {{icon:startIcon}}).addTo(map);
+
+// Checkpoints markers
+if (CPS.length > 0) {{
+  CPS.forEach(cp => {{
+    const cpIcon = L.divIcon({{className:'',
+      html:`<div style="background:#f97316;color:white;padding:2px 7px;border-radius:12px;font-size:11px;font-weight:700;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.5)">${{cp.label}}</div>`,
+      iconAnchor:[0,20]}});
+    L.marker([cp.lat, cp.lon], {{icon:cpIcon}}).addTo(map);
+    L.circleMarker([cp.lat, cp.lon], {{radius:8,color:'#f97316',fillColor:'#f97316',fillOpacity:.9,weight:2}}).addTo(map);
+  }});
+}}
+
+// Tracé progressif : polylines par segment coloré
+let polylines = [];
+let dotMarker = null;
+const dotIcon = i => L.divIcon({{className:'',
+  html:`<div style="background:{dot_color};width:${{i*2}}px;height:${{i*2}}px;border-radius:50%;border:2px solid white;box-shadow:0 0 12px {dot_color};transform:translate(-50%,-50%)"></div>`,
+  iconAnchor:[i,i]}});
+
+// Animation state
+let currentIdx = 0;
+let playing = true;
+let timer = null;
+
+function drawSegment(i) {{
+  if (i < 1 || i >= N) return;
+  const t  = CVS[i];
+  const col = getColor(t);
+  const seg = L.polyline([[LATS[i-1], LONS[i-1]], [LATS[i], LONS[i]]],
+    {{color:col, weight:{trace_width}, opacity:0.95, smoothFactor:1}}).addTo(map);
+  polylines.push(seg);
+}}
+
+function updateDot(i) {{
+  const lat = LATS[i], lon = LONS[i];
+  if (dotMarker) map.removeLayer(dotMarker);
+  dotMarker = L.marker([lat, lon], {{icon:dotIcon({anim_dot_size}), zIndexOffset:1000}}).addTo(map);
+}}
+
+function updateStats(i) {{
+  const d = DISTS[i], e = ELEVS[i], s = SLOPES[i];
+  document.getElementById('stat-dist').textContent  = d.toFixed(1);
+  document.getElementById('stat-elev').textContent  = Math.round(e);
+  document.getElementById('stat-slope').textContent = (s >= 0 ? '+' : '') + s.toFixed(1);
+  const distLabel = document.getElementById('dist-label');
+  if (distLabel) distLabel.textContent = 'km ' + d.toFixed(1);
+  // Progress bar
+  const pct = (i / (N-1)) * 100;
+  const pb = document.getElementById('progress-bar');
+  if (pb) pb.style.width = pct + '%';
+  // Checkpoint popup
+  if (CPS.length > 0) {{
+    const nearby = CPS.find(cp => Math.abs(cp.dist - d) < (TOTAL_KM / N * 2));
+    const popup = document.getElementById('cp-popup');
+    if (nearby) {{
+      document.getElementById('cp-name').textContent = nearby.label;
+      document.getElementById('cp-info').textContent = nearby.dist.toFixed(1) + ' km — ' + Math.round(e) + ' m';
+      popup.style.display = 'block';
+      setTimeout(() => {{ popup.style.display = 'none'; }}, 2500);
+    }}
+  }}
+}}
+
+function drawElevProfile() {{
+  {'const canvas = document.getElementById("profile-canvas"); if(!canvas) return;' if anim_show_elev else 'return;'}
+  const canvas = document.getElementById('profile-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+  canvas.width = W; canvas.height = H;
+  ctx.clearRect(0,0,W,H);
+  // Fond dégradé
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0, 'rgba(249,115,22,0.3)');
+  grad.addColorStop(1, 'rgba(249,115,22,0.02)');
+  // Tracé complet
+  ctx.beginPath();
+  ELEVS.forEach((e,i) => {{
+    const x = (i/N)*W;
+    const y = H - ((e - ELEV_MIN)/(ELEV_MAX - ELEV_MIN + 1)) * (H-8) - 4;
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }});
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  // Remplissage
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+  return ctx;
+}}
+
+let profileCtx = null;
+window.addEventListener('load', () => {{
+  profileCtx = drawElevProfile();
+}});
+
+function drawProfileCursor(i) {{
+  if (!profileCtx) return;
+  const canvas = document.getElementById('profile-canvas');
+  if (!canvas) return;
+  const W = canvas.width, H = canvas.height;
+  // Redessiner (rapide)
+  drawElevProfile();
+  // Curseur
+  const x = (i/N)*W;
+  const e = ELEVS[i];
+  const y = H - ((e - ELEV_MIN)/(ELEV_MAX - ELEV_MIN + 1)) * (H-8) - 4;
+  profileCtx.beginPath();
+  profileCtx.arc(x, y, 5, 0, Math.PI*2);
+  profileCtx.fillStyle = '#f97316';
+  profileCtx.fill();
+  profileCtx.beginPath();
+  profileCtx.moveTo(x, 0); profileCtx.lineTo(x, H);
+  profileCtx.strokeStyle = 'rgba(249,115,22,0.5)';
+  profileCtx.lineWidth = 1;
+  profileCtx.stroke();
+}}
+
+function step() {{
+  if (currentIdx >= N) {{
+    playing = false;
+    document.getElementById('btn-play').textContent = '▶ Rejouer';
+    return;
+  }}
+  for (let k = 0; k < FRAME_STEP && currentIdx < N; k++, currentIdx++) {{
+    drawSegment(currentIdx);
+  }}
+  updateDot(currentIdx - 1);
+  updateStats(currentIdx - 1);
+  drawProfileCursor(currentIdx - 1);
+  if (playing) timer = setTimeout(step, INTERVAL_MS);
+}}
+
+function togglePlay() {{
+  playing = !playing;
+  document.getElementById('btn-play').textContent = playing ? '⏸ Pause' : '▶ Play';
+  if (playing) step();
+}}
+
+function restart() {{
+  clearTimeout(timer);
+  polylines.forEach(p => map.removeLayer(p));
+  polylines = [];
+  if (dotMarker) map.removeLayer(dotMarker);
+  dotMarker = null;
+  currentIdx = 0;
+  playing = true;
+  document.getElementById('btn-play').textContent = '⏸ Pause';
+  drawElevProfile();
+  step();
+}}
+
+// Démarrage
+step();
+</script>
+</body></html>"""
+
+                # Afficher dans Streamlit
+                import streamlit.components.v1 as components
+                components.html(html_anim, height=600, scrolling=False)
+
+                # Bouton téléchargement
+                st.download_button(
+                    label="⬇️ Télécharger la vidéo HTML (partager, ouvrir hors-ligne)",
+                    data=html_anim.encode("utf-8"),
+                    file_name=f"parcours_trail_{int(total_dist_km)}km.html",
+                    mime="text/html",
+                    help="Fichier HTML autonome — ouvrez-le dans n'importe quel navigateur, "
+                         "ou partagez-le tel quel."
+                )
+                st.caption("💡 Le fichier HTML est autonome et fonctionne sans connexion internet. "
+                           "Partagez-le par email, WhatsApp, ou hébergez-le sur votre site.")
+
+
+
 # ══════════════════════════════════════════════════════════════
 with main_tabs[1]:
     st.title("🧪 Tests d'endurance & Vitesse Critique (VC)")
