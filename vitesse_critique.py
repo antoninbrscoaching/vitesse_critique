@@ -2012,141 +2012,123 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
         # ── Carte 3D Mapbox ──
         st.markdown("---")
         with st.expander("🗺️ Carte 3D satellite & Profil d'altitude", expanded=False):
-            # Token Mapbox (optionnel — sans token = carte OpenStreetMap basique)
-            mb_token = st.text_input(
-                "Token Mapbox (optionnel — pour vue satellite 3D)",
-                value=st.session_state.get("mapbox_token", ""),
-                key="mapbox_token_input",
-                type="password",
-                help="Créez un compte gratuit sur mapbox.com → Account → Tokens. "
-                     "Sans token : carte vectorielle standard (pas de satellite)."
-            )
-            if mb_token:
-                st.session_state["mapbox_token"] = mb_token
-
             map_style_opt = st.radio(
                 "Style de carte",
-                ["🛰 Satellite (Mapbox)", "🌍 Satellite+Routes (Mapbox)",
-                 "🗺️ Topo OpenStreetMap", "🌃 Dark (Mapbox)"],
+                ["🛰 Satellite ESRI (gratuit)", "🗺️ OpenStreetMap", "🌄 Topo CartoDB"],
                 horizontal=True, key="map_style_opt"
             )
+            st.caption("✅ Toutes ces cartes sont **100% gratuites**, sans inscription ni carte bancaire.")
 
-            use_3d = st.checkbox("Vue 3D (inclinaison + relief)", value=True, key="map_3d")
-            pitch_val = 45 if use_3d else 0
-            bearing_val = st.slider("Orientation (bearing°)", 0, 360, 0, 5,
-                                    key="map_bearing") if use_3d else 0
-
-            # Résolution de la ligne tracé (sous-échantillonnage pour perf)
+            # Sous-échantillonnage pour perf
             n_pts = len(points)
-            step = max(1, n_pts // 500)
-            lats_s = lats_m[::step]; lons_s = lons_m[::step]
+            step = max(1, n_pts // 800)
+            coords_line = [[lats_m[i], lons_m[i]] for i in range(0, n_pts, step)]
 
-            # Choix du style
-            token = st.session_state.get("mapbox_token", "")
-            if "Satellite+Routes" in map_style_opt and token:
-                map_style = "mapbox://styles/mapbox/satellite-streets-v12"
-            elif "Satellite" in map_style_opt and token:
-                map_style = "mapbox://styles/mapbox/satellite-v9"
-            elif "Dark" in map_style_opt and token:
-                map_style = "mapbox://styles/mapbox/dark-v11"
+            # Construire la carte Folium en HTML
+            import json as _json
+            center_lat = float(np.mean(lats_m))
+            center_lon = float(np.mean(lons_m))
+
+            # Choix des tuiles
+            if "Satellite" in map_style_opt:
+                tiles_url  = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                tiles_attr = "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
+                tiles_name = "ESRI Satellite"
+            elif "Topo" in map_style_opt:
+                tiles_url  = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+                tiles_attr = "CartoDB"
+                tiles_name = "CartoDB Voyager"
             else:
-                map_style = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+                tiles_url  = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                tiles_attr = "OpenStreetMap"
+                tiles_name = "OpenStreetMap"
 
-            # Couleurs du tracé selon D+
             y_elev = [getattr(p, "elevation", 0.0) or 0.0 for p in points]
-            path_data = []
-            seg_size = max(1, len(lats_s) // 50)
-            for seg_i in range(0, len(lats_s) - 1, seg_size):
-                seg_lats = lats_s[seg_i:seg_i + seg_size + 1]
-                seg_lons = lons_s[seg_i:seg_i + seg_size + 1]
-                if len(seg_lats) < 2: continue
-                # Gradient rouge→orange selon progression
-                progress = seg_i / max(1, len(lats_s))
-                r = int(220 - progress * 30)
-                g = int(50  + progress * 80)
-                path_data.append({"path": [[lo, la] for la, lo in zip(seg_lats, seg_lons)],
-                                   "color": [r, g, 50]})
 
-            layers = [
-                pdk.Layer("PathLayer", data=path_data,
-                          get_path="path", get_color="color",
-                          width_min_pixels=5, width_scale=1)
-            ]
+            # Couleurs gradient tracé (rouge→orange selon progression)
+            segments_html = []
+            seg_step = max(1, len(coords_line) // 60)
+            for si in range(0, len(coords_line) - 1, seg_step):
+                seg = coords_line[si:si + seg_step + 1]
+                if len(seg) < 2: continue
+                prog = si / max(1, len(coords_line))
+                r = int(255 - prog * 40)
+                g = int(60  + prog * 120)
+                color = f"rgb({r},{g},40)"
+                seg_json = _json.dumps(seg)
+                segments_html.append(f"""
+                    L.polyline({seg_json}, {{color: '{color}', weight: 5, opacity: 0.9}}).addTo(map);
+                """)
 
-            # Marqueurs checkpoints
-            if checkpoints:
-                cp_data = []
-                emoji_colors = {
-                    "🥤 Ravitaillement": [0, 200, 100],
-                    "⏱ Point de passage": [100, 150, 255],
-                    "🏔 Sommet":           [255, 200, 0],
-                    "🔻 Col":              [200, 100, 255],
-                    "🏁 Intermédiaire":    [255, 255, 255],
-                    "⚠️ Point clé":        [255, 80, 80],
-                }
-                for cp in checkpoints:
-                    cp_data.append({
-                        "position": [cp["lon"], cp["lat"]],
-                        "label": cp["label"],
-                        "color": emoji_colors.get(cp["type"], [255, 255, 0]),
-                    })
-                layers.append(pdk.Layer(
-                    "ScatterplotLayer", data=cp_data,
-                    get_position="position",
-                    get_color="color",
-                    get_radius=30,
-                    radius_min_pixels=8,
-                    radius_max_pixels=20,
-                    pickable=True,
-                ))
-                layers.append(pdk.Layer(
-                    "TextLayer", data=cp_data,
-                    get_position="position",
-                    get_text="label",
-                    get_size=14,
-                    get_color=[255, 255, 255],
-                    get_anchor_x="'middle'",
-                    get_pixel_offset=[0, -20],
-                ))
+            # Checkpoints markers
+            cp_colors_js = {{
+                "🥤 Ravitaillement": "#00c864",
+                "⏱ Point de passage": "#6496ff",
+                "🏔 Sommet":          "#ffc800",
+                "🔻 Col":             "#c864ff",
+                "🏁 Intermédiaire":   "#aaaaaa",
+                "⚠️ Point clé":       "#ff5050",
+            }}
+            cp_markers_html = []
+            for cp in checkpoints:
+                col = cp_colors_js.get(cp["type"], "#ffcc00")
+                popup = f"{cp['label']} — {cp['dist_km']:.1f} km — {cp['alt']} m"
+                cp_markers_html.append(f"""
+                    L.circleMarker([{cp['lat']}, {cp['lon']}], {{
+                        radius: 10, color: '{col}', fillColor: '{col}',
+                        fillOpacity: 0.9, weight: 2
+                    }}).bindPopup('<b>{popup}</b>').addTo(map);
+                    L.marker([{cp['lat']}, {cp['lon']}], {{
+                        icon: L.divIcon({{
+                            className: '', html: '<div style="background:{col};color:white;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold;white-space:nowrap">{cp['label']}</div>',
+                            iconAnchor: [0, 20]
+                        }})
+                    }}).addTo(map);
+                """)
 
-            # Marqueurs départ / arrivée
-            special_pts = [
-                {"position": [lons_m[0],  lats_m[0]],  "label": "🟢 Départ", "color": [0, 255, 0]},
-                {"position": [lons_m[-1], lats_m[-1]], "label": "🔴 Arrivée","color": [255, 0, 0]},
-            ]
-            layers.append(pdk.Layer(
-                "ScatterplotLayer", data=special_pts,
-                get_position="position", get_color="color",
-                get_radius=50, radius_min_pixels=10, radius_max_pixels=25, pickable=True,
-            ))
-            layers.append(pdk.Layer(
-                "TextLayer", data=special_pts,
-                get_position="position", get_text="label",
-                get_size=16, get_color=[255, 255, 255],
-                get_pixel_offset=[0, -25],
-            ))
+            # Départ / Arrivée
+            depart_arrivee_html = f"""
+                L.circleMarker([{lats_m[0]}, {lons_m[0]}], {{
+                    radius: 12, color: '#00ff44', fillColor: '#00ff44', fillOpacity: 1, weight: 3
+                }}).bindPopup('<b>🟢 Départ</b>').addTo(map);
+                L.marker([{lats_m[0]}, {lons_m[0]}], {{
+                    icon: L.divIcon({{
+                        className: '', html: '<div style="background:#00ff44;color:#000;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold">Départ</div>',
+                        iconAnchor: [0, 20]
+                    }})
+                }}).addTo(map);
+                L.circleMarker([{lats_m[-1]}, {lons_m[-1]}], {{
+                    radius: 12, color: '#ff2222', fillColor: '#ff2222', fillOpacity: 1, weight: 3
+                }}).bindPopup('<b>🔴 Arrivée</b>').addTo(map);
+                L.marker([{lats_m[-1]}, {lons_m[-1]}], {{
+                    icon: L.divIcon({{
+                        className: '', html: '<div style="background:#ff2222;color:white;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold">Arrivée</div>',
+                        iconAnchor: [0, 20]
+                    }})
+                }}).addTo(map);
+            """
 
-            view_state = pdk.ViewState(
-                latitude=float(np.mean(lats_m)),
-                longitude=float(np.mean(lons_m)),
-                zoom=13, pitch=pitch_val, bearing=bearing_val
-            )
+            segments_js   = "\n".join(segments_html)
+            cp_markers_js = "\n".join(cp_markers_html)
 
-            deck_kwargs = {"initial_view_state": view_state, "layers": layers,
-                           "tooltip": {"text": "{label}"}}
-            if token:
-                deck_kwargs["map_style"] = map_style
-                import os; os.environ["MAPBOX_API_KEY"] = token
-                pdk.settings.mapbox_key = token
-            else:
-                deck_kwargs["map_style"] = map_style
+            html_map = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{{margin:0;padding:0;height:100%;width:100%}}</style>
+</head><body>
+<div id="map" style="height:500px;width:100%"></div>
+<script>
+var map = L.map('map').setView([{center_lat}, {center_lon}], 13);
+L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map);
+{segments_js}
+{cp_markers_js}
+{depart_arrivee_html}
+</script></body></html>"""
 
-            deck = pdk.Deck(**deck_kwargs)
-            st.pydeck_chart(deck, use_container_width=True)
-
-            if not token:
-                st.caption("💡 Ajoutez un token Mapbox gratuit pour la vue satellite HD et le relief 3D. "
-                           "Inscription sur mapbox.com (50 000 vues/mois gratuites).")
+            import streamlit.components.v1 as components
+            components.html(html_map, height=510, scrolling=False)
 
             # ── Profil d'altitude avec checkpoints ──
             x_km  = np.array(cum_d_map) / 1000.0
