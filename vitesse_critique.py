@@ -2061,14 +2061,14 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
                 """)
 
             # Checkpoints markers
-            cp_colors_js = {{
+            cp_colors_js = {
                 "🥤 Ravitaillement": "#00c864",
                 "⏱ Point de passage": "#6496ff",
                 "🏔 Sommet":          "#ffc800",
                 "🔻 Col":             "#c864ff",
                 "🏁 Intermédiaire":   "#aaaaaa",
                 "⚠️ Point clé":       "#ff5050",
-            }}
+            }
             cp_markers_html = []
             for cp in checkpoints:
                 col = cp_colors_js.get(cp["type"], "#ffcc00")
