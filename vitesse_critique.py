@@ -1938,39 +1938,304 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
                 st.dataframe(df_out,use_container_width=True)
 
     if gpx_file and points:
-        with st.expander("🗺️ Carte & Profil d'altitude",expanded=False):
-            try:
-                lats_m=[p.latitude for p in points]; lons_m=[p.longitude for p in points]
-                view=pdk.ViewState(latitude=float(np.mean(lats_m)),longitude=float(np.mean(lons_m)),zoom=13,pitch=0)
-                deck=pdk.Deck(
-                    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-                    initial_view_state=view,
-                    layers=[pdk.Layer("PathLayer",
-                                      data=[{"path":[[lon,lat] for lat,lon in zip(lats_m,lons_m)]}],
-                                      get_path="path",get_color=[220,50,50],width_min_pixels=4)])
-                st.pydeck_chart(deck,use_container_width=True)
-                cum_d=[0.0]
-                for i in range(1,len(points)):
-                    cum_d.append(cum_d[-1]+haversine_m(points[i-1].latitude,points[i-1].longitude,
-                                                        points[i].latitude,points[i].longitude))
-                x_km=np.array(cum_d)/1000.0
-                y_gps=np.array([getattr(p,"elevation",0.0) or 0.0 for p in points])
-                w=int(elev_smooth_window); w+=(1 if w%2==0 else 0)
-                fig3,ax3=plt.subplots(figsize=(10,3))
-                if w>=3 and y_gps.size>=w:
-                    y_s=np.convolve(y_gps,np.ones(w)/w,mode="same")
-                    ax3.plot(x_km,y_s,lw=2,label="GPS lissé",color="steelblue")
-                    ax3.plot(x_km,y_gps,lw=1,alpha=0.2,color="gray",label="GPS brut")
-                else:
-                    ax3.plot(x_km,y_gps,lw=2,label="GPS",color="steelblue")
-                if dem_elevations is not None and len(dem_elevations)==len(points):
-                    y_dem=np.array([e if e is not None else 0.0 for e in dem_elevations])
-                    ax3.plot(x_km,y_dem,lw=2,ls="--",label="DEM corrigé",color="forestgreen")
-                ax3.set_xlabel("Distance (km)"); ax3.set_ylabel("Altitude (m)")
-                ax3.set_title("Profil d'altitude"); ax3.legend(); ax3.grid(alpha=0.3)
-                st.pyplot(fig3); plt.close(fig3)
-            except Exception as e:
-                st.error(f"Impossible d'afficher la carte : {e}")
+        # ── Calcul de la distance cumulée (partagé pour carte + profil) ──
+        cum_d_map = [0.0]
+        for i in range(1, len(points)):
+            cum_d_map.append(cum_d_map[-1] + haversine_m(
+                points[i-1].latitude, points[i-1].longitude,
+                points[i].latitude,   points[i].longitude))
+        total_dist_km = cum_d_map[-1] / 1000.0
+        lats_m = [p.latitude  for p in points]
+        lons_m = [p.longitude for p in points]
+
+        # ── Section Checkpoints / Ravitaillements ──
+        st.markdown("---")
+        st.subheader("📍 Checkpoints & Ravitaillements")
+        st.caption(f"Distance totale du parcours : **{total_dist_km:.2f} km**")
+
+        if "checkpoints" not in st.session_state:
+            st.session_state["checkpoints"] = []
+
+        col_cp1, col_cp2, col_cp3 = st.columns([2, 2, 1])
+        with col_cp1:
+            cp_dist = st.number_input(
+                "Distance du checkpoint (km)", min_value=0.1,
+                max_value=float(total_dist_km), value=min(5.0, float(total_dist_km)),
+                step=0.1, key="cp_dist_input",
+                help="Distance depuis le départ en km"
+            )
+        with col_cp2:
+            cp_type = st.selectbox(
+                "Type", ["🥤 Ravitaillement", "⏱ Point de passage", "🏔 Sommet",
+                         "🔻 Col", "🏁 Intermédiaire", "⚠️ Point clé"],
+                key="cp_type_input"
+            )
+        with col_cp3:
+            cp_nom = st.text_input("Nom (optionnel)", value="", key="cp_nom_input",
+                                   placeholder="ex: Ravito km7")
+
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("➕ Ajouter ce checkpoint"):
+                # Trouver lat/lon interpolé à cette distance
+                cp_dist_m = cp_dist * 1000.0
+                cp_lat = float(np.interp(cp_dist_m, cum_d_map, lats_m))
+                cp_lon = float(np.interp(cp_dist_m, cum_d_map, lons_m))
+                # Trouver l'altitude interpolée
+                y_gps_cp = [getattr(p, "elevation", 0.0) or 0.0 for p in points]
+                cp_alt = float(np.interp(cp_dist_m, cum_d_map, y_gps_cp))
+                label = cp_nom.strip() if cp_nom.strip() else f"{cp_type} km {cp_dist:.1f}"
+                st.session_state["checkpoints"].append({
+                    "dist_km": cp_dist,
+                    "type": cp_type,
+                    "label": label,
+                    "lat": cp_lat,
+                    "lon": cp_lon,
+                    "alt": round(cp_alt),
+                })
+                st.success(f"✅ Checkpoint ajouté : {label}")
+        with col_btn2:
+            if st.button("🗑️ Effacer tous les checkpoints"):
+                st.session_state["checkpoints"] = []
+
+        # Afficher les checkpoints existants
+        checkpoints = st.session_state["checkpoints"]
+        if checkpoints:
+            df_cp = pd.DataFrame([{
+                "Type": c["type"], "Nom": c["label"],
+                "Distance": f"{c['dist_km']:.1f} km",
+                "Altitude GPS": f"{c['alt']} m",
+                "Lat": round(c["lat"], 5), "Lon": round(c["lon"], 5),
+            } for c in sorted(checkpoints, key=lambda x: x["dist_km"])])
+            st.dataframe(df_cp, use_container_width=True, hide_index=True)
+
+        # ── Carte 3D Mapbox ──
+        st.markdown("---")
+        with st.expander("🗺️ Carte 3D satellite & Profil d'altitude", expanded=False):
+            # Token Mapbox (optionnel — sans token = carte OpenStreetMap basique)
+            mb_token = st.text_input(
+                "Token Mapbox (optionnel — pour vue satellite 3D)",
+                value=st.session_state.get("mapbox_token", ""),
+                key="mapbox_token_input",
+                type="password",
+                help="Créez un compte gratuit sur mapbox.com → Account → Tokens. "
+                     "Sans token : carte vectorielle standard (pas de satellite)."
+            )
+            if mb_token:
+                st.session_state["mapbox_token"] = mb_token
+
+            map_style_opt = st.radio(
+                "Style de carte",
+                ["🛰 Satellite (Mapbox)", "🌍 Satellite+Routes (Mapbox)",
+                 "🗺️ Topo OpenStreetMap", "🌃 Dark (Mapbox)"],
+                horizontal=True, key="map_style_opt"
+            )
+
+            use_3d = st.checkbox("Vue 3D (inclinaison + relief)", value=True, key="map_3d")
+            pitch_val = 45 if use_3d else 0
+            bearing_val = st.slider("Orientation (bearing°)", 0, 360, 0, 5,
+                                    key="map_bearing") if use_3d else 0
+
+            # Résolution de la ligne tracé (sous-échantillonnage pour perf)
+            n_pts = len(points)
+            step = max(1, n_pts // 500)
+            lats_s = lats_m[::step]; lons_s = lons_m[::step]
+
+            # Choix du style
+            token = st.session_state.get("mapbox_token", "")
+            if "Satellite+Routes" in map_style_opt and token:
+                map_style = "mapbox://styles/mapbox/satellite-streets-v12"
+            elif "Satellite" in map_style_opt and token:
+                map_style = "mapbox://styles/mapbox/satellite-v9"
+            elif "Dark" in map_style_opt and token:
+                map_style = "mapbox://styles/mapbox/dark-v11"
+            else:
+                map_style = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+
+            # Couleurs du tracé selon D+
+            y_elev = [getattr(p, "elevation", 0.0) or 0.0 for p in points]
+            path_data = []
+            seg_size = max(1, len(lats_s) // 50)
+            for seg_i in range(0, len(lats_s) - 1, seg_size):
+                seg_lats = lats_s[seg_i:seg_i + seg_size + 1]
+                seg_lons = lons_s[seg_i:seg_i + seg_size + 1]
+                if len(seg_lats) < 2: continue
+                # Gradient rouge→orange selon progression
+                progress = seg_i / max(1, len(lats_s))
+                r = int(220 - progress * 30)
+                g = int(50  + progress * 80)
+                path_data.append({"path": [[lo, la] for la, lo in zip(seg_lats, seg_lons)],
+                                   "color": [r, g, 50]})
+
+            layers = [
+                pdk.Layer("PathLayer", data=path_data,
+                          get_path="path", get_color="color",
+                          width_min_pixels=5, width_scale=1)
+            ]
+
+            # Marqueurs checkpoints
+            if checkpoints:
+                cp_data = []
+                emoji_colors = {
+                    "🥤 Ravitaillement": [0, 200, 100],
+                    "⏱ Point de passage": [100, 150, 255],
+                    "🏔 Sommet":           [255, 200, 0],
+                    "🔻 Col":              [200, 100, 255],
+                    "🏁 Intermédiaire":    [255, 255, 255],
+                    "⚠️ Point clé":        [255, 80, 80],
+                }
+                for cp in checkpoints:
+                    cp_data.append({
+                        "position": [cp["lon"], cp["lat"]],
+                        "label": cp["label"],
+                        "color": emoji_colors.get(cp["type"], [255, 255, 0]),
+                    })
+                layers.append(pdk.Layer(
+                    "ScatterplotLayer", data=cp_data,
+                    get_position="position",
+                    get_color="color",
+                    get_radius=30,
+                    radius_min_pixels=8,
+                    radius_max_pixels=20,
+                    pickable=True,
+                ))
+                layers.append(pdk.Layer(
+                    "TextLayer", data=cp_data,
+                    get_position="position",
+                    get_text="label",
+                    get_size=14,
+                    get_color=[255, 255, 255],
+                    get_anchor_x="'middle'",
+                    get_pixel_offset=[0, -20],
+                ))
+
+            # Marqueurs départ / arrivée
+            special_pts = [
+                {"position": [lons_m[0],  lats_m[0]],  "label": "🟢 Départ", "color": [0, 255, 0]},
+                {"position": [lons_m[-1], lats_m[-1]], "label": "🔴 Arrivée","color": [255, 0, 0]},
+            ]
+            layers.append(pdk.Layer(
+                "ScatterplotLayer", data=special_pts,
+                get_position="position", get_color="color",
+                get_radius=50, radius_min_pixels=10, radius_max_pixels=25, pickable=True,
+            ))
+            layers.append(pdk.Layer(
+                "TextLayer", data=special_pts,
+                get_position="position", get_text="label",
+                get_size=16, get_color=[255, 255, 255],
+                get_pixel_offset=[0, -25],
+            ))
+
+            view_state = pdk.ViewState(
+                latitude=float(np.mean(lats_m)),
+                longitude=float(np.mean(lons_m)),
+                zoom=13, pitch=pitch_val, bearing=bearing_val
+            )
+
+            deck_kwargs = {"initial_view_state": view_state, "layers": layers,
+                           "tooltip": {"text": "{label}"}}
+            if token:
+                deck_kwargs["map_style"] = map_style
+                import os; os.environ["MAPBOX_API_KEY"] = token
+                pdk.settings.mapbox_key = token
+            else:
+                deck_kwargs["map_style"] = map_style
+
+            deck = pdk.Deck(**deck_kwargs)
+            st.pydeck_chart(deck, use_container_width=True)
+
+            if not token:
+                st.caption("💡 Ajoutez un token Mapbox gratuit pour la vue satellite HD et le relief 3D. "
+                           "Inscription sur mapbox.com (50 000 vues/mois gratuites).")
+
+            # ── Profil d'altitude avec checkpoints ──
+            x_km  = np.array(cum_d_map) / 1000.0
+            y_gps = np.array(y_elev)
+            w     = int(elev_smooth_window); w += (1 if w % 2 == 0 else 0)
+
+            fig3, ax3 = plt.subplots(figsize=(11, 3.5))
+
+            # Remplissage sous la courbe
+            if w >= 3 and y_gps.size >= w:
+                y_s = np.convolve(y_gps, np.ones(w) / w, mode="same")
+                ax3.fill_between(x_km, y_s.min() - 5, y_s, alpha=0.15, color="steelblue")
+                ax3.plot(x_km, y_s, lw=2.5, label="Altitude GPS lissée", color="steelblue")
+                ax3.plot(x_km, y_gps, lw=0.8, alpha=0.2, color="gray", label="GPS brut")
+            else:
+                ax3.fill_between(x_km, y_gps.min() - 5, y_gps, alpha=0.15, color="steelblue")
+                ax3.plot(x_km, y_gps, lw=2.5, label="Altitude GPS", color="steelblue")
+
+            if dem_elevations is not None and len(dem_elevations) == len(points):
+                y_dem = np.array([e if e is not None else 0.0 for e in dem_elevations])
+                ax3.plot(x_km, y_dem, lw=2, ls="--", label="DEM corrigé", color="forestgreen")
+
+            # Tracer les checkpoints sur le profil
+            cp_colors_profile = {
+                "🥤 Ravitaillement": "#00c864",
+                "⏱ Point de passage": "#6496ff",
+                "🏔 Sommet":          "#ffc800",
+                "🔻 Col":             "#c864ff",
+                "🏁 Intermédiaire":   "#ffffff",
+                "⚠️ Point clé":       "#ff5050",
+            }
+            for cp in sorted(checkpoints, key=lambda x: x["dist_km"]):
+                cp_x = cp["dist_km"]
+                cp_y = float(np.interp(cp_x * 1000, cum_d_map, y_gps))
+                col_cp = cp_colors_profile.get(cp["type"], "#ffcc00")
+                ax3.axvline(cp_x, color=col_cp, lw=1.5, ls="--", alpha=0.7)
+                ax3.annotate(
+                    cp["label"], xy=(cp_x, cp_y),
+                    xytext=(0, 12), textcoords="offset points",
+                    ha="center", fontsize=7.5, color=col_cp, fontweight="bold",
+                    arrowprops=dict(arrowstyle="-", color=col_cp, lw=1),
+                )
+                ax3.scatter([cp_x], [cp_y], s=60, color=col_cp, zorder=5)
+
+            # Départ / Arrivée
+            ax3.scatter([x_km[0]],  [y_gps[0]],  s=80, color="lime",  zorder=6, marker="^", label="Départ")
+            ax3.scatter([x_km[-1]], [y_gps[-1]], s=80, color="red",   zorder=6, marker="s", label="Arrivée")
+
+            ax3.set_xlabel("Distance (km)"); ax3.set_ylabel("Altitude (m)")
+            ax3.set_title(f"Profil d'altitude — {total_dist_km:.1f} km")
+            ax3.legend(fontsize=8); ax3.grid(alpha=0.25)
+            fig3.tight_layout()
+            st.pyplot(fig3); plt.close(fig3)
+
+            # ── Tableau des temps de passage aux checkpoints ──
+            if checkpoints and "res" in st.session_state:
+                res_cp = st.session_state["res"]
+                df_out_cp = res_cp.get("df")
+                if df_out_cp is not None and not df_out_cp.empty:
+                    st.markdown("#### ⏱ Temps de passage aux checkpoints")
+                    st.caption("Estimé d'après la prédiction km par km.")
+                    # Construire un index distance→temps cumulé depuis df_out
+                    km_vals, t_cum_vals = [], []
+                    for _, row_cp in df_out_cp.iterrows():
+                        km_str = str(row_cp["Km"])
+                        try:
+                            km_num = float(km_str.split()[0])
+                        except:
+                            continue
+                        t_s_val = hms_to_seconds(str(row_cp["Temps cumulé"]))
+                        km_vals.append(km_num); t_cum_vals.append(t_s_val)
+
+                    if len(km_vals) >= 2:
+                        passage_rows = []
+                        for cp in sorted(checkpoints, key=lambda x: x["dist_km"]):
+                            t_passage = float(np.interp(cp["dist_km"], km_vals, t_cum_vals))
+                            passage_rows.append({
+                                "Checkpoint": cp["label"],
+                                "Distance":   f"{cp['dist_km']:.1f} km",
+                                "Altitude":   f"{cp['alt']} m",
+                                "Temps prévu": seconds_to_hms(t_passage),
+                                "Allure moy. jusque-là": pace_str(
+                                    t_passage / max(0.001, cp["dist_km"])) + "/km"
+                                    if cp["dist_km"] > 0 else "—",
+                            })
+                        st.dataframe(pd.DataFrame(passage_rows),
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Lancez d'abord le calcul de prédiction pour voir les temps de passage.")
 
 
 # ══════════════════════════════════════════════════════════════
