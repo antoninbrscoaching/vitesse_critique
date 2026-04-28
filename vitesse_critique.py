@@ -2479,7 +2479,7 @@ var map=new maplibregl.Map({
       lbl:{type:'raster',tiles:['https://cartodb-basemaps-a.global.ssl.fastly.net/dark_only_labels/{z}/{x}/{y}.png'],tileSize:256,maxzoom:18},
       dem:{type:'raster-dem',encoding:'terrarium',tiles:['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],tileSize:256,maxzoom:15},
       ghost:{type:'geojson',data:GJ},
-      anim:{type:'geojson',lineMetrics:true,data:{type:'Feature',geometry:{type:'LineString',coordinates:[[LO[0],LA[0]],[LO[0],LA[0]+0.00001]]}}},
+      anim:{type:'geojson',lineMetrics:true,data:{type:'Feature',geometry:{type:'LineString',coordinates:[[LO[0],LA[0]],[LO[Math.min(1,N-1)],LA[Math.min(1,N-1)]]]}}},
       dot:{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}}}
     },
     layers:[
@@ -2494,12 +2494,12 @@ var map=new maplibregl.Map({
       {id:'dot',type:'circle',source:'dot',paint:{'circle-radius':9,'circle-color':'#f97316','circle-stroke-width':2.5,'circle-stroke-color':'#fff','circle-pitch-alignment':'map'}}
     ]
   },
-  center:[CLO,CLT],zoom:12,pitch:62,bearing:-15,antialias:true
+  center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,antialias:true
 });
 
 map.on('load',function(){
   // Terrain 3D — AWS elevation tiles (domaine public, gratuit)
-  map.setTerrain({source:'dem',exaggeration:1.8});
+  map.setTerrain({source:'dem',exaggeration:3.5});
 
   // Checkpoints
   CP.forEach(function(cp){
@@ -2523,7 +2523,7 @@ map.on('load',function(){
 // État animation
 var cur=0,frac=0,playing=true,follow=true,lastTs=null,lcp=-1,dp=0,SPD=1;
 var BASE=N/(TOT*8);
-var coords=[[LO[0],LA[0]],[LO[0],LA[0]+0.00001]];
+var coords=[[LO[0],LA[0]],[LO[Math.min(1,N-1)],LA[Math.min(1,N-1)]]];
 
 function lerp(a,f){var i=Math.min(Math.floor(f),a.length-2),r=f-i;return a[i]*(1-r)+a[i+1]*r;}
 
@@ -2547,7 +2547,7 @@ function frame(ts){
     var ah=Math.min(frac+20,N-1),ai=Math.min(Math.floor(ah),N-2),af=ah-ai;
     var ala=LA[ai]*(1-af)+LA[ai+1]*af,alo=LO[ai]*(1-af)+LO[ai+1]*af;
     var brg=Math.atan2(alo-lo,ala-la)*180/Math.PI;
-    map.easeTo({center:[lo,la],bearing:brg-8,pitch:62,zoom:13.5,duration:180,easing:function(t){return t;}});
+    map.easeTo({center:[lo,la],bearing:brg-8,pitch:70,zoom:13.5,duration:180,easing:function(t){return t;}});
   }
   // Stats
   var d=lerp(DI,frac),s=lerp(SL,frac);
@@ -2623,7 +2623,7 @@ function tgFollow(){
   follow=!follow;
   var b=document.getElementById('bf');
   b.classList.toggle('on',follow);b.textContent=follow?'CAM':'MAP';
-  if(!follow)map.easeTo({center:[CLO,CLT],zoom:12,pitch:62,bearing:-15,duration:700});
+  if(!follow)map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:700});
 }
 function spd(m){
   SPD=m;
@@ -2632,12 +2632,12 @@ function spd(m){
 }
 function rst(){
   playing=false;frac=0;cur=0;dp=0;lcp=-1;lastTs=null;
-  coords=[[LO[0],LA[0]],[LO[0],LA[0]+0.00001]];
+  coords=[[LO[0],LA[0]],[LO[Math.min(1,N-1)],LA[Math.min(1,N-1)]]];
   map.getSource('anim').setData({type:'Feature',geometry:{type:'LineString',coordinates:coords}});
   map.getSource('dot').setData({type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}});
   document.getElementById('bp').innerHTML='&#9646;&#9646;';
   document.getElementById('progf').style.width='0%';
-  map.easeTo({center:[CLO,CLT],zoom:12,pitch:62,bearing:-15,duration:600});
+  map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:600});
   drawP(-1);playing=true;lastTs=null;requestAnimationFrame(frame);
 }
 window.addEventListener('resize',function(){drawP(frac>0?frac:-1);});
