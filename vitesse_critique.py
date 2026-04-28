@@ -2352,235 +2352,338 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                 dot_color    = "#ff4444"
                 trace_width  = anim_width
 
-                html_anim = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Trail — {int(total_dist_km)} km</title>
+                # ── Build Cesium 3D animation HTML ──
+                import json as _json
+
+                LO_js   = _json.dumps([round(x,6) for x in lons_a])
+                LA_js   = _json.dumps([round(x,6) for x in lats_a])
+                DI_js   = _json.dumps([round(x,3) for x in dist_a])
+                EL_js   = _json.dumps([round(e,1) for e in elev_a])
+                SL_js   = _json.dumps([round(s,1) for s in slopes_a])
+                CV_js   = _json.dumps([round(v,4) for v in cv_norm])
+                CP_js   = _json.dumps([
+                    {"lat": c["lat"], "lon": c["lon"],
+                     "label": c["label"], "dist": c["dist_km"],
+                     "elev": c["alt"],
+                     "color": {"🥤 Ravitaillement":"#22d3ee","🏔 Sommet":"#f59e0b",
+                               "🔻 Col":"#a855f7","⚠️ Point clé":"#ef4444",
+                               "⏱ Point de passage":"#60a5fa","🏁 Intermédiaire":"#9ca3af"
+                              }.get(c["type"], "#f97316")}
+                    for c in sorted(checkpoints, key=lambda x: x["dist_km"])
+                ] if anim_show_cp and checkpoints else [])
+
+                _dplus_anim = int(sum(max(0, elev_a[i]-elev_a[i-1]) for i in range(1, len(elev_a))))
+                _emin  = round(min(elev_a)); _emax = round(max(elev_a))
+                _clat  = round(float(np.mean(lats_a)),6)
+                _clon  = round(float(np.mean(lons_a)),6)
+
+                # HTML head + style (pas de f-string pour le JS)
+                _head = f"""<!DOCTYPE html>
+<html lang="fr"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Trail 3D — {round(total_dist_km,1)} km</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=Space+Mono&display=swap" rel="stylesheet"/>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>
-:root{{--acc:#f97316;--acc2:#fb923c;--bg:#060a14;--card:rgba(255,255,255,.04);--bd:rgba(255,255,255,.08);--txt:#e2e8f0;--muted:#64748b;}}
-*{{margin:0;padding:0;box-sizing:border-box;}}
-html,body{{height:100%;overflow:hidden;background:var(--bg);}}
-body{{font-family:'Space Grotesk',system-ui,sans-serif;color:var(--txt);}}
-#app{{display:grid;grid-template-rows:auto 1fr 78px;height:100vh;}}
-#hdr{{display:flex;align-items:center;justify-content:space-between;padding:10px 18px;
-      background:rgba(6,10,20,.94);backdrop-filter:blur(16px);
-      border-bottom:1px solid var(--bd);z-index:200;gap:12px;}}
-#logo{{width:30px;height:30px;border-radius:7px;
-       background:linear-gradient(135deg,var(--acc),#dc2626);
-       display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0;
-       box-shadow:0 0 18px rgba(249,115,22,.4);}}
-#ti h1{{font-size:.82rem;font-weight:800;color:#fff;letter-spacing:.05em;}}
-#ti p{{font-size:.6rem;color:var(--muted);font-family:'Space Mono';margin-top:1px;}}
-#stats{{display:flex;gap:5px;flex:1;justify-content:center;flex-wrap:wrap;}}
-.sc{{display:flex;flex-direction:column;align-items:center;
-     background:var(--card);border:1px solid var(--bd);
-     border-radius:7px;padding:4px 10px;min-width:58px;transition:border-color .3s;}}
-.sv{{font-size:.9rem;font-weight:800;font-family:'Space Mono';color:var(--acc);line-height:1.1;transition:color .2s;}}
-.sl{{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-top:1px;}}
-#ctrls{{display:flex;gap:6px;align-items:center;}}
-.btn{{background:var(--card);border:1px solid var(--bd);color:var(--txt);
-      border-radius:7px;padding:5px 12px;cursor:pointer;font-size:.7rem;
-      font-weight:700;font-family:'Space Grotesk';letter-spacing:.04em;transition:all .15s;}}
-.btn:hover{{background:rgba(249,115,22,.2);border-color:var(--acc);color:#fff;}}
-.btn.pl{{background:var(--acc);border-color:var(--acc);color:#fff;}}
-.sp.on{{background:var(--acc);border-color:var(--acc);color:#fff;}}
-#mwrap{{position:relative;min-height:0;}}
-#map{{width:100%;height:100%;}}
-.leaflet-container{{background:#060a14!important;}}
-.leaflet-control-attribution{{display:none!important;}}
-#prog{{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.06);z-index:500;}}
-#progf{{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#ef4444);box-shadow:0 0 8px var(--acc);transition:width .07s linear;}}
-#kmbadge{{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);
-          background:rgba(6,10,20,.88);backdrop-filter:blur(10px);
-          border:1px solid var(--bd);border-radius:18px;padding:4px 14px;
-          font-size:.75rem;font-weight:700;font-family:'Space Mono';color:var(--acc);z-index:500;}}
-#toast{{display:none;position:absolute;top:10px;left:50%;transform:translateX(-50%);
-        background:rgba(6,10,20,.93);backdrop-filter:blur(14px);
-        border-radius:10px;padding:8px 18px;z-index:999;pointer-events:none;
-        text-align:center;min-width:190px;border:1px solid var(--acc);
-        animation:tIn .25s ease;}}
-@keyframes tIn{{from{{opacity:0;transform:translateX(-50%) translateY(-6px)}}to{{opacity:1;transform:translateX(-50%) translateY(0)}}}}
-#toast .tn{{font-size:.85rem;font-weight:700;}}
-#toast .tm{{font-size:.62rem;color:var(--muted);font-family:'Space Mono';}}
-#profile{{background:rgba(6,10,20,.96);border-top:1px solid var(--bd);padding:6px 18px 4px;position:relative;}}
-#profile canvas{{width:100%;height:100%;display:block;}}
-#spwrap{{position:absolute;top:10px;right:14px;display:flex;gap:5px;z-index:500;}}
-</style>
-</head>
-<body>
-<div id="app">
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet"/>
+</head>"""
+
+                _style = """<style>
+:root{--acc:#f97316;--bg:#060a14;--bd:rgba(255,255,255,.08);--muted:#64748b;}
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{height:100%;overflow:hidden;background:var(--bg);font-family:'Space Grotesk',system-ui,sans-serif;color:#e2e8f0;}
+#app{display:grid;grid-template-rows:auto 1fr 76px;height:100vh;}
+#hdr{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;
+     background:rgba(6,10,20,.94);backdrop-filter:blur(16px);
+     border-bottom:1px solid var(--bd);z-index:200;gap:10px;}
+#ti h1{font-size:.8rem;font-weight:800;letter-spacing:.05em;}
+#ti p{font-size:.58rem;color:var(--muted);font-family:'Space Mono';}
+#stats{display:flex;gap:5px;flex:1;justify-content:center;flex-wrap:wrap;}
+.sc{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.04);
+    border:1px solid var(--bd);border-radius:7px;padding:3px 10px;min-width:56px;}
+.sv{font-size:.88rem;font-weight:800;font-family:'Space Mono';color:var(--acc);transition:color .2s;}
+.sl{font-size:.48rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;}
+#ctrls{display:flex;gap:5px;align-items:center;}
+.btn{background:rgba(255,255,255,.05);border:1px solid var(--bd);color:#e2e8f0;border-radius:7px;
+     padding:5px 11px;cursor:pointer;font-size:.68rem;font-weight:700;font-family:'Space Grotesk';
+     letter-spacing:.04em;transition:all .15s;}
+.btn:hover,.btn.on{background:rgba(249,115,22,.25);border-color:var(--acc);color:#fff;}
+.btn.pl{background:var(--acc);border-color:var(--acc);color:#fff;}
+#cesium{width:100%;height:100%;}
+.cesium-viewer-toolbar,.cesium-viewer-animationContainer,
+.cesium-viewer-timelineContainer,.cesium-viewer-bottom,
+.cesium-viewer-fullscreenContainer{display:none!important;}
+#prog{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.06);z-index:500;}
+#progf{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#ef4444);box-shadow:0 0 8px var(--acc);}
+#kmbadge{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);
+         background:rgba(6,10,20,.88);backdrop-filter:blur(10px);
+         border:1px solid var(--bd);border-radius:18px;padding:4px 14px;
+         font-size:.72rem;font-weight:700;font-family:'Space Mono';color:var(--acc);z-index:500;}
+#toast{display:none;position:absolute;top:10px;left:50%;transform:translateX(-50%);
+       background:rgba(6,10,20,.93);backdrop-filter:blur(14px);border-radius:10px;
+       padding:8px 18px;z-index:999;pointer-events:none;text-align:center;
+       min-width:190px;border:1px solid var(--acc);}
+.tn{font-size:.85rem;font-weight:700;}.tm{font-size:.62rem;color:var(--muted);font-family:'Space Mono';}
+#mwrap{position:relative;min-height:0;}
+#profile{background:rgba(6,10,20,.96);border-top:1px solid var(--bd);padding:6px 16px 4px;}
+#profile canvas{width:100%;height:100%;display:block;}
+</style>"""
+
+                _body = f"""<body><div id="app">
 <div id="hdr">
-  <div id="logo">🏔</div>
   <div id="ti">
-    <h1>TRAIL — {int(total_dist_km)} KM</h1>
-    <p>D+ {int(float(np.sum(np.clip(np.diff([getattr(p,"elevation",0.) or 0. for p in points]),0,None))))} M · {int(min(elev_a))}–{int(max(elev_a))} M ALT.</p>
+    <h1>🏔 TRAIL — {round(total_dist_km,1)} KM</h1>
+    <p>D+ {_dplus_anim} M · {_emin}–{_emax} M ALT.</p>
   </div>
   <div id="stats">
     <div class="sc"><div class="sv" id="sd">0.0</div><div class="sl">km</div></div>
     <div class="sc"><div class="sv" id="se">—</div><div class="sl">alt m</div></div>
     <div class="sc"><div class="sv" id="ss">0%</div><div class="sl">pente</div></div>
-    <div class="sc"><div class="sv" id="sp">0</div><div class="sl">d+</div></div>
+    <div class="sc"><div class="sv" id="sp">0</div><div class="sl">d+ m</div></div>
   </div>
   <div id="ctrls">
-    <div id="spwrap" style="position:static;display:flex;gap:5px;">
-      <button class="btn sp on" id="spx1" onclick="setSpeed(1)">1×</button>
-      <button class="btn sp" id="spx2" onclick="setSpeed(2)">2×</button>
-      <button class="btn sp" id="spx4" onclick="setSpeed(4)">4×</button>
-    </div>
+    <button class="btn on" id="spx1" onclick="setSpeed(1)">1×</button>
+    <button class="btn" id="spx2" onclick="setSpeed(2)">2×</button>
+    <button class="btn" id="spx4" onclick="setSpeed(4)">4×</button>
+    <button class="btn on" id="bfol" onclick="toggleFollow()">📷 Follow</button>
     <button class="btn pl" id="bpl" onclick="togglePlay()">⏸</button>
     <button class="btn" onclick="restart()">↺</button>
   </div>
 </div>
 <div id="mwrap">
-  <div id="map"></div>
+  <div id="cesium"></div>
   <div id="prog"><div id="progf"></div></div>
   <div id="kmbadge">0.0 / {round(total_dist_km,1)} km</div>
   <div id="toast"><div class="tn" id="tn"></div><div class="tm" id="tm"></div></div>
 </div>
 <div id="profile"><canvas id="pc"></canvas></div>
-</div>
-<script>
-const LO={_json.dumps([round(x,6) for x in lons_a])};
-const LA={_json.dumps([round(x,6) for x in lats_a])};
-const DI={_json.dumps([round(x,3) for x in dist_a])};
-const EL={_json.dumps([round(e,1) for e in elev_a])};
-const SL={_json.dumps([round(s,1) for s in slopes_a])};
-const CV={_json.dumps([round(v,4) for v in cv_norm])};
-const CP={cp_js};
-const N=LO.length,EMIN={round(min(elev_a))},EMAX={round(max(elev_a))},TOTAL={round(total_dist_km,1)};
-let FS={frame_step},INT={interval_ms},MULT=1;
+</div>"""
 
-var map=L.map('map',{{zoomControl:false,attributionControl:false}}).setView([{center_lat},{center_lon}],13);
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',{{maxZoom:19,opacity:.82}}).addTo(map);
-L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',{{maxZoom:19,opacity:.5}}).addTo(map);
+                # JS sans f-string — injection via placeholders
+                _js_template = """<script>
+const LO=__LO__;const LA=__LA__;const DI=__DI__;
+const EL=__EL__;const SL=__SL__;const CV=__CV__;
+const CP=__CP__;
+const N=LO.length,EMIN=__EMIN__,EMAX=__EMAX__,TOTAL=__TOTAL__;
+const CL=__CL__,CO=__CO__;
 
-function altCol(t){{
-  if(t>.85){{const f=(t-.85)/.15;const v=Math.round(210+f*45);return `rgb(${{v}},${{v}},${{v}})`;}}
-  if(t>.6) {{const f=(t-.6)/.25;return `rgb(249,${{Math.round(115+f*80)}},22)`;}}
-  if(t>.35){{const f=(t-.35)/.25;return `rgb(${{Math.round(74+f*175)}},${{Math.round(222-f*110)}},128)`;}}
-  return `rgb(38,${{Math.round(180+t*60)}},248)`;
-}}
+Cesium.Ion.defaultAccessToken='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYWE1OWUxNy1mMWZiLTQzYjYtYTQ0OS0xMzE0MjUxNjk4ZWYiLCJpZCI6NTkwNDIsImlhdCI6MTYyMzE5MzUxNn0.zTjHm9VbOra-JQEJBhqgAAlzPwYVnm3-QpGXhDjY0sA';
+const viewer=new Cesium.Viewer('cesium',{
+  terrainProvider:Cesium.createWorldTerrain({requestVertexNormals:true}),
+  baseLayerPicker:false,navigationHelpButton:false,homeButton:false,
+  sceneModePicker:false,geocoder:false,animation:false,
+  timeline:false,fullscreenButton:false,infoBox:false,
+  selectionIndicator:false,skyBox:false,
+  skyAtmosphere:new Cesium.SkyAtmosphere(),scene3DOnly:true,
+});
+viewer.scene.globe.enableLighting=true;
+viewer.scene.globe.depthTestAgainstTerrain=true;
+viewer.scene.fog.enabled=true;viewer.scene.fog.density=0.0002;
 
-const mkIco=(c,g,s)=>L.divIcon({{className:'',iconAnchor:[s/2,s/2],
-  html:`<div style="width:${{s}}px;height:${{s}}px;background:${{c}};border-radius:50%;border:2px solid rgba(255,255,255,.9);box-shadow:0 0 12px ${{g||c}}"></div>`}});
-L.marker([LA[0],LO[0]],{{icon:mkIco('#4ade80','#4ade80',14)}}).addTo(map);
-L.marker([LA[N-1],LO[N-1]],{{icon:mkIco('#f87171','#f87171',14)}}).addTo(map);
+function altCol(t){
+  if(t>.85){const v=210+Math.round((t-.85)/.15*45);return Cesium.Color.fromCssColorString('rgb('+v+','+v+','+v+')');}
+  if(t>.6)return Cesium.Color.fromCssColorString('rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)');
+  if(t>.35)return Cesium.Color.fromCssColorString('rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)');
+  return Cesium.Color.fromCssColorString('rgb(38,'+Math.round(180+t*60)+',248)');
+}
+function altColStr(t){
+  if(t>.85){const v=Math.round(210+(t-.85)/.15*45);return 'rgb('+v+','+v+','+v+')';}
+  if(t>.6)return 'rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)';
+  if(t>.35)return 'rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)';
+  return 'rgb(38,'+Math.round(180+t*60)+',248)';
+}
 
-CP.forEach(cp=>{{
-  L.circleMarker([cp.lat,cp.lon],{{radius:8,color:cp.color||'#f97316',fillColor:cp.color||'#f97316',fillOpacity:.95,weight:2}}).addTo(map);
-  L.marker([cp.lat,cp.lon],{{icon:L.divIcon({{className:'',iconAnchor:[-4,22],
-    html:`<div style="background:rgba(6,10,20,.9);color:#fff;padding:2px 8px;border-radius:9px;font-size:10px;font-weight:700;white-space:nowrap;border:1px solid ${{cp.color||'#f97316'}};font-family:Space Grotesk,sans-serif">${{cp.label}}</div>`}})}}).addTo(map);
+// Tracé fantôme
+const ghostPos=LA.map((la,i)=>Cesium.Cartesian3.fromDegrees(LO[i],la,EL[i]+5));
+viewer.entities.add({polyline:{positions:ghostPos,width:2,
+  material:new Cesium.ColorMaterialProperty(Cesium.Color.WHITE.withAlpha(0.05)),clampToGround:false}});
+
+// Checkpoints
+CP.forEach(cp=>{
+  viewer.entities.add({
+    position:Cesium.Cartesian3.fromDegrees(cp.lon,cp.lat,cp.elev+20),
+    billboard:{
+      image:'data:image/svg+xml,'+encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="140" height="36">'+
+        '<rect rx="8" ry="8" width="140" height="36" fill="'+cp.color+'" opacity=".92"/>'+
+        '<text x="70" y="24" font-family="system-ui" font-weight="700" font-size="13" fill="white" text-anchor="middle">'+cp.label+'</text>'+
+        '</svg>'),
+      verticalOrigin:Cesium.VerticalOrigin.BOTTOM,disableDepthTestDistance:1e9,
+      scaleByDistance:new Cesium.NearFarScalar(500,1.2,50000,.4),
+    },
+    point:{pixelSize:12,color:Cesium.Color.fromCssColorString(cp.color),
+           outlineColor:Cesium.Color.WHITE,outlineWidth:2,disableDepthTestDistance:1e9},
+  });
+});
+
+// Départ / Arrivée
+viewer.entities.add({position:Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+10),
+  point:{pixelSize:16,color:Cesium.Color.fromCssColorString('#4ade80'),outlineColor:Cesium.Color.WHITE,outlineWidth:2,disableDepthTestDistance:1e9}});
+viewer.entities.add({position:Cesium.Cartesian3.fromDegrees(LO[N-1],LA[N-1],EL[N-1]+10),
+  point:{pixelSize:16,color:Cesium.Color.fromCssColorString('#f87171'),outlineColor:Cesium.Color.WHITE,outlineWidth:2,disableDepthTestDistance:1e9}});
+
+// Point animé
+let dotPos=Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+8);
+viewer.entities.add({
+  position:new Cesium.CallbackProperty(()=>dotPos,false),
+  point:{pixelSize:18,color:Cesium.Color.fromCssColorString('#f97316'),
+         outlineColor:Cesium.Color.WHITE,outlineWidth:3,disableDepthTestDistance:1e9,
+         scaleByDistance:new Cesium.NearFarScalar(100,1.8,80000,.7)},
+});
+
+// Tracé progressif
+const trailPos=[Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+5)];
+viewer.entities.add({polyline:{
+  positions:new Cesium.CallbackProperty(()=>[...trailPos],false),
+  width:5,
+  material:new Cesium.PolylineGlowMaterialProperty({glowPower:.25,taperPower:.5,
+    color:Cesium.Color.fromCssColorString('#f97316')}),
+  clampToGround:false,
 }});
 
-let segs=[],dot=null,cur=0,playing=true,tmr=null,lcp=-1,cdp=0;
+// Caméra initiale
+viewer.camera.setView({
+  destination:Cesium.Cartesian3.fromDegrees(CO,CL,18000),
+  orientation:{heading:Cesium.Math.toRadians(20),pitch:Cesium.Math.toRadians(-40),roll:0}
+});
 
-function addSeg(i){{
-  if(i<1||i>=N)return;
-  segs.push(L.polyline([[LA[i-1],LO[i-1]],[LA[i],LO[i]]],
-    {{color:altCol(CV[i]),weight:4.5,opacity:.93,smoothFactor:.7,lineCap:'round',lineJoin:'round'}}).addTo(map));
-}}
-function moveDot(i){{
-  if(dot)map.removeLayer(dot);
-  dot=L.marker([LA[i],LO[i]],{{icon:L.divIcon({{className:'',iconAnchor:[10,10],
-    html:'<div style="width:20px;height:20px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#fff 0%,#f97316 45%,#dc2626 100%);border:2.5px solid rgba(255,255,255,.95);box-shadow:0 0 0 4px rgba(249,115,22,.3),0 0 16px rgba(249,115,22,.8),0 0 4px rgba(0,0,0,.6)"></div>'}}),zIndexOffset:2000}}).addTo(map);
-}}
-function updUI(i){{
-  const d=DI[i],e=EL[i],s=SL[i];
-  if(i>0)cdp+=Math.max(0,EL[i]-EL[i-1]);
-  document.getElementById('sd').textContent=d.toFixed(1);
-  document.getElementById('se').textContent=Math.round(e);
+// ── État animation ──
+let cur=0,curFrac=0,playing=true,following=true,lastFrame=null,lcp=-1,cdp=0,SPEED=1;
+const BASE_ADV=N/(TOTAL*8);
+
+// ── Profil canvas ──
+const pc=document.getElementById('pc'),pctx=pc.getContext('2d');
+function drawProf(cursor){
+  pc.width=pc.offsetWidth||800;pc.height=pc.offsetHeight||64;
+  const W=pc.width,H=pc.height;
+  pctx.clearRect(0,0,W,H);
+  const g=pctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(249,115,22,.25)');g.addColorStop(1,'rgba(0,0,0,0)');
+  pctx.beginPath();
+  EL.forEach((e,i)=>{const x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?pctx.lineTo(x,y):pctx.moveTo(x,y);});
+  pctx.lineTo(W,H);pctx.lineTo(0,H);pctx.closePath();pctx.fillStyle=g;pctx.fill();
+  for(let i=1;i<N;i++){
+    const x0=(i-1)/N*W,x1=i/N*W;
+    const y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    const y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    pctx.beginPath();pctx.moveTo(x0,y0);pctx.lineTo(x1,y1);
+    pctx.strokeStyle=i<=(cursor||0)?altColStr(CV[i]):'rgba(255,255,255,.1)';
+    pctx.lineWidth=1.8;pctx.stroke();
+  }
+  CP.forEach(cp=>{
+    const xi=Math.round(cp.dist/TOTAL*(N-1)),xd=cp.dist/TOTAL*W;
+    const y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    pctx.beginPath();pctx.moveTo(xd,0);pctx.lineTo(xd,H);
+    pctx.strokeStyle=cp.color+'55';pctx.lineWidth=1;pctx.stroke();
+    pctx.beginPath();pctx.arc(xd,y,3.5,0,Math.PI*2);pctx.fillStyle=cp.color;pctx.fill();
+  });
+  if(cursor>=0&&cursor<N){
+    const x=cursor/N*W,y=H-((EL[Math.min(Math.floor(cursor),N-1)]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    pctx.beginPath();pctx.moveTo(x,0);pctx.lineTo(x,H);
+    pctx.strokeStyle='rgba(249,115,22,.6)';pctx.lineWidth=1.5;pctx.stroke();
+    pctx.beginPath();pctx.arc(x,y,5,0,Math.PI*2);pctx.fillStyle='#f97316';pctx.fill();
+    pctx.beginPath();pctx.arc(x,y,2.5,0,Math.PI*2);pctx.fillStyle='#fff';pctx.fill();
+  }
+}
+function lerp(arr,frac){
+  const i=Math.min(Math.floor(frac),arr.length-2),f=frac-i;
+  return arr[i]*(1-f)+arr[i+1]*f;
+}
+
+// ── Boucle requestAnimationFrame ──
+function frame(ts){
+  if(!playing)return;
+  if(lastFrame===null)lastFrame=ts;
+  const dt=Math.min((ts-lastFrame)/1000,.1);lastFrame=ts;
+  const advance=BASE_ADV*SPEED*dt*60;
+  curFrac=Math.min(curFrac+advance,N-1);
+  const fi=Math.min(Math.floor(curFrac),N-2),ff=curFrac-fi;
+  const la=LA[fi]*(1-ff)+LA[fi+1]*ff;
+  const lo=LO[fi]*(1-ff)+LO[fi+1]*ff;
+  const el=EL[fi]*(1-ff)+EL[fi+1]*ff;
+  dotPos=Cesium.Cartesian3.fromDegrees(lo,la,el+8);
+  const nc=Math.floor(curFrac);
+  while(cur<nc&&cur<N-1){cur++;trailPos.push(Cesium.Cartesian3.fromDegrees(LO[cur],LA[cur],EL[cur]+5));}
+  if(following&&curFrac>3){
+    const ah=Math.min(curFrac+20,N-1);
+    const afi=Math.min(Math.floor(ah),N-2),aff=ah-afi;
+    const ala=LA[afi]*(1-aff)+LA[afi+1]*aff,alo=LO[afi]*(1-aff)+LO[afi+1]*aff;
+    const brg=Math.atan2(alo-lo,ala-la);
+    viewer.camera.setView({
+      destination:Cesium.Cartesian3.fromDegrees(lo,la,el+300),
+      orientation:{heading:brg+Cesium.Math.toRadians(-20),pitch:Cesium.Math.toRadians(-28),roll:0}
+    });
+  }
+  const d=lerp(DI,curFrac),s=lerp(SL,curFrac);
+  if(curFrac>advance)cdp+=Math.max(0,el-lerp(EL,curFrac-advance));
+  document.getElementById('sd').textContent=d.toFixed(2);
+  document.getElementById('se').textContent=Math.round(el);
   const sel=document.getElementById('ss');
   sel.textContent=(s>=0?'+':'')+s.toFixed(1)+'%';
   sel.style.color=s>12?'#f87171':s>5?'#fb923c':s<-8?'#38bdf8':'#f97316';
   document.getElementById('sp').textContent=Math.round(cdp);
   document.getElementById('kmbadge').textContent=d.toFixed(2)+' / '+TOTAL+' km';
-  document.getElementById('progf').style.width=(i/(N-1)*100)+'%';
-  drawProfCursor(i);
-  checkCp(d,e);
-}}
-function checkCp(d,e){{
-  const th=TOTAL/N*FS*3;
-  CP.forEach((cp,ci)=>{{
-    if(ci!==lcp&&Math.abs(cp.dist-d)<th){{
+  document.getElementById('progf').style.width=(curFrac/(N-1)*100)+'%';
+  drawProf(curFrac);
+  CP.forEach((cp,ci)=>{
+    if(ci!==lcp&&Math.abs(cp.dist-d)<.4){
       lcp=ci;
-      const t=document.getElementById('toast');
       document.getElementById('tn').textContent=cp.label;
-      document.getElementById('tn').style.color=cp.color||'#f97316';
-      document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(e)+' m';
-      t.style.borderColor=cp.color||'#f97316';t.style.display='block';
+      document.getElementById('tn').style.color=cp.color;
+      document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(el)+' m';
+      const t=document.getElementById('toast');
+      t.style.borderColor=cp.color;t.style.display='block';
       clearTimeout(window._ct);window._ct=setTimeout(()=>t.style.display='none',2800);
-    }}
-  }});
-}}
-
-const pc=document.getElementById('pc'),ctx=pc.getContext('2d');
-function drawProf(cursor){{
-  pc.width=pc.offsetWidth||800;pc.height=pc.offsetHeight||62;
-  const W=pc.width,H=pc.height;
-  ctx.clearRect(0,0,W,H);
-  const g=ctx.createLinearGradient(0,0,0,H);
-  g.addColorStop(0,'rgba(249,115,22,.28)');g.addColorStop(.6,'rgba(249,115,22,.06)');g.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.beginPath();
-  EL.forEach((e,i)=>{{const x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}});
-  ctx.lineTo(W,H);ctx.lineTo(0,H);ctx.closePath();ctx.fillStyle=g;ctx.fill();
-  for(let i=1;i<N;i++){{
-    const x0=(i-1)/N*W,x1=i/N*W;
-    const y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
-    const y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
-    ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);
-    ctx.strokeStyle=i<=(cursor||0)?altCol(CV[i]):'rgba(255,255,255,.1)';
-    ctx.lineWidth=1.6;ctx.stroke();
-  }}
-  CP.forEach(cp=>{{
-    const xi=Math.round(cp.dist/TOTAL*(N-1));
-    const xd=cp.dist/TOTAL*W;
-    const y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
-    ctx.beginPath();ctx.moveTo(xd,0);ctx.lineTo(xd,H);
-    ctx.strokeStyle=(cp.color||'#f97316')+'55';ctx.lineWidth=1;ctx.stroke();
-    ctx.beginPath();ctx.arc(xd,y,3.5,0,Math.PI*2);ctx.fillStyle=cp.color||'#f97316';ctx.fill();
-  }});
-  if(cursor>=0&&cursor<N){{
-    const x=cursor/N*W,y=H-((EL[cursor]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
-    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.strokeStyle='rgba(249,115,22,.55)';ctx.lineWidth=1.5;ctx.stroke();
-    ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fillStyle='#f97316';ctx.fill();
-    ctx.beginPath();ctx.arc(x,y,2.5,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();
-  }}
-}}
-function drawProfCursor(i){{drawProf(i);}}
-
-function step(){{
-  if(cur>=N){{playing=false;document.getElementById('bpl').textContent='▶';return;}}
-  for(let k=0;k<FS&&cur<N;k++,cur++)addSeg(cur);
-  moveDot(cur-1);updUI(cur-1);
-  if(playing)tmr=setTimeout(step,INT);
-}}
-function togglePlay(){{
+    }
+  });
+  if(curFrac>=N-1){playing=false;document.getElementById('bpl').textContent='▶';return;}
+  requestAnimationFrame(frame);
+}
+function togglePlay(){
   playing=!playing;
   document.getElementById('bpl').textContent=playing?'⏸':'▶';
-  if(playing)step();
-}}
-function restart(){{
-  clearTimeout(tmr);segs.forEach(s=>map.removeLayer(s));segs=[];
-  if(dot)map.removeLayer(dot);dot=null;
-  cur=0;playing=true;lcp=-1;cdp=0;
-  document.getElementById('bpl').textContent='⏸';
-  drawProf(-1);step();
-}}
-function setSpeed(m){{
-  MULT=m;FS={frame_step}*m;INT=Math.round({interval_ms}/m);
+  if(playing){lastFrame=null;requestAnimationFrame(frame);}
+}
+function toggleFollow(){
+  following=!following;
+  const b=document.getElementById('bfol');
+  b.classList.toggle('on',following);b.textContent=following?'📷 Follow':'🗺️ Free';
+  if(!following)viewer.camera.setView({
+    destination:Cesium.Cartesian3.fromDegrees(CO,CL,18000),
+    orientation:{heading:Cesium.Math.toRadians(20),pitch:Cesium.Math.toRadians(-40),roll:0}
+  });
+}
+function setSpeed(m){
+  SPEED=m;
   ['x1','x2','x4'].forEach(id=>document.getElementById('sp'+id).classList.remove('on'));
   document.getElementById('spx'+m).classList.add('on');
-}}
-window.addEventListener('load',()=>{{drawProf(-1);step();}});
-window.addEventListener('resize',()=>drawProf(cur>0?cur-1:-1));
-</script>
-</body></html>"""
+}
+function restart(){
+  playing=false;curFrac=0;cur=0;cdp=0;lcp=-1;lastFrame=null;
+  trailPos.length=1;trailPos[0]=Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+5);
+  dotPos=Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+8);
+  document.getElementById('bpl').textContent='⏸';
+  document.getElementById('progf').style.width='0%';
+  viewer.camera.setView({
+    destination:Cesium.Cartesian3.fromDegrees(CO,CL,18000),
+    orientation:{heading:Cesium.Math.toRadians(20),pitch:Cesium.Math.toRadians(-40),roll:0}
+  });
+  drawProf(-1);playing=true;
+  setTimeout(()=>{lastFrame=null;requestAnimationFrame(frame);},300);
+}
+window.addEventListener('load',()=>{drawProf(-1);setTimeout(()=>requestAnimationFrame(frame),1800);});
+window.addEventListener('resize',()=>drawProf(curFrac>0?curFrac:-1));
+</script></body></html>"""
+
+                _js = _js_template.replace('__LO__', LO_js).replace('__LA__', LA_js)
+                _js = _js.replace('__DI__', DI_js).replace('__EL__', EL_js)
+                _js = _js.replace('__SL__', SL_js).replace('__CV__', CV_js)
+                _js = _js.replace('__CP__', CP_js)
+                _js = _js.replace('__EMIN__', str(_emin)).replace('__EMAX__', str(_emax))
+                _js = _js.replace('__TOTAL__', str(round(total_dist_km,1)))
+                _js = _js.replace('__CL__', str(_clat)).replace('__CO__', str(_clon))
+
+                html_anim = _head + _style + _body + _js
                 # Sauvegarder dans session_state pour persistance
                 st.session_state["html_anim"] = html_anim
                 st.session_state["html_anim_km"] = int(total_dist_km)
