@@ -2352,16 +2352,16 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                 dot_color    = "#ff4444"
                 trace_width  = anim_width
 
-                # ── Build Cesium 3D animation HTML ──
+                # ── Build animation HTML (Leaflet + ESRI satellite + RAF fluide) ──
                 import json as _json
 
-                LO_js   = _json.dumps([round(x,6) for x in lons_a])
-                LA_js   = _json.dumps([round(x,6) for x in lats_a])
-                DI_js   = _json.dumps([round(x,3) for x in dist_a])
-                EL_js   = _json.dumps([round(e,1) for e in elev_a])
-                SL_js   = _json.dumps([round(s,1) for s in slopes_a])
-                CV_js   = _json.dumps([round(v,4) for v in cv_norm])
-                CP_js   = _json.dumps([
+                LO_js  = _json.dumps([round(x,6) for x in lons_a])
+                LA_js  = _json.dumps([round(x,6) for x in lats_a])
+                DI_js  = _json.dumps([round(x,3) for x in dist_a])
+                EL_js  = _json.dumps([round(e,1) for e in elev_a])
+                SL_js  = _json.dumps([round(s,1) for s in slopes_a])
+                CV_js  = _json.dumps([round(v,4) for v in cv_norm])
+                CP_js  = _json.dumps([
                     {"lat": c["lat"], "lon": c["lon"],
                      "label": c["label"], "dist": c["dist_km"],
                      "elev": c["alt"],
@@ -2372,26 +2372,28 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                     for c in sorted(checkpoints, key=lambda x: x["dist_km"])
                 ] if anim_show_cp and checkpoints else [])
 
-                _dplus_anim = int(sum(max(0, elev_a[i]-elev_a[i-1]) for i in range(1, len(elev_a))))
-                _emin  = round(min(elev_a)); _emax = round(max(elev_a))
-                _clat  = round(float(np.mean(lats_a)),6)
-                _clon  = round(float(np.mean(lons_a)),6)
+                _dplus_a = int(sum(max(0,elev_a[i]-elev_a[i-1]) for i in range(1,len(elev_a))))
+                _emin = round(min(elev_a)); _emax = round(max(elev_a))
+                _clat = round(float(np.mean(lats_a)),6)
+                _clon = round(float(np.mean(lons_a)),6)
 
-                # HTML head + style (pas de f-string pour le JS)
+                _style = anim_style  # garde la valeur du selectbox
+
+                # HTML : head + style séparés du JS pour éviter conflits f-string
                 _head = f"""<!DOCTYPE html>
 <html lang="fr"><head>
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Trail 3D — {round(total_dist_km,1)} km</title>
+<title>Trail — {round(total_dist_km,1)} km</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=Space+Mono&display=swap" rel="stylesheet"/>
-<script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
-<link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet"/>
-</head>"""
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>"""
 
-                _style = """<style>
+                _css = """<style>
 :root{--acc:#f97316;--bg:#060a14;--bd:rgba(255,255,255,.08);--muted:#64748b;}
 *{margin:0;padding:0;box-sizing:border-box;}
-html,body{height:100%;overflow:hidden;background:var(--bg);font-family:'Space Grotesk',system-ui,sans-serif;color:#e2e8f0;}
+html,body{height:100%;overflow:hidden;background:var(--bg);
+  font-family:'Space Grotesk',system-ui,sans-serif;color:#e2e8f0;}
 #app{display:grid;grid-template-rows:auto 1fr 76px;height:100vh;}
 #hdr{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;
      background:rgba(6,10,20,.94);backdrop-filter:blur(16px);
@@ -2399,33 +2401,40 @@ html,body{height:100%;overflow:hidden;background:var(--bg);font-family:'Space Gr
 #ti h1{font-size:.8rem;font-weight:800;letter-spacing:.05em;}
 #ti p{font-size:.58rem;color:var(--muted);font-family:'Space Mono';}
 #stats{display:flex;gap:5px;flex:1;justify-content:center;flex-wrap:wrap;}
-.sc{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.04);
-    border:1px solid var(--bd);border-radius:7px;padding:3px 10px;min-width:56px;}
-.sv{font-size:.88rem;font-weight:800;font-family:'Space Mono';color:var(--acc);transition:color .2s;}
+.sc{display:flex;flex-direction:column;align-items:center;
+    background:rgba(255,255,255,.04);border:1px solid var(--bd);
+    border-radius:7px;padding:3px 10px;min-width:56px;}
+.sv{font-size:.88rem;font-weight:800;font-family:'Space Mono';
+    color:var(--acc);transition:color .2s;}
 .sl{font-size:.48rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;}
 #ctrls{display:flex;gap:5px;align-items:center;}
-.btn{background:rgba(255,255,255,.05);border:1px solid var(--bd);color:#e2e8f0;border-radius:7px;
-     padding:5px 11px;cursor:pointer;font-size:.68rem;font-weight:700;font-family:'Space Grotesk';
-     letter-spacing:.04em;transition:all .15s;}
+.btn{background:rgba(255,255,255,.05);border:1px solid var(--bd);color:#e2e8f0;
+     border-radius:7px;padding:5px 11px;cursor:pointer;font-size:.68rem;
+     font-weight:700;font-family:'Space Grotesk';letter-spacing:.04em;transition:all .15s;}
 .btn:hover,.btn.on{background:rgba(249,115,22,.25);border-color:var(--acc);color:#fff;}
 .btn.pl{background:var(--acc);border-color:var(--acc);color:#fff;}
-#cesium{width:100%;height:100%;}
-.cesium-viewer-toolbar,.cesium-viewer-animationContainer,
-.cesium-viewer-timelineContainer,.cesium-viewer-bottom,
-.cesium-viewer-fullscreenContainer{display:none!important;}
-#prog{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.06);z-index:500;}
-#progf{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#ef4444);box-shadow:0 0 8px var(--acc);}
+#map{width:100%;height:100%;}
+.leaflet-container{background:#060a14!important;}
+.leaflet-control-attribution{display:none!important;}
+#mwrap{position:relative;min-height:0;}
+#prog{position:absolute;bottom:0;left:0;right:0;height:3px;
+      background:rgba(255,255,255,.06);z-index:500;}
+#progf{height:100%;width:0%;
+       background:linear-gradient(90deg,var(--acc),#ef4444);
+       box-shadow:0 0 8px var(--acc);}
 #kmbadge{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);
          background:rgba(6,10,20,.88);backdrop-filter:blur(10px);
          border:1px solid var(--bd);border-radius:18px;padding:4px 14px;
-         font-size:.72rem;font-weight:700;font-family:'Space Mono';color:var(--acc);z-index:500;}
+         font-size:.72rem;font-weight:700;font-family:'Space Mono';
+         color:var(--acc);z-index:500;}
 #toast{display:none;position:absolute;top:10px;left:50%;transform:translateX(-50%);
        background:rgba(6,10,20,.93);backdrop-filter:blur(14px);border-radius:10px;
        padding:8px 18px;z-index:999;pointer-events:none;text-align:center;
        min-width:190px;border:1px solid var(--acc);}
-.tn{font-size:.85rem;font-weight:700;}.tm{font-size:.62rem;color:var(--muted);font-family:'Space Mono';}
-#mwrap{position:relative;min-height:0;}
-#profile{background:rgba(6,10,20,.96);border-top:1px solid var(--bd);padding:6px 16px 4px;}
+.tn{font-size:.85rem;font-weight:700;}
+.tm{font-size:.62rem;color:var(--muted);font-family:'Space Mono';}
+#profile{background:rgba(6,10,20,.96);border-top:1px solid var(--bd);
+         padding:6px 16px 4px;}
 #profile canvas{width:100%;height:100%;display:block;}
 </style>"""
 
@@ -2433,25 +2442,25 @@ html,body{height:100%;overflow:hidden;background:var(--bg);font-family:'Space Gr
 <div id="hdr">
   <div id="ti">
     <h1>🏔 TRAIL — {round(total_dist_km,1)} KM</h1>
-    <p>D+ {_dplus_anim} M · {_emin}–{_emax} M ALT.</p>
+    <p>D+ {_dplus_a} M · {_emin}–{_emax} M ALT.</p>
   </div>
   <div id="stats">
     <div class="sc"><div class="sv" id="sd">0.0</div><div class="sl">km</div></div>
     <div class="sc"><div class="sv" id="se">—</div><div class="sl">alt m</div></div>
     <div class="sc"><div class="sv" id="ss">0%</div><div class="sl">pente</div></div>
-    <div class="sc"><div class="sv" id="sp">0</div><div class="sl">d+ m</div></div>
+    <div class="sc"><div class="sv" id="sp2">0</div><div class="sl">d+ m</div></div>
   </div>
   <div id="ctrls">
-    <button class="btn on" id="spx1" onclick="setSpeed(1)">1×</button>
-    <button class="btn" id="spx2" onclick="setSpeed(2)">2×</button>
-    <button class="btn" id="spx4" onclick="setSpeed(4)">4×</button>
-    <button class="btn on" id="bfol" onclick="toggleFollow()">📷 Follow</button>
-    <button class="btn pl" id="bpl" onclick="togglePlay()">⏸</button>
-    <button class="btn" onclick="restart()">↺</button>
+    <button class="btn on" id="spx1" onclick="setSpeed(1)">1x</button>
+    <button class="btn" id="spx2" onclick="setSpeed(2)">2x</button>
+    <button class="btn" id="spx4" onclick="setSpeed(4)">4x</button>
+    <button class="btn on" id="bfol" onclick="toggleFollow()">CAM</button>
+    <button class="btn pl" id="bpl" onclick="togglePlay()">||</button>
+    <button class="btn" onclick="restart()"><<</button>
   </div>
 </div>
 <div id="mwrap">
-  <div id="cesium"></div>
+  <div id="map"></div>
   <div id="prog"><div id="progf"></div></div>
   <div id="kmbadge">0.0 / {round(total_dist_km,1)} km</div>
   <div id="toast"><div class="tn" id="tn"></div><div class="tm" id="tm"></div></div>
@@ -2459,231 +2468,200 @@ html,body{height:100%;overflow:hidden;background:var(--bg);font-family:'Space Gr
 <div id="profile"><canvas id="pc"></canvas></div>
 </div>"""
 
-                # JS sans f-string — injection via placeholders
-                _js_template = """<script>
-const LO=__LO__;const LA=__LA__;const DI=__DI__;
-const EL=__EL__;const SL=__SL__;const CV=__CV__;
-const CP=__CP__;
-const N=LO.length,EMIN=__EMIN__,EMAX=__EMAX__,TOTAL=__TOTAL__;
-const CL=__CL__,CO=__CO__;
+                # JS sans f-string — données injectées via placeholders
+                _js_raw = """<script>
+var LO=__LO__;var LA=__LA__;var DI=__DI__;
+var EL=__EL__;var SL=__SL__;var CV=__CV__;
+var CP=__CP__;
+var N=LO.length,EMIN=__EMIN__,EMAX=__EMAX__,TOTAL=__TOTAL__;
+var CLAT=__CLAT__,CLON=__CLON__;
+var MAP_STYLE='__MAP_STYLE__';
 
-Cesium.Ion.defaultAccessToken='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYWE1OWUxNy1mMWZiLTQzYjYtYTQ0OS0xMzE0MjUxNjk4ZWYiLCJpZCI6NTkwNDIsImlhdCI6MTYyMzE5MzUxNn0.zTjHm9VbOra-JQEJBhqgAAlzPwYVnm3-QpGXhDjY0sA';
-const viewer=new Cesium.Viewer('cesium',{
-  terrainProvider:Cesium.createWorldTerrain({requestVertexNormals:true}),
-  baseLayerPicker:false,navigationHelpButton:false,homeButton:false,
-  sceneModePicker:false,geocoder:false,animation:false,
-  timeline:false,fullscreenButton:false,infoBox:false,
-  selectionIndicator:false,skyBox:false,
-  skyAtmosphere:new Cesium.SkyAtmosphere(),scene3DOnly:true,
-});
-viewer.scene.globe.enableLighting=true;
-viewer.scene.globe.depthTestAgainstTerrain=true;
-viewer.scene.fog.enabled=true;viewer.scene.fog.density=0.0002;
+// Carte Leaflet
+var map=L.map('map',{zoomControl:false,attributionControl:false}).setView([CLAT,CLON],13);
 
-function altCol(t){
-  if(t>.85){const v=210+Math.round((t-.85)/.15*45);return Cesium.Color.fromCssColorString('rgb('+v+','+v+','+v+')');}
-  if(t>.6)return Cesium.Color.fromCssColorString('rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)');
-  if(t>.35)return Cesium.Color.fromCssColorString('rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)');
-  return Cesium.Color.fromCssColorString('rgb(38,'+Math.round(180+t*60)+',248)');
+// Choix tuiles selon style
+if(MAP_STYLE.indexOf('Satellite')>=0){
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:19,opacity:.85}).addTo(map);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png',
+    {maxZoom:19,opacity:.5}).addTo(map);
+} else if(MAP_STYLE.indexOf('Topo')>=0){
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+    {maxZoom:19}).addTo(map);
+} else if(MAP_STYLE.indexOf('Blanc')>=0){
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    {maxZoom:19}).addTo(map);
+} else {
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    {maxZoom:19}).addTo(map);
 }
+
+// Tracé fantôme complet
+var ghostCoords=LA.map(function(la,i){return [la,LO[i]];});
+L.polyline(ghostCoords,{color:'rgba(255,255,255,.06)',weight:2}).addTo(map);
+
+// Départ / Arrivée
+function mkDot(color){
+  return L.divIcon({className:'',iconAnchor:[8,8],
+    html:'<div style="width:16px;height:16px;background:'+color+';border-radius:50%;border:2px solid rgba(255,255,255,.9);box-shadow:0 0 12px '+color+'"></div>'});
+}
+L.marker([LA[0],LO[0]],{icon:mkDot('#4ade80')}).addTo(map);
+L.marker([LA[N-1],LO[N-1]],{icon:mkDot('#f87171')}).addTo(map);
+
+// Checkpoints
+CP.forEach(function(cp){
+  L.circleMarker([cp.lat,cp.lon],{radius:9,color:cp.color,fillColor:cp.color,fillOpacity:.95,weight:2}).addTo(map);
+  L.marker([cp.lat,cp.lon],{icon:L.divIcon({className:'',iconAnchor:[-4,22],
+    html:'<div style="background:rgba(6,10,20,.92);color:white;padding:2px 8px;border-radius:9px;font-size:10px;font-weight:700;white-space:nowrap;border:1px solid '+cp.color+';font-family:Space Grotesk,sans-serif">'+cp.label+'</div>'})}).addTo(map);
+});
+
+// ── Animation ──
 function altColStr(t){
-  if(t>.85){const v=Math.round(210+(t-.85)/.15*45);return 'rgb('+v+','+v+','+v+')';}
+  if(t>.85){var v=Math.round(210+(t-.85)/.15*45);return 'rgb('+v+','+v+','+v+')';}
   if(t>.6)return 'rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)';
   if(t>.35)return 'rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)';
   return 'rgb(38,'+Math.round(180+t*60)+',248)';
 }
 
-// Tracé fantôme
-const ghostPos=LA.map((la,i)=>Cesium.Cartesian3.fromDegrees(LO[i],la,EL[i]+5));
-viewer.entities.add({polyline:{positions:ghostPos,width:2,
-  material:new Cesium.ColorMaterialProperty(Cesium.Color.WHITE.withAlpha(0.05)),clampToGround:false}});
+var segs=[],dotMk=null,cur=0,curFrac=0,playing=true,following=true;
+var lastFrame=null,lcp=-1,cdp=0,SPEED=1;
+var BASE_ADV=N/(TOTAL*8);
 
-// Checkpoints
-CP.forEach(cp=>{
-  viewer.entities.add({
-    position:Cesium.Cartesian3.fromDegrees(cp.lon,cp.lat,cp.elev+20),
-    billboard:{
-      image:'data:image/svg+xml,'+encodeURIComponent(
-        '<svg xmlns="http://www.w3.org/2000/svg" width="140" height="36">'+
-        '<rect rx="8" ry="8" width="140" height="36" fill="'+cp.color+'" opacity=".92"/>'+
-        '<text x="70" y="24" font-family="system-ui" font-weight="700" font-size="13" fill="white" text-anchor="middle">'+cp.label+'</text>'+
-        '</svg>'),
-      verticalOrigin:Cesium.VerticalOrigin.BOTTOM,disableDepthTestDistance:1e9,
-      scaleByDistance:new Cesium.NearFarScalar(500,1.2,50000,.4),
-    },
-    point:{pixelSize:12,color:Cesium.Color.fromCssColorString(cp.color),
-           outlineColor:Cesium.Color.WHITE,outlineWidth:2,disableDepthTestDistance:1e9},
-  });
-});
+function addSeg(i){
+  if(i<1||i>=N)return;
+  segs.push(L.polyline([[LA[i-1],LO[i-1]],[LA[i],LO[i]]],
+    {color:altColStr(CV[i]),weight:4.5,opacity:.93,
+     smoothFactor:.7,lineCap:'round',lineJoin:'round'}).addTo(map));
+}
 
-// Départ / Arrivée
-viewer.entities.add({position:Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+10),
-  point:{pixelSize:16,color:Cesium.Color.fromCssColorString('#4ade80'),outlineColor:Cesium.Color.WHITE,outlineWidth:2,disableDepthTestDistance:1e9}});
-viewer.entities.add({position:Cesium.Cartesian3.fromDegrees(LO[N-1],LA[N-1],EL[N-1]+10),
-  point:{pixelSize:16,color:Cesium.Color.fromCssColorString('#f87171'),outlineColor:Cesium.Color.WHITE,outlineWidth:2,disableDepthTestDistance:1e9}});
+function moveDot(la,lo){
+  if(dotMk)map.removeLayer(dotMk);
+  dotMk=L.marker([la,lo],{icon:L.divIcon({className:'',iconAnchor:[10,10],
+    html:'<div style="width:20px;height:20px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#fff 0%,#f97316 45%,#dc2626 100%);border:2.5px solid rgba(255,255,255,.95);box-shadow:0 0 0 4px rgba(249,115,22,.3),0 0 16px rgba(249,115,22,.8)"></div>'}),
+    zIndexOffset:2000}).addTo(map);
+}
 
-// Point animé
-let dotPos=Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+8);
-viewer.entities.add({
-  position:new Cesium.CallbackProperty(()=>dotPos,false),
-  point:{pixelSize:18,color:Cesium.Color.fromCssColorString('#f97316'),
-         outlineColor:Cesium.Color.WHITE,outlineWidth:3,disableDepthTestDistance:1e9,
-         scaleByDistance:new Cesium.NearFarScalar(100,1.8,80000,.7)},
-});
+function lerp(arr,frac){
+  var i=Math.min(Math.floor(frac),arr.length-2),f=frac-i;
+  return arr[i]*(1-f)+arr[i+1]*f;
+}
 
-// Tracé progressif
-const trailPos=[Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+5)];
-viewer.entities.add({polyline:{
-  positions:new Cesium.CallbackProperty(()=>[...trailPos],false),
-  width:5,
-  material:new Cesium.PolylineGlowMaterialProperty({glowPower:.25,taperPower:.5,
-    color:Cesium.Color.fromCssColorString('#f97316')}),
-  clampToGround:false,
-}});
-
-// Caméra initiale
-viewer.camera.setView({
-  destination:Cesium.Cartesian3.fromDegrees(CO,CL,18000),
-  orientation:{heading:Cesium.Math.toRadians(20),pitch:Cesium.Math.toRadians(-40),roll:0}
-});
-
-// ── État animation ──
-let cur=0,curFrac=0,playing=true,following=true,lastFrame=null,lcp=-1,cdp=0,SPEED=1;
-const BASE_ADV=N/(TOTAL*8);
-
-// ── Profil canvas ──
-const pc=document.getElementById('pc'),pctx=pc.getContext('2d');
+// Profil canvas
+var pc=document.getElementById('pc'),pctx=pc.getContext('2d');
 function drawProf(cursor){
   pc.width=pc.offsetWidth||800;pc.height=pc.offsetHeight||64;
-  const W=pc.width,H=pc.height;
+  var W=pc.width,H=pc.height;
   pctx.clearRect(0,0,W,H);
-  const g=pctx.createLinearGradient(0,0,0,H);
+  var g=pctx.createLinearGradient(0,0,0,H);
   g.addColorStop(0,'rgba(249,115,22,.25)');g.addColorStop(1,'rgba(0,0,0,0)');
   pctx.beginPath();
-  EL.forEach((e,i)=>{const x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?pctx.lineTo(x,y):pctx.moveTo(x,y);});
+  EL.forEach(function(e,i){var x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?pctx.lineTo(x,y):pctx.moveTo(x,y);});
   pctx.lineTo(W,H);pctx.lineTo(0,H);pctx.closePath();pctx.fillStyle=g;pctx.fill();
-  for(let i=1;i<N;i++){
-    const x0=(i-1)/N*W,x1=i/N*W;
-    const y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
-    const y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+  for(var i=1;i<N;i++){
+    var x0=(i-1)/N*W,x1=i/N*W;
+    var y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    var y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
     pctx.beginPath();pctx.moveTo(x0,y0);pctx.lineTo(x1,y1);
     pctx.strokeStyle=i<=(cursor||0)?altColStr(CV[i]):'rgba(255,255,255,.1)';
     pctx.lineWidth=1.8;pctx.stroke();
   }
-  CP.forEach(cp=>{
-    const xi=Math.round(cp.dist/TOTAL*(N-1)),xd=cp.dist/TOTAL*W;
-    const y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+  CP.forEach(function(cp){
+    var xi=Math.round(cp.dist/TOTAL*(N-1)),xd=cp.dist/TOTAL*W;
+    var y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
     pctx.beginPath();pctx.moveTo(xd,0);pctx.lineTo(xd,H);
     pctx.strokeStyle=cp.color+'55';pctx.lineWidth=1;pctx.stroke();
     pctx.beginPath();pctx.arc(xd,y,3.5,0,Math.PI*2);pctx.fillStyle=cp.color;pctx.fill();
   });
   if(cursor>=0&&cursor<N){
-    const x=cursor/N*W,y=H-((EL[Math.min(Math.floor(cursor),N-1)]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    var x=cursor/N*W,y=H-((EL[Math.min(Math.floor(cursor),N-1)]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
     pctx.beginPath();pctx.moveTo(x,0);pctx.lineTo(x,H);
     pctx.strokeStyle='rgba(249,115,22,.6)';pctx.lineWidth=1.5;pctx.stroke();
     pctx.beginPath();pctx.arc(x,y,5,0,Math.PI*2);pctx.fillStyle='#f97316';pctx.fill();
     pctx.beginPath();pctx.arc(x,y,2.5,0,Math.PI*2);pctx.fillStyle='#fff';pctx.fill();
   }
 }
-function lerp(arr,frac){
-  const i=Math.min(Math.floor(frac),arr.length-2),f=frac-i;
-  return arr[i]*(1-f)+arr[i+1]*f;
-}
 
-// ── Boucle requestAnimationFrame ──
+// Boucle RAF
 function frame(ts){
   if(!playing)return;
   if(lastFrame===null)lastFrame=ts;
-  const dt=Math.min((ts-lastFrame)/1000,.1);lastFrame=ts;
-  const advance=BASE_ADV*SPEED*dt*60;
+  var dt=Math.min((ts-lastFrame)/1000,.1);lastFrame=ts;
+  var advance=BASE_ADV*SPEED*dt*60;
   curFrac=Math.min(curFrac+advance,N-1);
-  const fi=Math.min(Math.floor(curFrac),N-2),ff=curFrac-fi;
-  const la=LA[fi]*(1-ff)+LA[fi+1]*ff;
-  const lo=LO[fi]*(1-ff)+LO[fi+1]*ff;
-  const el=EL[fi]*(1-ff)+EL[fi+1]*ff;
-  dotPos=Cesium.Cartesian3.fromDegrees(lo,la,el+8);
-  const nc=Math.floor(curFrac);
-  while(cur<nc&&cur<N-1){cur++;trailPos.push(Cesium.Cartesian3.fromDegrees(LO[cur],LA[cur],EL[cur]+5));}
-  if(following&&curFrac>3){
-    const ah=Math.min(curFrac+20,N-1);
-    const afi=Math.min(Math.floor(ah),N-2),aff=ah-afi;
-    const ala=LA[afi]*(1-aff)+LA[afi+1]*aff,alo=LO[afi]*(1-aff)+LO[afi+1]*aff;
-    const brg=Math.atan2(alo-lo,ala-la);
-    viewer.camera.setView({
-      destination:Cesium.Cartesian3.fromDegrees(lo,la,el+300),
-      orientation:{heading:brg+Cesium.Math.toRadians(-20),pitch:Cesium.Math.toRadians(-28),roll:0}
-    });
-  }
-  const d=lerp(DI,curFrac),s=lerp(SL,curFrac);
+  var fi=Math.min(Math.floor(curFrac),N-2),ff=curFrac-fi;
+  var la=LA[fi]*(1-ff)+LA[fi+1]*ff;
+  var lo=LO[fi]*(1-ff)+LO[fi+1]*ff;
+  var el=EL[fi]*(1-ff)+EL[fi+1]*ff;
+  var nc=Math.floor(curFrac);
+  while(cur<nc&&cur<N-1){cur++;addSeg(cur);}
+  moveDot(la,lo);
+  if(following){map.setView([la,lo],map.getZoom(),{animate:true,duration:.15,noMoveStart:true});}
+  var d=lerp(DI,curFrac),s=lerp(SL,curFrac);
   if(curFrac>advance)cdp+=Math.max(0,el-lerp(EL,curFrac-advance));
   document.getElementById('sd').textContent=d.toFixed(2);
   document.getElementById('se').textContent=Math.round(el);
-  const sel=document.getElementById('ss');
+  var sel=document.getElementById('ss');
   sel.textContent=(s>=0?'+':'')+s.toFixed(1)+'%';
   sel.style.color=s>12?'#f87171':s>5?'#fb923c':s<-8?'#38bdf8':'#f97316';
-  document.getElementById('sp').textContent=Math.round(cdp);
+  document.getElementById('sp2').textContent=Math.round(cdp);
   document.getElementById('kmbadge').textContent=d.toFixed(2)+' / '+TOTAL+' km';
   document.getElementById('progf').style.width=(curFrac/(N-1)*100)+'%';
   drawProf(curFrac);
-  CP.forEach((cp,ci)=>{
+  CP.forEach(function(cp,ci){
     if(ci!==lcp&&Math.abs(cp.dist-d)<.4){
       lcp=ci;
       document.getElementById('tn').textContent=cp.label;
       document.getElementById('tn').style.color=cp.color;
-      document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(el)+' m';
-      const t=document.getElementById('toast');
+      document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km - '+Math.round(el)+' m';
+      var t=document.getElementById('toast');
       t.style.borderColor=cp.color;t.style.display='block';
-      clearTimeout(window._ct);window._ct=setTimeout(()=>t.style.display='none',2800);
+      clearTimeout(window._ct);window._ct=setTimeout(function(){t.style.display='none';},2800);
     }
   });
-  if(curFrac>=N-1){playing=false;document.getElementById('bpl').textContent='▶';return;}
+  if(curFrac>=N-1){playing=false;document.getElementById('bpl').innerHTML='&#9654;';return;}
   requestAnimationFrame(frame);
 }
 function togglePlay(){
   playing=!playing;
-  document.getElementById('bpl').textContent=playing?'⏸':'▶';
+  document.getElementById('bpl').innerHTML=playing?'&#10074;&#10074;':'&#9654;';
   if(playing){lastFrame=null;requestAnimationFrame(frame);}
 }
 function toggleFollow(){
   following=!following;
-  const b=document.getElementById('bfol');
-  b.classList.toggle('on',following);b.textContent=following?'📷 Follow':'🗺️ Free';
-  if(!following)viewer.camera.setView({
-    destination:Cesium.Cartesian3.fromDegrees(CO,CL,18000),
-    orientation:{heading:Cesium.Math.toRadians(20),pitch:Cesium.Math.toRadians(-40),roll:0}
-  });
+  var b=document.getElementById('bfol');
+  b.classList.toggle('on',following);
+  b.textContent=following?'CAM':'MAP';
 }
 function setSpeed(m){
   SPEED=m;
-  ['x1','x2','x4'].forEach(id=>document.getElementById('sp'+id).classList.remove('on'));
-  document.getElementById('spx'+m).classList.add('on');
+  ['x1','x2','x4'].forEach(function(id){document.getElementById('sp'+id).classList.remove('on');});
+  document.getElementById('sp'+m).classList.add('on');
 }
 function restart(){
   playing=false;curFrac=0;cur=0;cdp=0;lcp=-1;lastFrame=null;
-  trailPos.length=1;trailPos[0]=Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+5);
-  dotPos=Cesium.Cartesian3.fromDegrees(LO[0],LA[0],EL[0]+8);
-  document.getElementById('bpl').textContent='⏸';
+  segs.forEach(function(s){map.removeLayer(s);});segs=[];
+  if(dotMk)map.removeLayer(dotMk);dotMk=null;
+  document.getElementById('bpl').innerHTML='&#10074;&#10074;';
   document.getElementById('progf').style.width='0%';
-  viewer.camera.setView({
-    destination:Cesium.Cartesian3.fromDegrees(CO,CL,18000),
-    orientation:{heading:Cesium.Math.toRadians(20),pitch:Cesium.Math.toRadians(-40),roll:0}
-  });
+  map.setView([CLAT,CLON],13);
   drawProf(-1);playing=true;
-  setTimeout(()=>{lastFrame=null;requestAnimationFrame(frame);},300);
+  lastFrame=null;requestAnimationFrame(frame);
 }
-window.addEventListener('load',()=>{drawProf(-1);setTimeout(()=>requestAnimationFrame(frame),1800);});
-window.addEventListener('resize',()=>drawProf(curFrac>0?curFrac:-1));
+window.addEventListener('load',function(){drawProf(-1);requestAnimationFrame(frame);});
+window.addEventListener('resize',function(){drawProf(curFrac>0?curFrac:-1);});
 </script></body></html>"""
 
-                _js = _js_template.replace('__LO__', LO_js).replace('__LA__', LA_js)
+                _js = _js_raw.replace('__LO__', LO_js).replace('__LA__', LA_js)
                 _js = _js.replace('__DI__', DI_js).replace('__EL__', EL_js)
                 _js = _js.replace('__SL__', SL_js).replace('__CV__', CV_js)
                 _js = _js.replace('__CP__', CP_js)
                 _js = _js.replace('__EMIN__', str(_emin)).replace('__EMAX__', str(_emax))
                 _js = _js.replace('__TOTAL__', str(round(total_dist_km,1)))
-                _js = _js.replace('__CL__', str(_clat)).replace('__CO__', str(_clon))
+                _js = _js.replace('__CLAT__', str(_clat)).replace('__CLON__', str(_clon))
+                _js = _js.replace('__MAP_STYLE__', _style)
 
-                html_anim = _head + _style + _body + _js
+                html_anim = _head + _css + _body + _js
                 # Sauvegarder dans session_state pour persistance
                 st.session_state["html_anim"] = html_anim
                 st.session_state["html_anim_km"] = int(total_dist_km)
