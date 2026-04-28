@@ -2356,286 +2356,250 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
 <html lang="fr">
 <head>
 <meta charset="UTF-8"/>
-<title>Animation parcours</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Trail — {int(total_dist_km)} km</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=Space+Mono&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{ background:#0d1117; font-family:'SF Pro Display',system-ui,sans-serif; color:#fff; overflow:hidden; }}
-  #main {{ display:flex; flex-direction:column; height:100vh; }}
-  #header {{ padding:16px 24px; background:rgba(0,0,0,0.6); backdrop-filter:blur(10px);
-             display:flex; justify-content:space-between; align-items:center; z-index:10; }}
-  #header h1 {{ font-size:1.1rem; font-weight:700; letter-spacing:.05em; color:#fff; }}
-  #stats {{ display:flex; gap:24px; }}
-  .stat {{ text-align:center; }}
-  .stat-val {{ font-size:1.3rem; font-weight:800; color:#f97316; }}
-  .stat-lbl {{ font-size:0.65rem; color:#999; text-transform:uppercase; letter-spacing:.1em; }}
-  #map-container {{ flex:1; position:relative; }}
-  #map {{ width:100%; height:100%; }}
-  #profile-bar {{ height:90px; background:rgba(0,0,0,0.75); backdrop-filter:blur(8px);
-                  padding:8px 24px; position:relative; }}
-  #profile-canvas {{ width:100%; height:100%; }}
-  #controls {{ position:absolute; bottom:110px; right:20px; display:flex; flex-direction:column;
-               gap:8px; z-index:1000; }}
-  .ctrl-btn {{ background:rgba(255,255,255,0.12); border:1px solid rgba(255,255,255,0.2);
-               color:#fff; border-radius:8px; padding:8px 16px; cursor:pointer; font-size:.8rem;
-               backdrop-filter:blur(8px); transition:all .2s; }}
-  .ctrl-btn:hover {{ background:rgba(255,255,255,0.25); }}
-  .ctrl-btn.active {{ background:#f97316; border-color:#f97316; }}
-  #progress-bar {{ position:absolute; bottom:0; left:0; height:3px;
-                   background:linear-gradient(90deg,#f97316,#ef4444); width:0%; transition:width .1s; }}
-  #dist-label {{ position:absolute; top:10px; left:50%; transform:translateX(-50%);
-                 background:rgba(0,0,0,0.7); padding:4px 12px; border-radius:20px;
-                 font-size:.85rem; font-weight:700; color:#f97316; letter-spacing:.05em; }}
-  #cp-popup {{ display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-60px);
-               background:rgba(0,0,0,0.85); border:1px solid #f97316; border-radius:10px;
-               padding:10px 18px; text-align:center; z-index:9999; pointer-events:none; }}
-  #cp-popup h3 {{ font-size:1rem; color:#f97316; margin-bottom:4px; }}
-  #cp-popup p  {{ font-size:.8rem; color:#ccc; }}
+:root{{--acc:#f97316;--acc2:#fb923c;--bg:#060a14;--card:rgba(255,255,255,.04);--bd:rgba(255,255,255,.08);--txt:#e2e8f0;--muted:#64748b;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}
+html,body{{height:100%;overflow:hidden;background:var(--bg);}}
+body{{font-family:'Space Grotesk',system-ui,sans-serif;color:var(--txt);}}
+#app{{display:grid;grid-template-rows:auto 1fr 78px;height:100vh;}}
+#hdr{{display:flex;align-items:center;justify-content:space-between;padding:10px 18px;
+      background:rgba(6,10,20,.94);backdrop-filter:blur(16px);
+      border-bottom:1px solid var(--bd);z-index:200;gap:12px;}}
+#logo{{width:30px;height:30px;border-radius:7px;
+       background:linear-gradient(135deg,var(--acc),#dc2626);
+       display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0;
+       box-shadow:0 0 18px rgba(249,115,22,.4);}}
+#ti h1{{font-size:.82rem;font-weight:800;color:#fff;letter-spacing:.05em;}}
+#ti p{{font-size:.6rem;color:var(--muted);font-family:'Space Mono';margin-top:1px;}}
+#stats{{display:flex;gap:5px;flex:1;justify-content:center;flex-wrap:wrap;}}
+.sc{{display:flex;flex-direction:column;align-items:center;
+     background:var(--card);border:1px solid var(--bd);
+     border-radius:7px;padding:4px 10px;min-width:58px;transition:border-color .3s;}}
+.sv{{font-size:.9rem;font-weight:800;font-family:'Space Mono';color:var(--acc);line-height:1.1;transition:color .2s;}}
+.sl{{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-top:1px;}}
+#ctrls{{display:flex;gap:6px;align-items:center;}}
+.btn{{background:var(--card);border:1px solid var(--bd);color:var(--txt);
+      border-radius:7px;padding:5px 12px;cursor:pointer;font-size:.7rem;
+      font-weight:700;font-family:'Space Grotesk';letter-spacing:.04em;transition:all .15s;}}
+.btn:hover{{background:rgba(249,115,22,.2);border-color:var(--acc);color:#fff;}}
+.btn.pl{{background:var(--acc);border-color:var(--acc);color:#fff;}}
+.sp.on{{background:var(--acc);border-color:var(--acc);color:#fff;}}
+#mwrap{{position:relative;min-height:0;}}
+#map{{width:100%;height:100%;}}
+.leaflet-container{{background:#060a14!important;}}
+.leaflet-control-attribution{{display:none!important;}}
+#prog{{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.06);z-index:500;}}
+#progf{{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#ef4444);box-shadow:0 0 8px var(--acc);transition:width .07s linear;}}
+#kmbadge{{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);
+          background:rgba(6,10,20,.88);backdrop-filter:blur(10px);
+          border:1px solid var(--bd);border-radius:18px;padding:4px 14px;
+          font-size:.75rem;font-weight:700;font-family:'Space Mono';color:var(--acc);z-index:500;}}
+#toast{{display:none;position:absolute;top:10px;left:50%;transform:translateX(-50%);
+        background:rgba(6,10,20,.93);backdrop-filter:blur(14px);
+        border-radius:10px;padding:8px 18px;z-index:999;pointer-events:none;
+        text-align:center;min-width:190px;border:1px solid var(--acc);
+        animation:tIn .25s ease;}}
+@keyframes tIn{{from{{opacity:0;transform:translateX(-50%) translateY(-6px)}}to{{opacity:1;transform:translateX(-50%) translateY(0)}}}}
+#toast .tn{{font-size:.85rem;font-weight:700;}}
+#toast .tm{{font-size:.62rem;color:var(--muted);font-family:'Space Mono';}}
+#profile{{background:rgba(6,10,20,.96);border-top:1px solid var(--bd);padding:6px 18px 4px;position:relative;}}
+#profile canvas{{width:100%;height:100%;display:block;}}
+#spwrap{{position:absolute;top:10px;right:14px;display:flex;gap:5px;z-index:500;}}
 </style>
 </head>
 <body>
-<div id="main">
-  <div id="header">
-    <h1>🏔 Parcours Trail — {total_km_v} km</h1>
-    <div id="stats">
-      <div class="stat"><div class="stat-val" id="stat-dist">0.0</div><div class="stat-lbl">km parcourus</div></div>
-      <div class="stat"><div class="stat-val" id="stat-elev">—</div><div class="stat-lbl">altitude (m)</div></div>
-      <div class="stat"><div class="stat-val" id="stat-slope">0</div><div class="stat-lbl">pente (%)</div></div>
-      <div class="stat"><div class="stat-val">{dplus_v}</div><div class="stat-lbl">D+ total (m)</div></div>
-    </div>
+<div id="app">
+<div id="hdr">
+  <div id="logo">🏔</div>
+  <div id="ti">
+    <h1>TRAIL — {int(total_dist_km)} KM</h1>
+    <p>D+ {int(float(np.sum(np.clip(np.diff([getattr(p,"elevation",0.) or 0. for p in points]),0,None))))} M · {int(min(elev_a))}–{int(max(elev_a))} M ALT.</p>
   </div>
-  <div id="map-container">
-    <div id="map"></div>
-    <div id="controls">
-      <button class="ctrl-btn active" id="btn-play" onclick="togglePlay()">⏸ Pause</button>
-      <button class="ctrl-btn" onclick="restart()">↺ Restart</button>
-    </div>
-    <div id="cp-popup"><h3 id="cp-name"></h3><p id="cp-info"></p></div>
-    <div id="dist-label" id="dist-label">km 0.0</div>
+  <div id="stats">
+    <div class="sc"><div class="sv" id="sd">0.0</div><div class="sl">km</div></div>
+    <div class="sc"><div class="sv" id="se">—</div><div class="sl">alt m</div></div>
+    <div class="sc"><div class="sv" id="ss">0%</div><div class="sl">pente</div></div>
+    <div class="sc"><div class="sv" id="sp">0</div><div class="sl">d+</div></div>
   </div>
-  {'<div id="profile-bar"><canvas id="profile-canvas"></canvas><div id="progress-bar"></div></div>' if anim_show_elev else ''}
+  <div id="ctrls">
+    <div id="spwrap" style="position:static;display:flex;gap:5px;">
+      <button class="btn sp on" id="spx1" onclick="setSpeed(1)">1×</button>
+      <button class="btn sp" id="spx2" onclick="setSpeed(2)">2×</button>
+      <button class="btn sp" id="spx4" onclick="setSpeed(4)">4×</button>
+    </div>
+    <button class="btn pl" id="bpl" onclick="togglePlay()">⏸</button>
+    <button class="btn" onclick="restart()">↺</button>
+  </div>
 </div>
-
+<div id="mwrap">
+  <div id="map"></div>
+  <div id="prog"><div id="progf"></div></div>
+  <div id="kmbadge">0.0 / {round(total_dist_km,1)} km</div>
+  <div id="toast"><div class="tn" id="tn"></div><div class="tm" id="tm"></div></div>
+</div>
+<div id="profile"><canvas id="pc"></canvas></div>
+</div>
 <script>
-const LONS  = {all_lons_js};
-const LATS  = {all_lats_js};
-const DISTS = {all_dist_js};
-const ELEVS = {all_elev_js};
-const SLOPES= {all_slope_js};
-const CVS   = {all_cv_js};
-const CPS   = {cp_js};
-const N     = LONS.length;
-const INTERVAL_MS = {interval_ms};
-const FRAME_STEP  = {frame_step};
-const TOTAL_KM    = {total_km_v};
-const ELEV_MIN    = {elev_min_v};
-const ELEV_MAX    = {elev_max_v};
+const LO={_json.dumps([round(x,6) for x in lons_a])};
+const LA={_json.dumps([round(x,6) for x in lats_a])};
+const DI={_json.dumps([round(x,3) for x in dist_a])};
+const EL={_json.dumps([round(e,1) for e in elev_a])};
+const SL={_json.dumps([round(s,1) for s in slopes_a])};
+const CV={_json.dumps([round(v,4) for v in cv_norm])};
+const CP={cp_js};
+const N=LO.length,EMIN={round(min(elev_a))},EMAX={round(max(elev_a))},TOTAL={round(total_dist_km,1)};
+let FS={frame_step},INT={interval_ms},MULT=1;
 
-// Leaflet map
-var map = L.map('map', {{zoomControl:false, attributionControl:false}})
-            .setView([{center_lat}, {center_lon}], 13);
+var map=L.map('map',{{zoomControl:false,attributionControl:false}}).setView([{center_lat},{center_lon}],13);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',{{maxZoom:19,opacity:.82}}).addTo(map);
+L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',{{maxZoom:19,opacity:.5}}).addTo(map);
 
-{'L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{maxZoom:19}).addTo(map);' if anim_style == 'Satellite ESRI' else
- 'L.tileLayer("https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png",{maxZoom:19}).addTo(map);' if 'dark' in mb_style or 'matter' in mb_style else
- 'L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",{maxZoom:19}).addTo(map);' if 'topo' in anim_style.lower() else
- 'L.tileLayer("https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png",{maxZoom:19}).addTo(map);'}
-
-// Couleur par valeur normalisée (plasma: bleu→violet→orange→jaune)
-function getColor(t) {{
-  if ({1 if anim_color == 'Pente' else 0}) {{
-    // RdYlGn pour pente: rouge montée, vert descente
-    const slope = SLOPES[Math.min(Math.floor(t * N), N-1)];
-    if (slope > 15) return '#d62728';
-    if (slope > 8)  return '#ff7f0e';
-    if (slope > 3)  return '#ffd700';
-    if (slope > -3) return '#2ca02c';
-    if (slope > -8) return '#17becf';
-    return '#1f77b4';
-  }}
-  // Plasma colorscale
-  const r = Math.round(13 + t * 235);
-  const g = Math.round(8  + t * 150 * (1-t*0.6));
-  const b = Math.round(135 - t * 120);
-  return `rgb(${{r}},${{g}},${{b}})`;
+function altCol(t){{
+  if(t>.85){{const f=(t-.85)/.15;const v=Math.round(210+f*45);return `rgb(${{v}},${{v}},${{v}})`;}}
+  if(t>.6) {{const f=(t-.6)/.25;return `rgb(249,${{Math.round(115+f*80)}},22)`;}}
+  if(t>.35){{const f=(t-.35)/.25;return `rgb(${{Math.round(74+f*175)}},${{Math.round(222-f*110)}},128)`;}}
+  return `rgb(38,${{Math.round(180+t*60)}},248)`;
 }}
 
-// Départ marker
-const startIcon = L.divIcon({{className:'',html:'<div style="background:#00ff44;width:14px;height:14px;border-radius:50%;border:2px solid white;box-shadow:0 0 8px #00ff44"></div>',iconAnchor:[7,7]}});
-L.marker([LATS[0], LONS[0]], {{icon:startIcon}}).addTo(map);
+const mkIco=(c,g,s)=>L.divIcon({{className:'',iconAnchor:[s/2,s/2],
+  html:`<div style="width:${{s}}px;height:${{s}}px;background:${{c}};border-radius:50%;border:2px solid rgba(255,255,255,.9);box-shadow:0 0 12px ${{g||c}}"></div>`}});
+L.marker([LA[0],LO[0]],{{icon:mkIco('#4ade80','#4ade80',14)}}).addTo(map);
+L.marker([LA[N-1],LO[N-1]],{{icon:mkIco('#f87171','#f87171',14)}}).addTo(map);
 
-// Checkpoints markers
-if (CPS.length > 0) {{
-  CPS.forEach(cp => {{
-    const cpIcon = L.divIcon({{className:'',
-      html:`<div style="background:#f97316;color:white;padding:2px 7px;border-radius:12px;font-size:11px;font-weight:700;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.5)">${{cp.label}}</div>`,
-      iconAnchor:[0,20]}});
-    L.marker([cp.lat, cp.lon], {{icon:cpIcon}}).addTo(map);
-    L.circleMarker([cp.lat, cp.lon], {{radius:8,color:'#f97316',fillColor:'#f97316',fillOpacity:.9,weight:2}}).addTo(map);
-  }});
-}}
-
-// Tracé progressif : polylines par segment coloré
-let polylines = [];
-let dotMarker = null;
-const dotIcon = i => L.divIcon({{className:'',
-  html:`<div style="background:{dot_color};width:${{i*2}}px;height:${{i*2}}px;border-radius:50%;border:2px solid white;box-shadow:0 0 12px {dot_color};transform:translate(-50%,-50%)"></div>`,
-  iconAnchor:[i,i]}});
-
-// Animation state
-let currentIdx = 0;
-let playing = true;
-let timer = null;
-
-function drawSegment(i) {{
-  if (i < 1 || i >= N) return;
-  const t  = CVS[i];
-  const col = getColor(t);
-  const seg = L.polyline([[LATS[i-1], LONS[i-1]], [LATS[i], LONS[i]]],
-    {{color:col, weight:{trace_width}, opacity:0.95, smoothFactor:1}}).addTo(map);
-  polylines.push(seg);
-}}
-
-function updateDot(i) {{
-  const lat = LATS[i], lon = LONS[i];
-  if (dotMarker) map.removeLayer(dotMarker);
-  dotMarker = L.marker([lat, lon], {{icon:dotIcon({anim_dot_size}), zIndexOffset:1000}}).addTo(map);
-}}
-
-function updateStats(i) {{
-  const d = DISTS[i], e = ELEVS[i], s = SLOPES[i];
-  document.getElementById('stat-dist').textContent  = d.toFixed(1);
-  document.getElementById('stat-elev').textContent  = Math.round(e);
-  document.getElementById('stat-slope').textContent = (s >= 0 ? '+' : '') + s.toFixed(1);
-  const distLabel = document.getElementById('dist-label');
-  if (distLabel) distLabel.textContent = 'km ' + d.toFixed(1);
-  // Progress bar
-  const pct = (i / (N-1)) * 100;
-  const pb = document.getElementById('progress-bar');
-  if (pb) pb.style.width = pct + '%';
-  // Checkpoint popup
-  if (CPS.length > 0) {{
-    const nearby = CPS.find(cp => Math.abs(cp.dist - d) < (TOTAL_KM / N * 2));
-    const popup = document.getElementById('cp-popup');
-    if (nearby) {{
-      document.getElementById('cp-name').textContent = nearby.label;
-      document.getElementById('cp-info').textContent = nearby.dist.toFixed(1) + ' km — ' + Math.round(e) + ' m';
-      popup.style.display = 'block';
-      setTimeout(() => {{ popup.style.display = 'none'; }}, 2500);
-    }}
-  }}
-}}
-
-function drawElevProfile() {{
-  {'const canvas = document.getElementById("profile-canvas"); if(!canvas) return;' if anim_show_elev else 'return;'}
-  const canvas = document.getElementById('profile-canvas');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.offsetWidth, H = canvas.offsetHeight;
-  canvas.width = W; canvas.height = H;
-  ctx.clearRect(0,0,W,H);
-  // Fond dégradé
-  const grad = ctx.createLinearGradient(0,0,0,H);
-  grad.addColorStop(0, 'rgba(249,115,22,0.3)');
-  grad.addColorStop(1, 'rgba(249,115,22,0.02)');
-  // Tracé complet
-  ctx.beginPath();
-  ELEVS.forEach((e,i) => {{
-    const x = (i/N)*W;
-    const y = H - ((e - ELEV_MIN)/(ELEV_MAX - ELEV_MIN + 1)) * (H-8) - 4;
-    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
-  }});
-  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  // Remplissage
-  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
-  ctx.fillStyle = grad;
-  ctx.fill();
-  return ctx;
-}}
-
-let profileCtx = null;
-window.addEventListener('load', () => {{
-  profileCtx = drawElevProfile();
+CP.forEach(cp=>{{
+  L.circleMarker([cp.lat,cp.lon],{{radius:8,color:cp.color||'#f97316',fillColor:cp.color||'#f97316',fillOpacity:.95,weight:2}}).addTo(map);
+  L.marker([cp.lat,cp.lon],{{icon:L.divIcon({{className:'',iconAnchor:[-4,22],
+    html:`<div style="background:rgba(6,10,20,.9);color:#fff;padding:2px 8px;border-radius:9px;font-size:10px;font-weight:700;white-space:nowrap;border:1px solid ${{cp.color||'#f97316'}};font-family:Space Grotesk,sans-serif">${{cp.label}}</div>`}})}}).addTo(map);
 }});
 
-function drawProfileCursor(i) {{
-  if (!profileCtx) return;
-  const canvas = document.getElementById('profile-canvas');
-  if (!canvas) return;
-  const W = canvas.width, H = canvas.height;
-  // Redessiner (rapide)
-  drawElevProfile();
-  // Curseur
-  const x = (i/N)*W;
-  const e = ELEVS[i];
-  const y = H - ((e - ELEV_MIN)/(ELEV_MAX - ELEV_MIN + 1)) * (H-8) - 4;
-  profileCtx.beginPath();
-  profileCtx.arc(x, y, 5, 0, Math.PI*2);
-  profileCtx.fillStyle = '#f97316';
-  profileCtx.fill();
-  profileCtx.beginPath();
-  profileCtx.moveTo(x, 0); profileCtx.lineTo(x, H);
-  profileCtx.strokeStyle = 'rgba(249,115,22,0.5)';
-  profileCtx.lineWidth = 1;
-  profileCtx.stroke();
+let segs=[],dot=null,cur=0,playing=true,tmr=null,lcp=-1,cdp=0;
+
+function addSeg(i){{
+  if(i<1||i>=N)return;
+  segs.push(L.polyline([[LA[i-1],LO[i-1]],[LA[i],LO[i]]],
+    {{color:altCol(CV[i]),weight:4.5,opacity:.93,smoothFactor:.7,lineCap:'round',lineJoin:'round'}}).addTo(map));
+}}
+function moveDot(i){{
+  if(dot)map.removeLayer(dot);
+  dot=L.marker([LA[i],LO[i]],{{icon:L.divIcon({{className:'',iconAnchor:[10,10],
+    html:'<div style="width:20px;height:20px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#fff 0%,#f97316 45%,#dc2626 100%);border:2.5px solid rgba(255,255,255,.95);box-shadow:0 0 0 4px rgba(249,115,22,.3),0 0 16px rgba(249,115,22,.8),0 0 4px rgba(0,0,0,.6)"></div>'}}),zIndexOffset:2000}}).addTo(map);
+}}
+function updUI(i){{
+  const d=DI[i],e=EL[i],s=SL[i];
+  if(i>0)cdp+=Math.max(0,EL[i]-EL[i-1]);
+  document.getElementById('sd').textContent=d.toFixed(1);
+  document.getElementById('se').textContent=Math.round(e);
+  const sel=document.getElementById('ss');
+  sel.textContent=(s>=0?'+':'')+s.toFixed(1)+'%';
+  sel.style.color=s>12?'#f87171':s>5?'#fb923c':s<-8?'#38bdf8':'#f97316';
+  document.getElementById('sp').textContent=Math.round(cdp);
+  document.getElementById('kmbadge').textContent=d.toFixed(2)+' / '+TOTAL+' km';
+  document.getElementById('progf').style.width=(i/(N-1)*100)+'%';
+  drawProfCursor(i);
+  checkCp(d,e);
+}}
+function checkCp(d,e){{
+  const th=TOTAL/N*FS*3;
+  CP.forEach((cp,ci)=>{{
+    if(ci!==lcp&&Math.abs(cp.dist-d)<th){{
+      lcp=ci;
+      const t=document.getElementById('toast');
+      document.getElementById('tn').textContent=cp.label;
+      document.getElementById('tn').style.color=cp.color||'#f97316';
+      document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(e)+' m';
+      t.style.borderColor=cp.color||'#f97316';t.style.display='block';
+      clearTimeout(window._ct);window._ct=setTimeout(()=>t.style.display='none',2800);
+    }}
+  }});
 }}
 
-function step() {{
-  if (currentIdx >= N) {{
-    playing = false;
-    document.getElementById('btn-play').textContent = '▶ Rejouer';
-    return;
+const pc=document.getElementById('pc'),ctx=pc.getContext('2d');
+function drawProf(cursor){{
+  pc.width=pc.offsetWidth||800;pc.height=pc.offsetHeight||62;
+  const W=pc.width,H=pc.height;
+  ctx.clearRect(0,0,W,H);
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(249,115,22,.28)');g.addColorStop(.6,'rgba(249,115,22,.06)');g.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.beginPath();
+  EL.forEach((e,i)=>{{const x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}});
+  ctx.lineTo(W,H);ctx.lineTo(0,H);ctx.closePath();ctx.fillStyle=g;ctx.fill();
+  for(let i=1;i<N;i++){{
+    const x0=(i-1)/N*W,x1=i/N*W;
+    const y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    const y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);
+    ctx.strokeStyle=i<=(cursor||0)?altCol(CV[i]):'rgba(255,255,255,.1)';
+    ctx.lineWidth=1.6;ctx.stroke();
   }}
-  for (let k = 0; k < FRAME_STEP && currentIdx < N; k++, currentIdx++) {{
-    drawSegment(currentIdx);
+  CP.forEach(cp=>{{
+    const xi=Math.round(cp.dist/TOTAL*(N-1));
+    const xd=cp.dist/TOTAL*W;
+    const y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    ctx.beginPath();ctx.moveTo(xd,0);ctx.lineTo(xd,H);
+    ctx.strokeStyle=(cp.color||'#f97316')+'55';ctx.lineWidth=1;ctx.stroke();
+    ctx.beginPath();ctx.arc(xd,y,3.5,0,Math.PI*2);ctx.fillStyle=cp.color||'#f97316';ctx.fill();
+  }});
+  if(cursor>=0&&cursor<N){{
+    const x=cursor/N*W,y=H-((EL[cursor]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;
+    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.strokeStyle='rgba(249,115,22,.55)';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fillStyle='#f97316';ctx.fill();
+    ctx.beginPath();ctx.arc(x,y,2.5,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();
   }}
-  updateDot(currentIdx - 1);
-  updateStats(currentIdx - 1);
-  drawProfileCursor(currentIdx - 1);
-  if (playing) timer = setTimeout(step, INTERVAL_MS);
 }}
+function drawProfCursor(i){{drawProf(i);}}
 
-function togglePlay() {{
-  playing = !playing;
-  document.getElementById('btn-play').textContent = playing ? '⏸ Pause' : '▶ Play';
-  if (playing) step();
+function step(){{
+  if(cur>=N){{playing=false;document.getElementById('bpl').textContent='▶';return;}}
+  for(let k=0;k<FS&&cur<N;k++,cur++)addSeg(cur);
+  moveDot(cur-1);updUI(cur-1);
+  if(playing)tmr=setTimeout(step,INT);
 }}
-
-function restart() {{
-  clearTimeout(timer);
-  polylines.forEach(p => map.removeLayer(p));
-  polylines = [];
-  if (dotMarker) map.removeLayer(dotMarker);
-  dotMarker = null;
-  currentIdx = 0;
-  playing = true;
-  document.getElementById('btn-play').textContent = '⏸ Pause';
-  drawElevProfile();
-  step();
+function togglePlay(){{
+  playing=!playing;
+  document.getElementById('bpl').textContent=playing?'⏸':'▶';
+  if(playing)step();
 }}
-
-// Démarrage
-step();
+function restart(){{
+  clearTimeout(tmr);segs.forEach(s=>map.removeLayer(s));segs=[];
+  if(dot)map.removeLayer(dot);dot=null;
+  cur=0;playing=true;lcp=-1;cdp=0;
+  document.getElementById('bpl').textContent='⏸';
+  drawProf(-1);step();
+}}
+function setSpeed(m){{
+  MULT=m;FS={frame_step}*m;INT=Math.round({interval_ms}/m);
+  ['x1','x2','x4'].forEach(id=>document.getElementById('sp'+id).classList.remove('on'));
+  document.getElementById('spx'+m).classList.add('on');
+}}
+window.addEventListener('load',()=>{{drawProf(-1);step();}});
+window.addEventListener('resize',()=>drawProf(cur>0?cur-1:-1));
 </script>
 </body></html>"""
+                # Sauvegarder dans session_state pour persistance
+                st.session_state["html_anim"] = html_anim
+                st.session_state["html_anim_km"] = int(total_dist_km)
 
-                # Afficher dans Streamlit
-                import streamlit.components.v1 as components
-                components.html(html_anim, height=600, scrolling=False)
-
-                # Bouton téléchargement
+        # ── Affichage HORS du bloc if button (persiste après clic) ──
+        if "html_anim" in st.session_state:
+            import streamlit.components.v1 as components
+            components.html(st.session_state["html_anim"], height=620, scrolling=False)
+            col_dl1, col_dl2 = st.columns([1, 3])
+            with col_dl1:
                 st.download_button(
-                    label="⬇️ Télécharger la vidéo HTML (partager, ouvrir hors-ligne)",
-                    data=html_anim.encode("utf-8"),
-                    file_name=f"parcours_trail_{int(total_dist_km)}km.html",
+                    label="⬇️ Télécharger le fichier HTML",
+                    data=st.session_state["html_anim"].encode("utf-8"),
+                    file_name=f"trail_{st.session_state['html_anim_km']}km.html",
                     mime="text/html",
-                    help="Fichier HTML autonome — ouvrez-le dans n'importe quel navigateur, "
-                         "ou partagez-le tel quel."
                 )
-                st.caption("💡 Le fichier HTML est autonome et fonctionne sans connexion internet. "
-                           "Partagez-le par email, WhatsApp, ou hébergez-le sur votre site.")
+            with col_dl2:
+                st.caption("💡 Fichier autonome — ouvrez-le dans Chrome, partagez par email ou WhatsApp. "
+                           "Fonctionne sans connexion.")
 
 
 
