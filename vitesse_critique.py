@@ -2355,24 +2355,27 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                 # ── Build animation HTML MapLibre GL JS — satellite + relief 3D ──
                 import json as _json
 
-                LO_js  = _json.dumps([round(x,6) for x in lons_a])
-                LA_js  = _json.dumps([round(x,6) for x in lats_a])
-                DI_js  = _json.dumps([round(x,3) for x in dist_a])
-                EL_js  = _json.dumps([round(e,1) for e in elev_a])
-                SL_js  = _json.dumps([round(s,1) for s in slopes_a])
-                CV_js  = _json.dumps([round(v,4) for v in cv_norm])
-                CP_js  = _json.dumps([
-                    {"lat": c["lat"], "lon": c["lon"],
-                     "label": c["label"], "dist": c["dist_km"],
-                     "elev": c["alt"],
-                     "color": {"🥤 Ravitaillement":"#22d3ee","🏔 Sommet":"#f59e0b",
-                               "🔻 Col":"#a855f7","⚠️ Point clé":"#ef4444",
-                               "⏱ Point de passage":"#60a5fa","🏁 Intermédiaire":"#9ca3af"
-                              }.get(c["type"], "#f97316")}
+                _n = len(lons_a)
+                LO_js   = _json.dumps([round(x,6) for x in lons_a])
+                LA_js   = _json.dumps([round(x,6) for x in lats_a])
+                DI_js   = _json.dumps([round(x,3) for x in dist_a])
+                EL_js   = _json.dumps([round(e,1) for e in elev_a])
+                SL_js   = _json.dumps([round(s,1) for s in slopes_a])
+                CV_js   = _json.dumps([round(v,4) for v in cv_norm])
+                CP_js   = _json.dumps([
+                    {"lat":c["lat"],"lon":c["lon"],"label":c["label"],
+                     "dist":c["dist_km"],"elev":c["alt"],
+                     "color":{"🥤 Ravitaillement":"#22d3ee","🏔 Sommet":"#f59e0b",
+                              "🔻 Col":"#a855f7","⚠️ Point clé":"#ef4444",
+                              "⏱ Point de passage":"#60a5fa","🏁 Intermédiaire":"#9ca3af"
+                             }.get(c["type"],"#f97316")}
                     for c in sorted(checkpoints, key=lambda x: x["dist_km"])
                 ] if anim_show_cp and checkpoints else [])
+                GHOST_js = _json.dumps({"type":"Feature","geometry":{
+                    "type":"LineString",
+                    "coordinates":[[lons_a[i],lats_a[i]] for i in range(_n)]}})
 
-                _dplus_a = int(sum(max(0,elev_a[i]-elev_a[i-1]) for i in range(1,len(elev_a))))
+                _dplus_a = int(sum(max(0,elev_a[i]-elev_a[i-1]) for i in range(1,_n)))
                 _emin = round(min(elev_a)); _emax = round(max(elev_a))
                 _clat = round(float(np.mean(lats_a)),6)
                 _clon = round(float(np.mean(lons_a)),6)
@@ -2381,26 +2384,21 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                 _head = f"""<!DOCTYPE html>
 <html lang="fr"><head>
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Trail {_total_km} km — 3D Satellite</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=Space+Mono&display=swap" rel="stylesheet"/>
+<title>Trail {_total_km} km</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@700;800&family=Space+Mono&display=swap" rel="stylesheet"/>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet"/>
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>
-*{{margin:0;padding:0;box-sizing:border-box;}}
-html,body{{height:100%;overflow:hidden;background:#060a14;font-family:'Space Grotesk',sans-serif;color:#e2e8f0;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}html,body{{height:100%;overflow:hidden;background:#060a14;font-family:'Space Grotesk',sans-serif;color:#e2e8f0;}}
 #app{{display:grid;grid-template-rows:48px 1fr 72px;height:100vh;}}
 #hdr{{display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:rgba(6,10,20,.95);backdrop-filter:blur(16px);border-bottom:1px solid rgba(255,255,255,.08);z-index:200;gap:10px;}}
-#ti h1{{font-size:.78rem;font-weight:800;letter-spacing:.06em;}}
-#ti p{{font-size:.55rem;color:#64748b;font-family:'Space Mono';}}
+#ti h1{{font-size:.78rem;font-weight:800;letter-spacing:.06em;}}#ti p{{font-size:.55rem;color:#64748b;font-family:'Space Mono';}}
 #stats{{display:flex;gap:4px;flex:1;justify-content:center;}}
 .sc{{display:flex;flex-direction:column;align-items:center;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:2px 9px;min-width:52px;}}
-.sv{{font-size:.85rem;font-weight:800;font-family:'Space Mono';color:#f97316;}}
-.sl{{font-size:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.1em;}}
+.sv{{font-size:.85rem;font-weight:800;font-family:'Space Mono';color:#f97316;}}.sl{{font-size:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.1em;}}
 #ctrls{{display:flex;gap:4px;}}
 .btn{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#e2e8f0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.65rem;font-weight:700;font-family:'Space Grotesk';transition:all .15s;}}
-.btn:hover,.btn.on{{background:rgba(249,115,22,.3);border-color:#f97316;color:#fff;}}
-.btn.pl{{background:#f97316;border-color:#f97316;color:#fff;}}
+.btn:hover,.btn.on{{background:rgba(249,115,22,.3);border-color:#f97316;color:#fff;}}.btn.pl{{background:#f97316;border-color:#f97316;color:#fff;}}
 #mwrap{{position:relative;min-height:0;}}#map{{width:100%;height:100%;}}
 .maplibregl-ctrl-bottom-left,.maplibregl-ctrl-bottom-right,.maplibregl-ctrl-top-right{{display:none!important;}}
 #prog{{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.06);z-index:500;}}
@@ -2413,7 +2411,7 @@ html,body{{height:100%;overflow:hidden;background:#060a14;font-family:'Space Gro
 </style></head><body>
 <div id="app">
 <div id="hdr">
-  <div id="ti"><h1>🏔 TRAIL — {_total_km} KM</h1><p>D+{_dplus_a}M · {_emin}–{_emax}M · SATELLITE + RELIEF 3D</p></div>
+  <div id="ti"><h1>🏔 TRAIL — {_total_km} KM</h1><p>D+{_dplus_a}M · {_emin}–{_emax}M · SAT+3D</p></div>
   <div id="stats">
     <div class="sc"><div class="sv" id="sd">0.0</div><div class="sl">km</div></div>
     <div class="sc"><div class="sv" id="se">—</div><div class="sl">m alt</div></div>
@@ -2441,44 +2439,37 @@ html,body{{height:100%;overflow:hidden;background:#060a14;font-family:'Space Gro
                 _js_raw = """<script>
 var LO=__LO__,LA=__LA__,DI=__DI__,EL=__EL__,SL=__SL__,CV=__CV__,CP=__CP__;
 var N=LO.length,EMIN=__EMIN__,EMAX=__EMAX__,TOT=__TOT__,CLT=__CLT__,CLO=__CLO__;
-var map=new maplibregl.Map({
-  container:'map',
-  style:{version:8,sources:{
-    sat:{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:19},
-    lbl:{type:'raster',tiles:['https://cartodb-basemaps-a.global.ssl.fastly.net/dark_only_labels/{z}/{x}/{y}.png'],tileSize:256,maxzoom:18},
-    dem:{type:'raster-dem',encoding:'terrarium',tiles:['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],tileSize:256,maxzoom:15},
-    ghost:{type:'geojson',data:{type:'Feature',geometry:{type:'LineString',coordinates:LO.map(function(lo,i){return [lo,LA[i]];})}}},
-    anim:{type:'geojson',data:{type:'Feature',geometry:{type:'LineString',coordinates:[[LO[0],LA[0]]]}}},
-    dot:{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}}}
-  },layers:[
-    {id:'sat',type:'raster',source:'sat'},
-    {id:'lbl',type:'raster',source:'lbl',paint:{'raster-opacity':0.4}},
-    {id:'ghost',type:'line',source:'ghost',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'rgba(255,255,255,.07)','line-width':2}},
-    {id:'anim-glow',type:'line',source:'anim',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#f97316','line-width':14,'line-opacity':0.15,'line-blur':5}},
-    {id:'anim',type:'line',source:'anim',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#f97316','line-width':5,'line-opacity':0.95}},
-    {id:'dot-h',type:'circle',source:'dot',paint:{'circle-radius':20,'circle-color':'rgba(249,115,22,.15)','circle-pitch-alignment':'map'}},
-    {id:'dot',type:'circle',source:'dot',paint:{'circle-radius':9,'circle-color':'#f97316','circle-stroke-width':2.5,'circle-stroke-color':'white','circle-pitch-alignment':'map'}}
-  ]},
-  center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,antialias:true
-});
+var GHOST=__GHOST__;
+var MAP_READY=false;
+var map=new maplibregl.Map({container:'map',style:{version:8,sources:{
+  sat:{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:19},
+  lbl:{type:'raster',tiles:['https://cartodb-basemaps-a.global.ssl.fastly.net/dark_only_labels/{z}/{x}/{y}.png'],tileSize:256,maxzoom:18},
+  dem:{type:'raster-dem',encoding:'terrarium',tiles:['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],tileSize:256,maxzoom:15},
+  ghost:{type:'geojson',data:GHOST}
+},layers:[
+  {id:'sat',type:'raster',source:'sat'},
+  {id:'lbl',type:'raster',source:'lbl',paint:{'raster-opacity':0.4}},
+  {id:'ghost',type:'line',source:'ghost',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'rgba(255,255,255,.08)','line-width':2}}
+]},center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,antialias:true});
 map.on('load',function(){
-  map.setTerrain({source:'dem',exaggeration:3.5});
-  CP.forEach(function(cp){
-    var el=document.createElement('div');
-    el.style.cssText='background:rgba(6,10,20,.92);color:#fff;padding:3px 8px;border-radius:9px;font-size:10.5px;font-weight:700;white-space:nowrap;border:1.5px solid '+cp.color+';font-family:"Space Grotesk",sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.5)';
-    el.textContent=cp.label;
-    new maplibregl.Marker({element:el,anchor:'bottom'}).setLngLat([cp.lon,cp.lat]).addTo(map);
-  });
+  map.setTerrain({source:'dem',exaggeration:4});
+  map.addSource('anim',{type:'geojson',data:{type:'Feature',geometry:{type:'LineString',coordinates:[[LO[0],LA[0]],[LO[1],LA[1]]]}}});
+  map.addSource('dot',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}}});
+  map.addLayer({id:'anim-glow',type:'line',source:'anim',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#f97316','line-width':16,'line-opacity':0.2,'line-blur':8}});
+  map.addLayer({id:'anim',type:'line',source:'anim',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#f97316','line-width':5,'line-opacity':1}});
+  map.addLayer({id:'dot-h',type:'circle',source:'dot',paint:{'circle-radius':24,'circle-color':'rgba(249,115,22,.2)','circle-pitch-alignment':'map'}});
+  map.addLayer({id:'dot',type:'circle',source:'dot',paint:{'circle-radius':9,'circle-color':'#f97316','circle-stroke-width':3,'circle-stroke-color':'#fff','circle-pitch-alignment':'map'}});
+  CP.forEach(function(cp){var el=document.createElement('div');el.style.cssText='background:rgba(6,10,20,.93);color:#fff;padding:3px 9px;border-radius:9px;font-size:10.5px;font-weight:700;white-space:nowrap;border:1.5px solid '+cp.color+';font-family:Space Grotesk,sans-serif;box-shadow:0 2px 12px rgba(0,0,0,.6)';el.textContent=cp.label;new maplibregl.Marker({element:el,anchor:'bottom'}).setLngLat([cp.lon,cp.lat]).addTo(map);});
   function mk(c){var e=document.createElement('div');e.style.cssText='width:13px;height:13px;background:'+c+';border-radius:50%;border:2px solid white;box-shadow:0 0 10px '+c;return e;}
   new maplibregl.Marker({element:mk('#4ade80'),anchor:'center'}).setLngLat([LO[0],LA[0]]).addTo(map);
   new maplibregl.Marker({element:mk('#f87171'),anchor:'center'}).setLngLat([LO[N-1],LA[N-1]]).addTo(map);
-  lastTs=null;playing=true;requestAnimationFrame(frame);
+  MAP_READY=true;lastTs=null;requestAnimationFrame(frame);
 });
-var cur=0,frac=0,playing=true,follow=true,lastTs=null,lcp=-1,dp=0,SPD=1;
-var BASE=N/(TOT*8),animCoords=[[LO[0],LA[0]]];
+var cur=1,frac=1,playing=true,follow=true,lastTs=null,lcp=-1,dp=0,SPD=1;
+var BASE=N/(TOT*8),animCoords=[[LO[0],LA[0]],[LO[1],LA[1]]];
 function lerp(a,f){var i=Math.min(Math.floor(f),a.length-2),r=f-i;return a[i]*(1-r)+a[i+1]*r;}
 function frame(ts){
-  if(!playing)return;
+  if(!playing||!MAP_READY)return;
   if(!lastTs)lastTs=ts;
   var dt=Math.min((ts-lastTs)/1000,0.1);lastTs=ts;
   frac=Math.min(frac+BASE*SPD*dt*60,N-1);
@@ -2488,55 +2479,37 @@ function frame(ts){
   while(cur<nc&&cur<N-1){cur++;animCoords.push([LO[cur],LA[cur]]);}
   map.getSource('anim').setData({type:'Feature',geometry:{type:'LineString',coordinates:animCoords}});
   map.getSource('dot').setData({type:'Feature',geometry:{type:'Point',coordinates:[lo,la]}});
-  if(follow&&frac>3){
-    var ah=Math.min(frac+20,N-1),ai=Math.min(Math.floor(ah),N-2),af=ah-ai;
-    var ala=LA[ai]*(1-af)+LA[ai+1]*af,alo=LO[ai]*(1-af)+LO[ai+1]*af;
-    var brg=Math.atan2(alo-lo,ala-la)*180/Math.PI;
-    map.easeTo({center:[lo,la],bearing:brg-8,pitch:70,zoom:13.5,duration:180,easing:function(t){return t;}});
-  }
+  if(follow&&frac>5){var ah=Math.min(frac+20,N-1),ai=Math.min(Math.floor(ah),N-2),af=ah-ai;var ala=LA[ai]*(1-af)+LA[ai+1]*af,alo=LO[ai]*(1-af)+LO[ai+1]*af;var brg=Math.atan2(alo-lo,ala-la)*180/Math.PI;map.easeTo({center:[lo,la],bearing:brg-8,pitch:70,zoom:13.5,duration:180,easing:function(t){return t;}});}
   var d=lerp(DI,frac),s=lerp(SL,frac);
   if(frac>BASE*SPD)dp+=Math.max(0,el-lerp(EL,frac-BASE*SPD));
-  document.getElementById('sd').textContent=d.toFixed(2);
-  document.getElementById('se').textContent=Math.round(el);
-  var ss=document.getElementById('ss');
-  ss.textContent=(s>=0?'+':'')+s.toFixed(1)+'%';
-  ss.style.color=s>12?'#f87171':s>5?'#fb923c':s<-8?'#38bdf8':'#f97316';
+  document.getElementById('sd').textContent=d.toFixed(2);document.getElementById('se').textContent=Math.round(el);
+  var ss=document.getElementById('ss');ss.textContent=(s>=0?'+':'')+s.toFixed(1)+'%';ss.style.color=s>12?'#f87171':s>5?'#fb923c':s<-8?'#38bdf8':'#f97316';
   document.getElementById('sdp').textContent=Math.round(dp);
   document.getElementById('badge').textContent=d.toFixed(2)+' / '+TOT+' km';
   document.getElementById('progf').style.width=(frac/(N-1)*100)+'%';
   drawP(frac);
-  CP.forEach(function(cp,ci){
-    if(ci!==lcp&&Math.abs(cp.dist-d)<0.35){
-      lcp=ci;
-      document.getElementById('tn').textContent=cp.label;
-      document.getElementById('tn').style.color=cp.color;
-      document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(el)+' m';
-      var t=document.getElementById('toast');
-      t.style.borderColor=cp.color;t.style.display='block';
-      clearTimeout(window._ct);window._ct=setTimeout(function(){t.style.display='none';},2500);
-    }
-  });
+  CP.forEach(function(cp,ci){if(ci!==lcp&&Math.abs(cp.dist-d)<0.4){lcp=ci;document.getElementById('tn').textContent=cp.label;document.getElementById('tn').style.color=cp.color;document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(el)+' m';var t=document.getElementById('toast');t.style.borderColor=cp.color;t.style.display='block';clearTimeout(window._ct);window._ct=setTimeout(function(){t.style.display='none';},2500);}});
   if(frac>=N-1){playing=false;document.getElementById('bp').innerHTML='&#9654;';return;}
   requestAnimationFrame(frame);
 }
 var pc=document.getElementById('pc'),ctx=pc.getContext('2d');
-function cs(t){if(t>.85){var v=Math.round(210+(t-.85)/.15*45);return 'rgb('+v+','+v+','+v+')';}if(t>.6)return 'rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)';if(t>.35)return 'rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)';return 'rgb(38,'+Math.round(180+t*60)+',248)';}
+function cs(t){if(t>.85){var v=Math.round(210+(t-.85)/.15*45);return'rgb('+v+','+v+','+v+')';}if(t>.6)return'rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)';if(t>.35)return'rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)';return'rgb(38,'+Math.round(180+t*60)+',248)';}
 function drawP(c){pc.width=pc.offsetWidth||800;pc.height=pc.offsetHeight||62;var W=pc.width,H=pc.height;ctx.clearRect(0,0,W,H);var g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,'rgba(249,115,22,.22)');g.addColorStop(1,'rgba(0,0,0,0)');ctx.beginPath();EL.forEach(function(e,i){var x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.lineTo(W,H);ctx.lineTo(0,H);ctx.closePath();ctx.fillStyle=g;ctx.fill();for(var i=1;i<N;i++){var x0=(i-1)/N*W,x1=i/N*W,y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4,y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.strokeStyle=i<=(c||0)?cs(CV[i]):'rgba(255,255,255,.09)';ctx.lineWidth=1.7;ctx.stroke();}CP.forEach(function(cp){var xi=Math.round(cp.dist/TOT*(N-1)),xd=cp.dist/TOT*W,y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;ctx.beginPath();ctx.moveTo(xd,0);ctx.lineTo(xd,H);ctx.strokeStyle=cp.color+'55';ctx.lineWidth=1;ctx.stroke();ctx.beginPath();ctx.arc(xd,y,3,0,Math.PI*2);ctx.fillStyle=cp.color;ctx.fill();});if(c>=0&&c<N){var x=c/N*W,y=H-((EL[Math.min(Math.floor(c),N-1)]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.strokeStyle='rgba(249,115,22,.55)';ctx.lineWidth=1.5;ctx.stroke();ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fillStyle='#f97316';ctx.fill();ctx.beginPath();ctx.arc(x,y,2.5,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();}}
 function tgP(){playing=!playing;document.getElementById('bp').innerHTML=playing?'&#9646;&#9646;':'&#9654;';if(playing){lastTs=null;requestAnimationFrame(frame);}}
 function tgF(){follow=!follow;var b=document.getElementById('bf');b.classList.toggle('on',follow);b.textContent=follow?'CAM':'MAP';if(!follow)map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:700});}
 function spd(m){SPD=m;['s1','s2','s4'].forEach(function(id){document.getElementById(id).classList.remove('on');});document.getElementById('s'+m).classList.add('on');}
-function rst(){playing=false;frac=0;cur=0;dp=0;lcp=-1;lastTs=null;animCoords=[[LO[0],LA[0]]];map.getSource('anim').setData({type:'Feature',geometry:{type:'LineString',coordinates:[[LO[0],LA[0]]]}});map.getSource('dot').setData({type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}});document.getElementById('bp').innerHTML='&#9646;&#9646;';document.getElementById('progf').style.width='0%';map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:600});drawP(-1);playing=true;lastTs=null;requestAnimationFrame(frame);}
+function rst(){playing=false;frac=1;cur=1;dp=0;lcp=-1;lastTs=null;animCoords=[[LO[0],LA[0]],[LO[1],LA[1]]];if(MAP_READY){map.getSource('anim').setData({type:'Feature',geometry:{type:'LineString',coordinates:animCoords}});map.getSource('dot').setData({type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}});}document.getElementById('bp').innerHTML='&#9646;&#9646;';document.getElementById('progf').style.width='0%';map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:600});drawP(-1);playing=true;lastTs=null;requestAnimationFrame(frame);}
 window.addEventListener('resize',function(){drawP(frac>0?frac:-1);});
 </script></body></html>"""
 
-                _js = _js_raw.replace('__LO__', LO_js).replace('__LA__', LA_js)
-                _js = _js.replace('__DI__', DI_js).replace('__EL__', EL_js)
-                _js = _js.replace('__SL__', SL_js).replace('__CV__', CV_js)
-                _js = _js.replace('__CP__', CP_js)
-                _js = _js.replace('__EMIN__', str(_emin)).replace('__EMAX__', str(_emax))
-                _js = _js.replace('__TOT__', str(_total_km))
-                _js = _js.replace('__CLT__', str(_clat)).replace('__CLO__', str(_clon))
-
+                _js = _js_raw.replace('__LO__',LO_js).replace('__LA__',LA_js)
+                _js = _js.replace('__DI__',DI_js).replace('__EL__',EL_js)
+                _js = _js.replace('__SL__',SL_js).replace('__CV__',CV_js)
+                _js = _js.replace('__CP__',CP_js)
+                _js = _js.replace('__EMIN__',str(_emin)).replace('__EMAX__',str(_emax))
+                _js = _js.replace('__TOT__',str(_total_km))
+                _js = _js.replace('__CLT__',str(_clat)).replace('__CLO__',str(_clon))
+                _js = _js.replace('__GHOST__',GHOST_js)
                 html_anim = _head + _js
                 # Sauvegarder dans session_state pour persistance
                 st.session_state["html_anim"] = html_anim
