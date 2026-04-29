@@ -2352,17 +2352,17 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                 dot_color    = "#ff4444"
                 trace_width  = anim_width
 
-                # ── Build animation HTML MapLibre GL JS — satellite + relief 3D ──
+                # ── Build animation HTML — Leaflet satellite + relief 3D isométrique ──
                 import json as _json
 
                 _n = len(lons_a)
-                LO_js   = _json.dumps([round(x,6) for x in lons_a])
-                LA_js   = _json.dumps([round(x,6) for x in lats_a])
-                DI_js   = _json.dumps([round(x,3) for x in dist_a])
-                EL_js   = _json.dumps([round(e,1) for e in elev_a])
-                SL_js   = _json.dumps([round(s,1) for s in slopes_a])
-                CV_js   = _json.dumps([round(v,4) for v in cv_norm])
-                CP_js   = _json.dumps([
+                LO_js = _json.dumps([round(x,6) for x in lons_a])
+                LA_js = _json.dumps([round(x,6) for x in lats_a])
+                DI_js = _json.dumps([round(x,3) for x in dist_a])
+                EL_js = _json.dumps([round(e,1) for e in elev_a])
+                SL_js = _json.dumps([round(s,1) for s in slopes_a])
+                CV_js = _json.dumps([round(v,4) for v in cv_norm])
+                CP_js = _json.dumps([
                     {"lat":c["lat"],"lon":c["lon"],"label":c["label"],
                      "dist":c["dist_km"],"elev":c["alt"],
                      "color":{"🥤 Ravitaillement":"#22d3ee","🏔 Sommet":"#f59e0b",
@@ -2371,9 +2371,6 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                              }.get(c["type"],"#f97316")}
                     for c in sorted(checkpoints, key=lambda x: x["dist_km"])
                 ] if anim_show_cp and checkpoints else [])
-                GHOST_js = _json.dumps({"type":"Feature","geometry":{
-                    "type":"LineString",
-                    "coordinates":[[lons_a[i],lats_a[i]] for i in range(_n)]}})
 
                 _dplus_a = int(sum(max(0,elev_a[i]-elev_a[i-1]) for i in range(1,_n)))
                 _emin = round(min(elev_a)); _emax = round(max(elev_a))
@@ -2386,11 +2383,11 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Trail {_total_km} km</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@700;800&family=Space+Mono&display=swap" rel="stylesheet"/>
-<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet"/>
-<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box;}}html,body{{height:100%;overflow:hidden;background:#060a14;font-family:'Space Grotesk',sans-serif;color:#e2e8f0;}}
-#app{{display:grid;grid-template-rows:48px 1fr 72px;height:100vh;}}
+#app{{display:grid;grid-template-rows:48px 1fr 110px;height:100vh;}}
 #hdr{{display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:rgba(6,10,20,.95);backdrop-filter:blur(16px);border-bottom:1px solid rgba(255,255,255,.08);z-index:200;gap:10px;}}
 #ti h1{{font-size:.78rem;font-weight:800;letter-spacing:.06em;}}#ti p{{font-size:.55rem;color:#64748b;font-family:'Space Mono';}}
 #stats{{display:flex;gap:4px;flex:1;justify-content:center;}}
@@ -2400,18 +2397,21 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
 .btn{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#e2e8f0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.65rem;font-weight:700;font-family:'Space Grotesk';transition:all .15s;}}
 .btn:hover,.btn.on{{background:rgba(249,115,22,.3);border-color:#f97316;color:#fff;}}.btn.pl{{background:#f97316;border-color:#f97316;color:#fff;}}
 #mwrap{{position:relative;min-height:0;}}#map{{width:100%;height:100%;}}
-.maplibregl-ctrl-bottom-left,.maplibregl-ctrl-bottom-right,.maplibregl-ctrl-top-right{{display:none!important;}}
+.leaflet-container{{background:#060a14!important;}}.leaflet-control-attribution{{display:none!important;}}
 #prog{{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.06);z-index:500;}}
-#progf{{height:100%;width:0%;background:linear-gradient(90deg,#f97316,#ef4444);box-shadow:0 0 6px #f97316;}}
-#badge{{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(6,10,20,.9);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:3px 12px;font-size:.7rem;font-weight:700;font-family:'Space Mono';color:#f97316;z-index:500;}}
+#progf{{height:100%;width:0%;background:linear-gradient(90deg,#f97316,#ef4444);box-shadow:0 0 6px #f97316;transition:width .08s;}}
+#badge{{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(6,10,20,.9);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:3px 12px;font-size:.7rem;font-weight:700;font-family:'Space Mono';color:#f97316;z-index:500;white-space:nowrap;}}
 #toast{{display:none;position:absolute;top:8px;left:50%;transform:translateX(-50%);background:rgba(6,10,20,.93);backdrop-filter:blur(12px);border-radius:10px;padding:7px 16px;z-index:999;pointer-events:none;text-align:center;min-width:180px;border:1px solid #f97316;}}
 .tn{{font-size:.82rem;font-weight:700;}}.tm{{font-size:.6rem;color:#64748b;font-family:'Space Mono';}}
-#prof{{background:rgba(6,10,20,.97);border-top:1px solid rgba(255,255,255,.07);padding:5px 16px 4px;}}
-#prof canvas{{width:100%;height:100%;display:block;}}
+#bottom{{display:grid;grid-template-columns:1fr 280px;background:rgba(6,10,20,.97);border-top:1px solid rgba(255,255,255,.07);}}
+#prof{{padding:6px 16px 4px;}}#prof canvas{{width:100%;height:100%;display:block;}}
+#relief-wrap{{border-left:1px solid rgba(255,255,255,.07);padding:4px 8px;display:flex;flex-direction:column;}}
+#relief-title{{font-size:.5rem;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:2px;text-align:center;}}
+#relief-canvas{{width:100%;flex:1;display:block;}}
 </style></head><body>
 <div id="app">
 <div id="hdr">
-  <div id="ti"><h1>🏔 TRAIL — {_total_km} KM</h1><p>D+{_dplus_a}M · {_emin}–{_emax}M · SAT+3D</p></div>
+  <div id="ti"><h1>🏔 TRAIL — {_total_km} KM</h1><p>D+{_dplus_a}M · {_emin}–{_emax}M · SAT + RELIEF 3D</p></div>
   <div id="stats">
     <div class="sc"><div class="sv" id="sd">0.0</div><div class="sl">km</div></div>
     <div class="sc"><div class="sv" id="se">—</div><div class="sl">m alt</div></div>
@@ -2433,53 +2433,45 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
   <div id="badge">0.00 / {_total_km} km</div>
   <div id="toast"><div class="tn" id="tn"></div><div class="tm" id="tm"></div></div>
 </div>
-<div id="prof"><canvas id="pc"></canvas></div>
+<div id="bottom">
+  <div id="prof"><canvas id="pc"></canvas></div>
+  <div id="relief-wrap"><div id="relief-title">⛰ Relief 3D</div><canvas id="rc"></canvas></div>
+</div>
 </div>"""
 
                 _js_raw = """<script>
 var LO=__LO__,LA=__LA__,DI=__DI__,EL=__EL__,SL=__SL__,CV=__CV__,CP=__CP__;
 var N=LO.length,EMIN=__EMIN__,EMAX=__EMAX__,TOT=__TOT__,CLT=__CLT__,CLO=__CLO__;
-var GHOST=__GHOST__;
-var MAP_READY=false;
-var map=new maplibregl.Map({container:'map',style:{version:8,sources:{
-  sat:{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:19},
-  lbl:{type:'raster',tiles:['https://cartodb-basemaps-a.global.ssl.fastly.net/dark_only_labels/{z}/{x}/{y}.png'],tileSize:256,maxzoom:18},
-  dem:{type:'raster-dem',encoding:'terrarium',tiles:['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],tileSize:256,maxzoom:15},
-  ghost:{type:'geojson',data:GHOST}
-},layers:[
-  {id:'sat',type:'raster',source:'sat'},
-  {id:'lbl',type:'raster',source:'lbl',paint:{'raster-opacity':0.4}},
-  {id:'ghost',type:'line',source:'ghost',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'rgba(255,255,255,.08)','line-width':2}}
-]},center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,antialias:true});
-map.on('load',function(){
-  map.setTerrain({source:'dem',exaggeration:4});
-  map.addSource('anim',{type:'geojson',data:{type:'Feature',geometry:{type:'LineString',coordinates:[[LO[0],LA[0]],[LO[1],LA[1]]]}}});
-  map.addSource('dot',{type:'geojson',data:{type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}}});
-  map.addLayer({id:'anim-glow',type:'line',source:'anim',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#f97316','line-width':16,'line-opacity':0.2,'line-blur':8}});
-  map.addLayer({id:'anim',type:'line',source:'anim',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#f97316','line-width':5,'line-opacity':1}});
-  map.addLayer({id:'dot-h',type:'circle',source:'dot',paint:{'circle-radius':24,'circle-color':'rgba(249,115,22,.2)','circle-pitch-alignment':'map'}});
-  map.addLayer({id:'dot',type:'circle',source:'dot',paint:{'circle-radius':9,'circle-color':'#f97316','circle-stroke-width':3,'circle-stroke-color':'#fff','circle-pitch-alignment':'map'}});
-  CP.forEach(function(cp){var el=document.createElement('div');el.style.cssText='background:rgba(6,10,20,.93);color:#fff;padding:3px 9px;border-radius:9px;font-size:10.5px;font-weight:700;white-space:nowrap;border:1.5px solid '+cp.color+';font-family:Space Grotesk,sans-serif;box-shadow:0 2px 12px rgba(0,0,0,.6)';el.textContent=cp.label;new maplibregl.Marker({element:el,anchor:'bottom'}).setLngLat([cp.lon,cp.lat]).addTo(map);});
-  function mk(c){var e=document.createElement('div');e.style.cssText='width:13px;height:13px;background:'+c+';border-radius:50%;border:2px solid white;box-shadow:0 0 10px '+c;return e;}
-  new maplibregl.Marker({element:mk('#4ade80'),anchor:'center'}).setLngLat([LO[0],LA[0]]).addTo(map);
-  new maplibregl.Marker({element:mk('#f87171'),anchor:'center'}).setLngLat([LO[N-1],LA[N-1]]).addTo(map);
-  MAP_READY=true;lastTs=null;requestAnimationFrame(frame);
+var map=L.map('map',{zoomControl:false,attributionControl:false}).setView([CLT,CLO],13);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,opacity:.88}).addTo(map);
+L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/dark_only_labels/{z}/{x}/{y}.png',{maxZoom:18,opacity:.45}).addTo(map);
+var ghostCoords=LA.map(function(la,i){return [la,LO[i]];});
+L.polyline(ghostCoords,{color:'rgba(255,255,255,.07)',weight:2}).addTo(map);
+function mkDot(c){return L.divIcon({className:'',iconAnchor:[7,7],html:'<div style="width:14px;height:14px;background:'+c+';border-radius:50%;border:2px solid white;box-shadow:0 0 10px '+c+'"></div>'});}
+L.marker([LA[0],LO[0]],{icon:mkDot('#4ade80')}).addTo(map);
+L.marker([LA[N-1],LO[N-1]],{icon:mkDot('#f87171')}).addTo(map);
+CP.forEach(function(cp){
+  var el=document.createElement('div');
+  el.style.cssText='background:rgba(6,10,20,.92);color:#fff;padding:2px 8px;border-radius:9px;font-size:10px;font-weight:700;white-space:nowrap;border:1.5px solid '+cp.color+';font-family:Space Grotesk,sans-serif';
+  el.textContent=cp.label;
+  L.marker([cp.lat,cp.lon],{icon:L.divIcon({className:'',iconAnchor:[0,22],html:el.outerHTML})}).addTo(map);
+  L.circleMarker([cp.lat,cp.lon],{radius:8,color:cp.color,fillColor:cp.color,fillOpacity:.9,weight:2}).addTo(map);
 });
-var cur=1,frac=1,playing=true,follow=true,lastTs=null,lcp=-1,dp=0,SPD=1;
-var BASE=N/(TOT*8),animCoords=[[LO[0],LA[0]],[LO[1],LA[1]]];
+function cs(t){if(t>.85){var v=Math.round(210+(t-.85)/.15*45);return'rgb('+v+','+v+','+v+')';}if(t>.6)return'rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)';if(t>.35)return'rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)';return'rgb(38,'+Math.round(180+t*60)+',248)';}
 function lerp(a,f){var i=Math.min(Math.floor(f),a.length-2),r=f-i;return a[i]*(1-r)+a[i+1]*r;}
+var segs=[],dotMk=null,cur=0,frac=0,playing=true,follow=true,lastTs=null,lcp=-1,dp=0,SPD=1,BASE=N/(TOT*8);
 function frame(ts){
-  if(!playing||!MAP_READY)return;
+  if(!playing)return;
   if(!lastTs)lastTs=ts;
   var dt=Math.min((ts-lastTs)/1000,0.1);lastTs=ts;
   frac=Math.min(frac+BASE*SPD*dt*60,N-1);
   var fi=Math.min(Math.floor(frac),N-2),ff=frac-fi;
   var la=LA[fi]*(1-ff)+LA[fi+1]*ff,lo=LO[fi]*(1-ff)+LO[fi+1]*ff,el=EL[fi]*(1-ff)+EL[fi+1]*ff;
   var nc=Math.floor(frac);
-  while(cur<nc&&cur<N-1){cur++;animCoords.push([LO[cur],LA[cur]]);}
-  map.getSource('anim').setData({type:'Feature',geometry:{type:'LineString',coordinates:animCoords}});
-  map.getSource('dot').setData({type:'Feature',geometry:{type:'Point',coordinates:[lo,la]}});
-  if(follow&&frac>5){var ah=Math.min(frac+20,N-1),ai=Math.min(Math.floor(ah),N-2),af=ah-ai;var ala=LA[ai]*(1-af)+LA[ai+1]*af,alo=LO[ai]*(1-af)+LO[ai+1]*af;var brg=Math.atan2(alo-lo,ala-la)*180/Math.PI;map.easeTo({center:[lo,la],bearing:brg-8,pitch:70,zoom:13.5,duration:180,easing:function(t){return t;}});}
+  while(cur<nc&&cur<N-1){cur++;segs.push(L.polyline([[LA[cur-1],LO[cur-1]],[LA[cur],LO[cur]]],{color:cs(CV[cur]),weight:5,opacity:.95,smoothFactor:.5,lineCap:'round',lineJoin:'round'}).addTo(map));}
+  if(dotMk)map.removeLayer(dotMk);
+  dotMk=L.marker([la,lo],{icon:L.divIcon({className:'',iconAnchor:[11,11],html:'<div style="width:22px;height:22px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#fff 0%,#f97316 45%,#dc2626 100%);border:3px solid rgba(255,255,255,.95);box-shadow:0 0 0 5px rgba(249,115,22,.25),0 0 18px rgba(249,115,22,.8)"></div>'}),zIndexOffset:2000}).addTo(map);
+  if(follow)map.setView([la,lo],map.getZoom(),{animate:true,duration:.12,noMoveStart:true});
   var d=lerp(DI,frac),s=lerp(SL,frac);
   if(frac>BASE*SPD)dp+=Math.max(0,el-lerp(EL,frac-BASE*SPD));
   document.getElementById('sd').textContent=d.toFixed(2);document.getElementById('se').textContent=Math.round(el);
@@ -2487,19 +2479,21 @@ function frame(ts){
   document.getElementById('sdp').textContent=Math.round(dp);
   document.getElementById('badge').textContent=d.toFixed(2)+' / '+TOT+' km';
   document.getElementById('progf').style.width=(frac/(N-1)*100)+'%';
-  drawP(frac);
+  drawProf(frac);drawRelief(frac);
   CP.forEach(function(cp,ci){if(ci!==lcp&&Math.abs(cp.dist-d)<0.4){lcp=ci;document.getElementById('tn').textContent=cp.label;document.getElementById('tn').style.color=cp.color;document.getElementById('tm').textContent=cp.dist.toFixed(1)+' km · '+Math.round(el)+' m';var t=document.getElementById('toast');t.style.borderColor=cp.color;t.style.display='block';clearTimeout(window._ct);window._ct=setTimeout(function(){t.style.display='none';},2500);}});
   if(frac>=N-1){playing=false;document.getElementById('bp').innerHTML='&#9654;';return;}
   requestAnimationFrame(frame);
 }
-var pc=document.getElementById('pc'),ctx=pc.getContext('2d');
-function cs(t){if(t>.85){var v=Math.round(210+(t-.85)/.15*45);return'rgb('+v+','+v+','+v+')';}if(t>.6)return'rgb(249,'+Math.round(115+(t-.6)/.25*80)+',22)';if(t>.35)return'rgb('+Math.round(74+(t-.35)/.25*175)+','+Math.round(222-(t-.35)/.25*110)+',128)';return'rgb(38,'+Math.round(180+t*60)+',248)';}
-function drawP(c){pc.width=pc.offsetWidth||800;pc.height=pc.offsetHeight||62;var W=pc.width,H=pc.height;ctx.clearRect(0,0,W,H);var g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,'rgba(249,115,22,.22)');g.addColorStop(1,'rgba(0,0,0,0)');ctx.beginPath();EL.forEach(function(e,i){var x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.lineTo(W,H);ctx.lineTo(0,H);ctx.closePath();ctx.fillStyle=g;ctx.fill();for(var i=1;i<N;i++){var x0=(i-1)/N*W,x1=i/N*W,y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4,y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.strokeStyle=i<=(c||0)?cs(CV[i]):'rgba(255,255,255,.09)';ctx.lineWidth=1.7;ctx.stroke();}CP.forEach(function(cp){var xi=Math.round(cp.dist/TOT*(N-1)),xd=cp.dist/TOT*W,y=H-((EL[xi]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;ctx.beginPath();ctx.moveTo(xd,0);ctx.lineTo(xd,H);ctx.strokeStyle=cp.color+'55';ctx.lineWidth=1;ctx.stroke();ctx.beginPath();ctx.arc(xd,y,3,0,Math.PI*2);ctx.fillStyle=cp.color;ctx.fill();});if(c>=0&&c<N){var x=c/N*W,y=H-((EL[Math.min(Math.floor(c),N-1)]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.strokeStyle='rgba(249,115,22,.55)';ctx.lineWidth=1.5;ctx.stroke();ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fillStyle='#f97316';ctx.fill();ctx.beginPath();ctx.arc(x,y,2.5,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();}}
+var pc=document.getElementById('pc'),pctx=pc.getContext('2d');
+function drawProf(c){pc.width=pc.offsetWidth||600;pc.height=pc.offsetHeight||90;var W=pc.width,H=pc.height;pctx.clearRect(0,0,W,H);var g=pctx.createLinearGradient(0,0,0,H);g.addColorStop(0,'rgba(249,115,22,.22)');g.addColorStop(1,'rgba(0,0,0,0)');pctx.beginPath();EL.forEach(function(e,i){var x=i/N*W,y=H-((e-EMIN)/(EMAX-EMIN+1))*(H-8)-4;i?pctx.lineTo(x,y):pctx.moveTo(x,y);});pctx.lineTo(W,H);pctx.lineTo(0,H);pctx.closePath();pctx.fillStyle=g;pctx.fill();for(var i=1;i<N;i++){var x0=(i-1)/N*W,x1=i/N*W,y0=H-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(H-8)-4,y1=H-((EL[i]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;pctx.beginPath();pctx.moveTo(x0,y0);pctx.lineTo(x1,y1);pctx.strokeStyle=i<=(c||0)?cs(CV[i]):'rgba(255,255,255,.09)';pctx.lineWidth=1.7;pctx.stroke();}if(c>=0&&c<N){var x=c/N*W,y=H-((EL[Math.min(Math.floor(c),N-1)]-EMIN)/(EMAX-EMIN+1))*(H-8)-4;pctx.beginPath();pctx.moveTo(x,0);pctx.lineTo(x,H);pctx.strokeStyle='rgba(249,115,22,.6)';pctx.lineWidth=1.5;pctx.stroke();pctx.beginPath();pctx.arc(x,y,5,0,Math.PI*2);pctx.fillStyle='#f97316';pctx.fill();pctx.beginPath();pctx.arc(x,y,2.5,0,Math.PI*2);pctx.fillStyle='#fff';pctx.fill();}}
+var rc=document.getElementById('rc'),rctx=rc.getContext('2d');
+function drawRelief(curIdx){rc.width=rc.offsetWidth||280;rc.height=rc.offsetHeight||100;var W=rc.width,H=rc.height;rctx.clearRect(0,0,W,H);var fi=Math.min(Math.floor(curIdx||0),N-1),WIN=60,startI=Math.max(0,fi-WIN),endI=Math.min(N-1,fi+WIN),pts=endI-startI;if(pts<2)return;var EXAG=4,PITCH=0.45,cx=LA[fi],scaleX=W/(2*WIN*0.015),scaleY=H*0.4;rctx.save();rctx.beginPath();var first=true;for(var i=startI;i<=endI;i++){var dx=(LA[i]-cx)*scaleX,elNorm=(EL[i]-EMIN)/(EMAX-EMIN+1),sy=PITCH*dx,sz=elNorm*scaleY*EXAG/4,px=W/2+dx*0.7-sy*0.3,py=H*0.75-sz-sy*0.5;if(first){rctx.moveTo(px,py);first=false;}else rctx.lineTo(px,py);}var dxl=(LA[endI]-cx)*scaleX,syl=PITCH*dxl;rctx.lineTo(W/2+dxl*0.7-syl*0.3,H*0.95);var dx0=(LA[startI]-cx)*scaleX,sy0=PITCH*dx0;rctx.lineTo(W/2+dx0*0.7-sy0*0.3,H*0.95);rctx.closePath();var grd=rctx.createLinearGradient(0,0,0,H);grd.addColorStop(0,'rgba(100,200,100,.5)');grd.addColorStop(.5,'rgba(150,120,80,.4)');grd.addColorStop(1,'rgba(80,80,80,.2)');rctx.fillStyle=grd;rctx.fill();rctx.beginPath();first=true;for(var i=startI;i<=endI;i++){var dx=(LA[i]-cx)*scaleX,elNorm=(EL[i]-EMIN)/(EMAX-EMIN+1),sy=PITCH*dx,sz=elNorm*scaleY*EXAG/4,px=W/2+dx*0.7-sy*0.3,py=H*0.75-sz-sy*0.5;if(first){rctx.moveTo(px,py);first=false;}else rctx.lineTo(px,py);}rctx.strokeStyle='rgba(255,255,255,.6)';rctx.lineWidth=1.5;rctx.stroke();var elCur=(EL[fi]-EMIN)/(EMAX-EMIN+1),pxCur=W/2,pyCur=H*0.75-elCur*scaleY*EXAG/4;rctx.beginPath();rctx.arc(pxCur,pyCur,5,0,Math.PI*2);rctx.fillStyle='#f97316';rctx.fill();rctx.strokeStyle='white';rctx.lineWidth=2;rctx.stroke();rctx.beginPath();rctx.moveTo(pxCur,pyCur);rctx.lineTo(pxCur,H*0.75);rctx.strokeStyle='rgba(249,115,22,.4)';rctx.lineWidth=1;rctx.setLineDash([3,3]);rctx.stroke();rctx.setLineDash([]);rctx.fillStyle='#f97316';rctx.font='bold 10px Space Mono,monospace';rctx.fillText(Math.round(EL[fi])+' m',pxCur+8,pyCur-4);rctx.restore();}
 function tgP(){playing=!playing;document.getElementById('bp').innerHTML=playing?'&#9646;&#9646;':'&#9654;';if(playing){lastTs=null;requestAnimationFrame(frame);}}
-function tgF(){follow=!follow;var b=document.getElementById('bf');b.classList.toggle('on',follow);b.textContent=follow?'CAM':'MAP';if(!follow)map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:700});}
+function tgF(){follow=!follow;var b=document.getElementById('bf');b.classList.toggle('on',follow);b.textContent=follow?'CAM':'MAP';}
 function spd(m){SPD=m;['s1','s2','s4'].forEach(function(id){document.getElementById(id).classList.remove('on');});document.getElementById('s'+m).classList.add('on');}
-function rst(){playing=false;frac=1;cur=1;dp=0;lcp=-1;lastTs=null;animCoords=[[LO[0],LA[0]],[LO[1],LA[1]]];if(MAP_READY){map.getSource('anim').setData({type:'Feature',geometry:{type:'LineString',coordinates:animCoords}});map.getSource('dot').setData({type:'Feature',geometry:{type:'Point',coordinates:[LO[0],LA[0]]}});}document.getElementById('bp').innerHTML='&#9646;&#9646;';document.getElementById('progf').style.width='0%';map.easeTo({center:[CLO,CLT],zoom:12,pitch:72,bearing:-25,duration:600});drawP(-1);playing=true;lastTs=null;requestAnimationFrame(frame);}
-window.addEventListener('resize',function(){drawP(frac>0?frac:-1);});
+function rst(){playing=false;frac=0;cur=0;dp=0;lcp=-1;lastTs=null;segs.forEach(function(s){map.removeLayer(s);});segs=[];if(dotMk){map.removeLayer(dotMk);dotMk=null;}document.getElementById('bp').innerHTML='&#9646;&#9646;';document.getElementById('progf').style.width='0%';map.setView([CLT,CLO],13);drawProf(-1);drawRelief(0);playing=true;lastTs=null;requestAnimationFrame(frame);}
+window.addEventListener('load',function(){drawProf(-1);drawRelief(0);requestAnimationFrame(frame);});
+window.addEventListener('resize',function(){drawProf(frac>0?frac:-1);drawRelief(Math.floor(frac));});
 </script></body></html>"""
 
                 _js = _js_raw.replace('__LO__',LO_js).replace('__LA__',LA_js)
@@ -2509,7 +2503,6 @@ window.addEventListener('resize',function(){drawP(frac>0?frac:-1);});
                 _js = _js.replace('__EMIN__',str(_emin)).replace('__EMAX__',str(_emax))
                 _js = _js.replace('__TOT__',str(_total_km))
                 _js = _js.replace('__CLT__',str(_clat)).replace('__CLO__',str(_clon))
-                _js = _js.replace('__GHOST__',GHOST_js)
                 html_anim = _head + _js
                 # Sauvegarder dans session_state pour persistance
                 st.session_state["html_anim"] = html_anim
