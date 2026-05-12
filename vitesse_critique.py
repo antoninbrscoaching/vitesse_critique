@@ -1,8 +1,11 @@
-# analyse_course_v4.py
+# analyse_course_v5.py
 # Application Streamlit unifiée — 3 onglets
-#   [0] 🏃 Prédiction de course (v3)
-#   [1] 🧪 Tests d'endurance + Vitesse Critique
-#   [2] ⚙️  Analyse entraînement (avec analyse fractionnés)
+# NOUVEAUTÉS v5 :
+#   - Sélecteur profil terrain : Route / Trail modéré / Ultra-trail montagneux
+#   - Sélecteur surface : route, gravier, sentier, rocheux, boue/neige
+#   - Tous les coefficients toujours visibles et modifiables
+#   - Plafond anti-accumulation intégré dans le bloc Pente
+#   - surface_mult appliqué sur base_s_per_km dans run_prediction()
 #
 # pip install streamlit gpxpy fitparse fitdecode pandas numpy pydeck matplotlib requests scipy
 
@@ -30,7 +33,7 @@ import io
 from scipy import stats as sp_stats
 
 # ══════════════════════════════════════════════════════════════
-# CONFIG — un seul set_page_config pour toute l'app
+# CONFIG
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="Coach Running — Suite complète", layout="wide", page_icon="🏃")
 TZ_NAME_DEFAULT = "Europe/Paris"
@@ -68,7 +71,6 @@ st.markdown("""
 }
 .test-card h4 { margin: 0 0 8px 0; color: #1f77b4; font-size: 1rem; }
 .result-metric { text-align: center; font-size: 1.4rem; font-weight: 700; }
-
 .sidebar-label {
     background: #e8f4fd;
     border-radius: 4px;
@@ -84,9 +86,16 @@ st.markdown("""
     padding: 10px 14px;
     margin-bottom: 8px;
 }
+.terrain-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
 </style>
 """, unsafe_allow_html=True)
-
 
 # ══════════════════════════════════════════════════════════════
 # HELPERS UI
@@ -101,10 +110,6 @@ def param_help(text_up: str, text_down: str, note: str = ""):
         f'{note_html}</div>',
         unsafe_allow_html=True
     )
-
-
-
-
 
 # ══════════════════════════════════════════════════════════════
 # UTILITAIRES PARTAGÉS
@@ -126,7 +131,6 @@ def safe_float(val, default=0.0):
 
 
 def hms_to_seconds(hms: str) -> int:
-    """Convertit hh:mm:ss, mm:ss ou ss en secondes entières."""
     if hms is None: return 0
     try:
         parts = [int(p) for p in str(hms).strip().split(":")]
@@ -141,7 +145,6 @@ def hms_to_seconds(hms: str) -> int:
 
 
 def seconds_to_hms(s: float) -> str:
-    """Convertit des secondes en hh:mm:ss."""
     s = int(round(s))
     return f"{s//3600}:{(s%3600)//60:02d}:{s%60:02d}"
 
@@ -151,7 +154,6 @@ def hms_to_timedelta(hms: str) -> timedelta:
 
 
 def validate_hms(val: str) -> bool:
-    """Retourne True si le format hh:mm:ss / mm:ss est valide."""
     try:
         parts = [int(p) for p in val.strip().split(":")]
         if len(parts) == 3:
@@ -165,10 +167,6 @@ def validate_hms(val: str) -> bool:
 
 def hms_input(label: str, default: str = "0:00:00", key: str = None,
               help: str = None, compact: bool = False) -> str:
-    """
-    Champ de saisie d'un temps au format hh:mm:ss.
-    Retourne la valeur saisie (chaîne). Affiche un avertissement si format invalide.
-    """
     val = st.text_input(
         label,
         value=str(st.session_state.get(key, default)) if key else default,
@@ -214,7 +212,7 @@ def compute_dplus_dminus(elevs):
 
 
 # ══════════════════════════════════════════════════════════════
-# MODÈLES PHYSIQUES (v3)
+# MODÈLES PHYSIQUES
 # ══════════════════════════════════════════════════════════════
 
 def wbgt_simplified(T_c: float, RH: float) -> float:
@@ -444,7 +442,7 @@ def correct_elevations_dem(points, max_points=100, dataset="srtm30m"):
 
 
 # ══════════════════════════════════════════════════════════════
-# FC ANALYSE (v3)
+# FC ANALYSE
 # ══════════════════════════════════════════════════════════════
 
 def analyze_hr_v3(hr_records: list) -> dict:
@@ -464,7 +462,7 @@ def analyze_hr_v3(hr_records: list) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# PARSING FICHIERS (fitparse — pour onglet Prédiction)
+# PARSING FICHIERS
 # ══════════════════════════════════════════════════════════════
 
 class SimplePoint:
@@ -580,14 +578,10 @@ def extract_segment(points, start_td, end_td):
 
 
 # ══════════════════════════════════════════════════════════════
-# CHARGEMENT ACTIVITÉ (fitdecode — pour onglets Tests + Entraînement)
+# CHARGEMENT ACTIVITÉ (fitdecode)
 # ══════════════════════════════════════════════════════════════
 
 def load_activity(file):
-    """
-    Charge FIT (fitdecode), GPX, TCX ou CSV.
-    Retourne un DataFrame avec : elapsed_s, heart_rate, speed_ms, distance_m, altitude_m
-    """
     if file is None: return None
     fname = file.name.lower()
     df = None
@@ -686,11 +680,9 @@ def load_activity(file):
         if "elapsed_s" not in df.columns: df["elapsed_s"] = range(len(df))
 
     if df is None: return None
-
     for col in ["heart_rate","speed_ms","distance_m","altitude_m","elapsed_s"]:
         if col not in df.columns: df[col] = None
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df = df.dropna(subset=["elapsed_s"]).reset_index(drop=True)
     return df if len(df) >= 5 else None
 
@@ -748,9 +740,66 @@ def analyze_speed_kinetics(df: pd.DataFrame) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# VITESSE CRITIQUE (VC)
+# VITESSE CRITIQUE (VC) + SV1/SV2
 # ══════════════════════════════════════════════════════════════
-# PARSEUR MASQUE ZONE X (Pairfs) + DÉTECTION SV1/SV2
+
+def compute_vc(distances_m: list, durations_s: list):
+    T = np.array(durations_s, dtype=float)
+    D = np.array(distances_m, dtype=float)
+    if len(T) < 2: return None, None, None
+    slope, intercept, r, p, se = sp_stats.linregress(T, D)
+    return float(slope), float(intercept), float(r**2)
+
+
+def build_holding_table(vc_ms: float, d_prime: float,
+                        refs_fit: list, K_riegel: float) -> pd.DataFrame:
+    if vc_ms is None or vc_ms <= 0:
+        return pd.DataFrame()
+    X, Y = [], []
+    for r in refs_fit:
+        d_m = float(r.get("distance", 0))
+        t_s = float(r.get("temps", 0))
+        if d_m > 0 and t_s > 0:
+            X.append(math.log(d_m / 1000.0))
+            Y.append(math.log(t_s))
+    if len(X) >= 2:
+        K_fit, loga, _, _, _ = sp_stats.linregress(X, Y)
+        K_fit = float(max(0.85, min(1.25, K_fit)))
+        a_fit = math.exp(float(loga))
+    elif len(X) == 1:
+        K_fit = float(K_riegel)
+        a_fit = math.exp(Y[0]) / math.exp(X[0])
+    else:
+        K_fit = float(K_riegel)
+        a_fit = 240.0
+    pct_steps = [pct / 100.0 for pct in range(80, 121, 2)]
+    rows = []
+    for pct in pct_steps:
+        v = vc_ms * pct
+        if v <= 0: continue
+        pct_label = f"{round(pct * 100):.0f} %"
+        pace = pace_str(1000.0 / v)
+        if pct < 1.0:
+            if abs(1.0 - K_fit) < 1e-6: continue
+            try:
+                t = (a_fit * (v / 1000.0) ** K_fit) ** (1.0 / (1.0 - K_fit))
+            except Exception: continue
+            modele = "Riegel"
+        else:
+            delta_v = v - vc_ms
+            if d_prime is None or delta_v < 0.01: continue
+            t = d_prime / delta_v
+            modele = "Modèle D'"
+        t = max(0.0, min(t, 360000.0))
+        if t > 0:
+            rows.append({"% VC": pct_label, "Vitesse (m/s)": round(v, 2),
+                         "Allure (/km)": pace, "Temps de maintien": seconds_to_hms(t),
+                         "Durée (min)": round(t / 60.0, 1), "Modèle": modele})
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════
+# PARSEUR ZONE X (Pairfs) + DÉTECTION SV1/SV2
 # ══════════════════════════════════════════════════════════════
 
 def parse_zonex_csv(file):
@@ -766,7 +815,6 @@ def parse_zonex_csv(file):
         df = pd.read_csv(file)
         df.columns = [c.strip() for c in df.columns]
 
-        # Normaliser les noms de colonnes (robustesse aux variantes)
         renames = {}
         for c in df.columns:
             cl = c.lower().replace(" ", "").replace("(", "").replace(")", "")
@@ -786,7 +834,6 @@ def parse_zonex_csv(file):
             elif cl == "aux2":                  renames[c] = "aux2"
         df.rename(columns=renames, inplace=True)
 
-        # Détecter la colonne VE si renommée différemment
         if "VE" not in df.columns:
             for c in df.columns:
                 if "VE" in c and "L/min" in c:
@@ -798,27 +845,22 @@ def parse_zonex_csv(file):
         if missing:
             return None
 
-        # Temps relatif
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
         df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
         df["elapsed_s"] = df["timestamp"] - df["timestamp"].iloc[0]
         df["elapsed_min"] = df["elapsed_s"] / 60.0
 
-        # Forcer numérique
         for col in ["VE", "VCO2", "eqO2_raw", "HR", "Cadence", "FeCO2", "eqCO2"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # VO2 = VE / eqO2  (eqO2 = VE/VO2 → VO2 = VE/eqO2)
         df["VO2_Lmin"] = df["VE"] / df["eqO2_raw"].replace(0, np.nan)
-        # QR = VCO2 / VO2
         df["RQ"] = df["VCO2"] / df["VO2_Lmin"].replace(0, np.nan)
         df["eqO2"] = df["eqO2_raw"]
-
         df["palier"] = pd.to_numeric(df["palier"], errors="coerce").fillna(0).astype(int)
         return df
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -836,7 +878,6 @@ def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
     Détecte SV1 et SV2 à partir des données agrégées par palier.
 
     SV1 (premier seuil ventilatoire) :
-      Méthode combinée :
       1. Premier palier où le RQ dépasse 0.85 durablement
       2. eqO2 commence à monter alors que eqCO2 est encore stable ou baisse
       → Point le plus précoce des deux critères
@@ -845,8 +886,6 @@ def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
       1. Premier palier où RQ ≥ 1.00
       2. eqCO2 commence à monter (tampon bicarbonate épuisé)
       → Point le plus précoce des deux critères
-
-    Retourne un dict avec les paliers, FC et métriques aux seuils.
     """
     result = {"sv1": None, "sv2": None}
     if df_pal.empty or len(df_pal) < 3:
@@ -865,7 +904,6 @@ def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
             break
 
     # Critère 2 : eqO2 monte alors que eqCO2 est stable/descend
-    # (nadir de eqCO2 pas encore atteint)
     if "eqCO2" in pals.columns:
         for i in range(1, n - 1):
             deqo2  = pals.loc[i, "eqO2"]  - pals.loc[i-1, "eqO2"]
@@ -879,7 +917,7 @@ def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
     # ── SV2 ──────────────────────────────────────────────────
     sv2_idx = None
 
-    # Critère 1 : RQ ≥ 1.00 pour la première fois
+    # Critère 1 : RQ ≥ 1.00
     for i in range(n):
         if pals.loc[i, "RQ"] >= 1.00:
             sv2_idx = i
@@ -887,7 +925,6 @@ def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
 
     # Critère 2 : eqCO2 monte durablement (après son nadir)
     if "eqCO2" in pals.columns and sv2_idx is not None:
-        # Chercher le nadir de eqCO2 AVANT sv2_idx
         nadir_idx = pals.loc[:sv2_idx, "eqCO2"].idxmin()
         for i in range(nadir_idx + 1, n - 1):
             deqco2 = pals.loc[i, "eqCO2"] - pals.loc[i-1, "eqCO2"]
@@ -901,198 +938,106 @@ def detect_sv1_sv2(df_pal: pd.DataFrame) -> dict:
         if idx is not None and 0 <= idx < n:
             row = pals.iloc[idx]
             result[key] = {
-                "palier":    int(row["palier"]),
-                "t_min":     round(float(row["elapsed_min"]), 1),
-                "HR":        round(float(row["HR"])),
-                "VO2":       round(float(row.get("VO2_Lmin", 0)), 3),
-                "VCO2":      round(float(row.get("VCO2", 0)), 3),
-                "RQ":        round(float(row["RQ"]), 3),
-                "eqO2":      round(float(row["eqO2"]), 1),
-                "eqCO2":     round(float(row.get("eqCO2", 0)), 1),
-                "VE":        round(float(row["VE"]), 1),
-                "Cadence":   round(float(row.get("Cadence", 0)), 2),
+                "palier":  int(row["palier"]),
+                "t_min":   round(float(row["elapsed_min"]), 1),
+                "HR":      round(float(row["HR"])),
+                "VO2":     round(float(row.get("VO2_Lmin", 0)), 3),
+                "VCO2":    round(float(row.get("VCO2", 0)), 3),
+                "RQ":      round(float(row["RQ"]), 3),
+                "eqO2":    round(float(row["eqO2"]), 1),
+                "eqCO2":   round(float(row.get("eqCO2", 0)), 1),
+                "VE":      round(float(row["VE"]), 1),
+                "Cadence": round(float(row.get("Cadence", 0)), 2),
             }
 
     return result
-
-
-def compute_vc(distances_m: list, durations_s: list):
-    T = np.array(durations_s, dtype=float)
-    D = np.array(distances_m, dtype=float)
-    if len(T) < 2: return None, None, None
-    slope, intercept, r, p, se = sp_stats.linregress(T, D)
-    return float(slope), float(intercept), float(r**2)
-
-
-def build_holding_table(vc_ms: float, d_prime: float,
-                        refs_fit: list, K_riegel: float) -> pd.DataFrame:
-    """
-    Table des temps de maintien de 80 % à 120 % de VC, par pas de 4 %.
-    - 80 % VC ≤ v < 100 % VC : Riegel log-log calé sur les références
-                                T = [a × (v/1000)^K]^(1/(1−K))
-    - 100 % VC ≤ v ≤ 120 % VC : Modèle D'  →  T = D' / (v − VC)
-    Colonnes : % VC, Vitesse, Allure, Temps de maintien, Durée (min), Modèle.
-    """
-    if vc_ms is None or vc_ms <= 0:
-        return pd.DataFrame()
-
-    # Recalculer a et K depuis les refs
-    X, Y = [], []
-    for r in refs_fit:
-        d_m = float(r.get("distance", 0))
-        t_s = float(r.get("temps", 0))
-        if d_m > 0 and t_s > 0:
-            X.append(math.log(d_m / 1000.0))
-            Y.append(math.log(t_s))
-    if len(X) >= 2:
-        K_fit, loga, _, _, _ = sp_stats.linregress(X, Y)
-        K_fit = float(max(0.85, min(1.25, K_fit)))
-        a_fit = math.exp(float(loga))
-    elif len(X) == 1:
-        K_fit = float(K_riegel)
-        a_fit = math.exp(Y[0]) / math.exp(X[0])
-    else:
-        K_fit = float(K_riegel)
-        a_fit = 240.0
-
-    # Paliers fixes de 80 % à 120 % par pas de 2 %
-    pct_steps = [pct / 100.0 for pct in range(80, 121, 2)]
-
-    rows = []
-    for pct in pct_steps:
-        v = vc_ms * pct
-        if v <= 0:
-            continue
-        pct_label = f"{round(pct * 100):.0f} %"
-        pace = pace_str(1000.0 / v)
-
-        if pct < 1.0:
-            # Riegel
-            if abs(1.0 - K_fit) < 1e-6:
-                continue
-            try:
-                t = (a_fit * (v / 1000.0) ** K_fit) ** (1.0 / (1.0 - K_fit))
-            except Exception:
-                continue
-            modele = "Riegel"
-        else:
-            # Modèle D'
-            delta_v = v - vc_ms
-            if d_prime is None or delta_v < 0.01:
-                continue
-            t = d_prime / delta_v
-            modele = "Modèle D'"
-
-        t = max(0.0, min(t, 360000.0))   # plafond 100 h
-        if t > 0:
-            rows.append({
-                "% VC":               pct_label,
-                "Vitesse (m/s)":      round(v, 2),
-                "Allure (/km)":       pace,
-                "Temps de maintien":  seconds_to_hms(t),
-                "Durée (min)":        round(t / 60.0, 1),
-                "Modèle":             modele,
-            })
-
-    return pd.DataFrame(rows)
 
 
 # ══════════════════════════════════════════════════════════════
 # STANDARDS DE PERFORMANCE & PRÉDICTIONS RIEGEL
 # ══════════════════════════════════════════════════════════════
 
-# Sources : captures FFA officielles "Minima qualification 2026" (images transmises)
-# Catégorie Séniors dans tous les cas
-# 5km : minima A (accès direct finale) retenu comme référence
 PERF_STANDARDS = {
     "5 km": {
         "dist_m": 5000,
         "H": {
-            # Séniors H : minima A = 16'00  |  minima B (demi-finale) = 17'00
-            "Minima Champ. France (A)": "0:16:00",  # FFA Séniors H 2026 — accès finale directe
-            "Minima Champ. France (B)": "0:17:00",  # FFA Séniors H 2026 — accès demi-finale
-            "Minima Champ. Europe":      "0:13:25",  # EAA 2024
-            "Minima Champ. Monde":       "0:13:16",  # WA 2025
-            "Record de France":          "0:13:07",  # Jimmy Gressier (2021)
-            "Record d'Europe":           "0:12:48",  # Mohamed Katir (ESP, 2021)
-            "Record du Monde":           "0:12:35",  # Joshua Cheptegei (2020)
+            "Minima Champ. France (A)": "0:16:00",
+            "Minima Champ. France (B)": "0:17:00",
+            "Minima Champ. Europe":      "0:13:25",
+            "Minima Champ. Monde":       "0:13:16",
+            "Record de France":          "0:13:07",
+            "Record d'Europe":           "0:12:48",
+            "Record du Monde":           "0:12:35",
         },
         "F": {
-            # Séniors F : minima A = 20'15  |  minima B = 21'15
-            "Minima Champ. France (A)": "0:20:15",  # FFA Séniors F 2026 — accès finale directe
-            "Minima Champ. France (B)": "0:21:15",  # FFA Séniors F 2026 — accès demi-finale
-            "Minima Champ. Europe":      "0:15:20",  # EAA 2024
-            "Minima Champ. Monde":       "0:15:10",  # WA 2025
-            "Record de France":          "0:14:53",  # Léa Philippot (2023)
-            "Record d'Europe":           "0:14:19",  # Sifan Hassan (NED, 2019)
-            "Record du Monde":           "0:14:05",  # Ejgayehu Taye (2023)
+            "Minima Champ. France (A)": "0:20:15",
+            "Minima Champ. France (B)": "0:21:15",
+            "Minima Champ. Europe":      "0:15:20",
+            "Minima Champ. Monde":       "0:15:10",
+            "Record de France":          "0:14:53",
+            "Record d'Europe":           "0:14:19",
+            "Record du Monde":           "0:14:05",
         },
     },
     "10 km": {
         "dist_m": 10000,
         "H": {
-            # Séniors H : 34'15
-            "Minima Champ. France":  "0:34:15",  # FFA Séniors H 2026
-            "Minima Champ. Europe":  "0:28:15",  # EAA 2024
-            "Minima Champ. Monde":   "0:27:50",  # WA 2025
-            "Record de France":      "0:27:13",  # Morhad Amdouni (2019)
-            "Record d'Europe":       "0:26:46",  # Mohamed Katir (ESP, 2022)
-            "Record du Monde":       "0:26:11",  # Joshua Cheptegei (2020)
+            "Minima Champ. France":  "0:34:15",
+            "Minima Champ. Europe":  "0:28:15",
+            "Minima Champ. Monde":   "0:27:50",
+            "Record de France":      "0:27:13",
+            "Record d'Europe":       "0:26:46",
+            "Record du Monde":       "0:26:11",
         },
         "F": {
-            # Séniors F : 43'00
-            "Minima Champ. France":  "0:43:00",  # FFA Séniors F 2026
-            "Minima Champ. Europe":  "0:32:00",  # EAA 2024
-            "Minima Champ. Monde":   "0:31:25",  # WA 2025
-            "Record de France":      "0:30:39",  # Clémence Calvin (2018)
-            "Record d'Europe":       "0:29:56",  # Sifan Hassan (NED, 2021)
-            "Record du Monde":       "0:29:01",  # Letesenbet Gidey (2021)
+            "Minima Champ. France":  "0:43:00",
+            "Minima Champ. Europe":  "0:32:00",
+            "Minima Champ. Monde":   "0:31:25",
+            "Record de France":      "0:30:39",
+            "Record d'Europe":       "0:29:56",
+            "Record du Monde":       "0:29:01",
         },
     },
     "Semi-marathon": {
         "dist_m": 21097,
         "H": {
-            # Séniors H : 1h15'30
-            "Minima Champ. France":  "1:15:30",  # FFA Séniors H 2026
-            "Minima Champ. Europe":  "1:02:30",  # EAA 2024
-            "Minima Champ. Monde":   "1:01:30",  # WA 2025
-            "Record de France":      "1:00:01",  # Jimmy Gressier (2022)
-            "Record d'Europe":       "0:59:26",  # Julien Wanders (SUI, 2019)
-            "Record du Monde":       "0:57:31",  # Jacob Kiplimo (2021)
+            "Minima Champ. France":  "1:15:30",
+            "Minima Champ. Europe":  "1:02:30",
+            "Minima Champ. Monde":   "1:01:30",
+            "Record de France":      "1:00:01",
+            "Record d'Europe":       "0:59:26",
+            "Record du Monde":       "0:57:31",
         },
         "F": {
-            # Séniors F : 1h45'
-            "Minima Champ. France":  "1:45:00",  # FFA Séniors F 2026
-            "Minima Champ. Europe":  "1:10:30",  # EAA 2024
-            "Minima Champ. Monde":   "1:09:00",  # WA 2025
-            "Record de France":      "1:07:34",  # Clémence Calvin (2019)
-            "Record d'Europe":       "1:05:46",  # Sifan Hassan (NED, 2020)
-            "Record du Monde":       "1:02:52",  # Letesenbet Gidey (2021)
+            "Minima Champ. France":  "1:45:00",
+            "Minima Champ. Europe":  "1:10:30",
+            "Minima Champ. Monde":   "1:09:00",
+            "Record de France":      "1:07:34",
+            "Record d'Europe":       "1:05:46",
+            "Record du Monde":       "1:02:52",
         },
     },
     "Marathon": {
         "dist_m": 42195,
         "H": {
-            # U23-SE-M0 H : 2h48'
-            "Minima Champ. France":  "2:48:00",  # FFA U23-SE-M0 H 2026
-            "Minima Champ. Europe":  "2:14:30",  # EAA 2024
-            "Minima Champ. Monde":   "2:11:30",  # WA 2025
-            "Record de France":      "2:06:51",  # Morhad Amdouni (2020)
-            "Record d'Europe":       "2:04:11",  # Koen Naert (BEL, 2022)
-            "Record du Monde":       "2:00:35",  # Kelvin Kiptum (2023)
+            "Minima Champ. France":  "2:48:00",
+            "Minima Champ. Europe":  "2:14:30",
+            "Minima Champ. Monde":   "2:11:30",
+            "Record de France":      "2:06:51",
+            "Record d'Europe":       "2:04:11",
+            "Record du Monde":       "2:00:35",
         },
         "F": {
-            # U23-SE-M0 F : 3h38'
-            "Minima Champ. France":  "3:38:00",  # FFA U23-SE-M0 F 2026
-            "Minima Champ. Europe":  "2:31:00",  # EAA 2024
-            "Minima Champ. Monde":   "2:27:00",  # WA 2025
-            "Record de France":      "2:21:49",  # Clémence Calvin (2019)
-            "Record d'Europe":       "2:17:01",  # Yalemzerf Yehualaw (NED, 2022)
-            "Record du Monde":       "2:11:53",  # Tigist Assefa (2023)
+            "Minima Champ. France":  "3:38:00",
+            "Minima Champ. Europe":  "2:31:00",
+            "Minima Champ. Monde":   "2:27:00",
+            "Record de France":      "2:21:49",
+            "Record d'Europe":       "2:17:01",
+            "Record du Monde":       "2:11:53",
         },
     },
 }
-# Ordre d'affichage du plus accessible au plus exigeant
+
 STANDARDS_ORDER = [
     "Minima Champ. France",
     "Minima Champ. France (A)",
@@ -1104,7 +1049,6 @@ STANDARDS_ORDER = [
     "Record du Monde",
 ]
 
-# Emojis associés
 STANDARDS_EMOJI = {
     "Minima Champ. France":      "🇫🇷",
     "Minima Champ. France (A)":  "🇫🇷⭐",
@@ -1118,21 +1062,11 @@ STANDARDS_EMOJI = {
 
 
 def riegel_predict(dist_m: float, a: float, K: float) -> float:
-    """Prédit le temps en secondes pour une distance donnée avec les paramètres Riegel."""
-    if dist_m <= 0 or a <= 0:
-        return 0.0
+    if dist_m <= 0 or a <= 0: return 0.0
     return float(a) * (float(dist_m) / 1000.0) ** float(K)
 
 
-def predict_performances(vc_ms: float, d_prime: float,
-                          refs_fit: list, K_riegel: float,
-                          genre: str = "H") -> dict:
-    """
-    Pour chaque distance standard, prédit le temps via Riegel
-    et calcule l'écart à chaque standard/record.
-    Retourne un dict {distance_label: {prévu, standards_list}}.
-    """
-    # Recalibrer a et K
+def predict_performances(vc_ms, d_prime, refs_fit, K_riegel, genre="H"):
     X, Y = [], []
     for r in refs_fit:
         d_m = float(r.get("distance", 0))
@@ -1150,51 +1084,31 @@ def predict_performances(vc_ms: float, d_prime: float,
     else:
         K_fit = float(K_riegel)
         a_fit = 240.0
-
     results = {}
     for dist_label, info in PERF_STANDARDS.items():
         dist_m   = info["dist_m"]
         stds     = info.get(genre, {})
         t_pred_s = riegel_predict(dist_m, a_fit, K_fit)
-        if t_pred_s <= 0:
-            continue
+        if t_pred_s <= 0: continue
         pace_pred = pace_str(t_pred_s / (dist_m / 1000.0))
-
         std_rows = []
         for std_name in STANDARDS_ORDER:
-            if std_name not in stds:
-                continue
+            if std_name not in stds: continue
             t_std_s = hms_to_seconds(stds[std_name])
-            if t_std_s <= 0:
-                continue
-            diff_s   = t_pred_s - t_std_s   # positif = plus lent que le standard
-            emoji    = STANDARDS_EMOJI.get(std_name, "")
-            std_rows.append({
-                "standard":  std_name,
-                "emoji":     emoji,
-                "temps_std": seconds_to_hms(t_std_s),
-                "diff_s":    diff_s,
-                "diff_str":  (f"+{seconds_to_hms(int(diff_s))}" if diff_s > 0
-                              else f"-{seconds_to_hms(int(-diff_s))}"),
-                "atteint":   diff_s <= 0,
-            })
-
-        # Standard le plus proche (en valeur absolue)
-        if std_rows:
-            closest = min(std_rows, key=lambda r: abs(r["diff_s"]))
-        else:
-            closest = None
-
-        results[dist_label] = {
-            "dist_m":     dist_m,
-            "t_pred_s":   t_pred_s,
-            "t_pred_hms": seconds_to_hms(t_pred_s),
-            "pace_pred":  pace_pred,
-            "standards":  std_rows,
-            "closest":    closest,
-        }
-
-    # Distance où l'athlète est proportionnellement le plus proche d'un standard
+            if t_std_s <= 0: continue
+            diff_s = t_pred_s - t_std_s
+            emoji  = STANDARDS_EMOJI.get(std_name, "")
+            std_rows.append({"standard": std_name, "emoji": emoji,
+                             "temps_std": seconds_to_hms(t_std_s),
+                             "diff_s": diff_s,
+                             "diff_str": (f"+{seconds_to_hms(int(diff_s))}" if diff_s > 0
+                                          else f"-{seconds_to_hms(int(-diff_s))}"),
+                             "atteint": diff_s <= 0})
+        closest = min(std_rows, key=lambda r: abs(r["diff_s"])) if std_rows else None
+        results[dist_label] = {"dist_m": dist_m, "t_pred_s": t_pred_s,
+                                "t_pred_hms": seconds_to_hms(t_pred_s),
+                                "pace_pred": pace_pred, "standards": std_rows,
+                                "closest": closest}
     best_dist = None
     best_ratio = float("inf")
     for dist_label, info in results.items():
@@ -1203,12 +1117,11 @@ def predict_performances(vc_ms: float, d_prime: float,
             if ratio < best_ratio:
                 best_ratio = ratio
                 best_dist  = dist_label
-
     return results, best_dist
 
 
 # ══════════════════════════════════════════════════════════════
-# MODÈLE RIEGEL + LOO-CV + RECALIBRATION (v3)
+# MODÈLE RIEGEL + LOO-CV + RECALIBRATION
 # ══════════════════════════════════════════════════════════════
 
 def fit_loglog(refs):
@@ -1304,7 +1217,7 @@ def prepare_refs(refs_input,use_recalibrated,opt_temp,use_wbgt,cold_quad,hot_qua
 
 
 # ══════════════════════════════════════════════════════════════
-# PACING ULTRA + PRÉDICTION PRINCIPALE (v3)
+# PACING ULTRA + PRÉDICTION PRINCIPALE (v5 — avec surface_mult)
 # ══════════════════════════════════════════════════════════════
 
 def apply_ultra_pacing(t_raw,d_end_m,seg_len_m,total_corr_m,amp_pct):
@@ -1320,21 +1233,23 @@ def apply_ultra_pacing(t_raw,d_end_m,seg_len_m,total_corr_m,amp_pct):
 
 
 def run_prediction(
-    distance_cible_km,refs_input,points,date_course,heure_course,
-    use_recalibrated,opt_temp,use_wbgt,cold_quad,hot_quad,temp_max_penalty,temp_power,
-    elev_ref_power,temp_ref_power,
-    apply_grade,use_minetti,minetti_weight,
-    k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down,
-    elev_smooth_window,grade_power,
-    apply_altitude,altitude_ref_m,
-    apply_wind,wind_mode,wind_smooth_km,
-    drag_coeff,tail_credit,wind_cap_head,wind_cap_tail,wind_power,
-    wind_gate_g1,wind_gate_g2,wind_gate_min,
-    base_cap,extra_per_pct,max_cap,
-    apply_fatigue,fatigue_rate,fatigue_mode,
-    apply_ultra,ultra_amp,
-    objective_hms,show_smooth_pace,smooth_window_km,
-    dem_elevations,tz_name=TZ_NAME_DEFAULT):
+    distance_cible_km, refs_input, points, date_course, heure_course,
+    use_recalibrated, opt_temp, use_wbgt, cold_quad, hot_quad, temp_max_penalty, temp_power,
+    elev_ref_power, temp_ref_power,
+    apply_grade, use_minetti, minetti_weight,
+    k_up, k_down, down_cap, g0_up, g0_down, max_up, max_down,
+    elev_smooth_window, grade_power,
+    apply_altitude, altitude_ref_m,
+    apply_wind, wind_mode, wind_smooth_km,
+    drag_coeff, tail_credit, wind_cap_head, wind_cap_tail, wind_power,
+    wind_gate_g1, wind_gate_g2, wind_gate_min,
+    base_cap, extra_per_pct, max_cap,
+    apply_fatigue, fatigue_rate, fatigue_mode,
+    apply_ultra, ultra_amp,
+    objective_hms, show_smooth_pace, smooth_window_km,
+    dem_elevations,
+    surface_mult=1.0,           # ← NOUVEAU paramètre v5
+    tz_name=TZ_NAME_DEFAULT):
 
     if not points or len(points)<2: raise ValueError("GPX invalide ou trop court.")
     if dem_elevations is not None and len(dem_elevations)==len(points):
@@ -1373,8 +1288,13 @@ def run_prediction(
     if objective_hms:
         obj_s = hms_to_seconds(objective_hms); d_km = distance_cible_km
         a = obj_s/(d_km**K) if d_km>0 else a
+
     base_total_s  = predict_flat(int(distance_cible_km*1000),a,K)
     base_s_per_km = base_total_s/max(distance_cible_km,1e-9)
+
+    # ── PATCH v5 : appliquer le multiplicateur de surface ──
+    base_s_per_km = base_s_per_km * float(surface_mult)
+
     alt_mult = altitude_vo2_multiplier(avg_alt,altitude_ref_m) if apply_altitude else 1.0
 
     km_marks = [i*1000 for i in range(1,int(total_corr//1000)+1)]
@@ -1504,20 +1424,16 @@ def run_prediction(
 # ══════════════════════════════════════════════════════════════
 
 def extract_interval_df(df: pd.DataFrame, start_hms: str, end_hms: str) -> pd.DataFrame:
-    """Extrait un sous-DataFrame entre start_hms et end_hms (relatif au début de l'activité)."""
     t_start = float(hms_to_seconds(start_hms))
     t_end   = float(hms_to_seconds(end_hms))
-    if t_end <= t_start:
-        return pd.DataFrame()
+    if t_end <= t_start: return pd.DataFrame()
     sub = df[(df["elapsed_s"] >= t_start) & (df["elapsed_s"] <= t_end)].copy()
     sub["elapsed_s"] = sub["elapsed_s"] - t_start
     return sub.reset_index(drop=True)
 
 
 def analyze_interval(df_int: pd.DataFrame, name: str) -> dict:
-    """Calcule les stats clés d'un intervalle."""
-    if df_int.empty:
-        return {"name": name, "valid": False}
+    if df_int.empty: return {"name": name, "valid": False}
     dur_s = float(df_int["elapsed_s"].max())
     dist_m = None
     if "distance_m" in df_int.columns and df_int["distance_m"].notna().any():
@@ -1527,18 +1443,43 @@ def analyze_interval(df_int: pd.DataFrame, name: str) -> dict:
     hr_stats  = analyze_heart_rate(df_int)
     spd_stats = analyze_speed_kinetics(df_int)
     avg_speed = None
-    if dist_m and dur_s > 0:
-        avg_speed = dist_m / dur_s
-    return {
-        "name": name,
-        "valid": True,
-        "dur_s": dur_s,
-        "dist_m": dist_m,
-        "avg_speed": avg_speed,
-        "hr": hr_stats,
-        "spd": spd_stats,
-        "df": df_int,
-    }
+    if dist_m and dur_s > 0: avg_speed = dist_m / dur_s
+    return {"name": name, "valid": True, "dur_s": dur_s, "dist_m": dist_m,
+            "avg_speed": avg_speed, "hr": hr_stats, "spd": spd_stats, "df": df_int}
+
+
+# ══════════════════════════════════════════════════════════════
+# CONSTANTES PROFILS TERRAIN (v5)
+# ══════════════════════════════════════════════════════════════
+
+TERRAIN_PROFILES = {
+    "🛣️ Route / Plat": {
+        "k_up": 12.0, "k_down": 5.0, "down_cap": -0.08,
+        "minetti_weight": 0.60, "elev_smooth_window": 11,
+        "grade_power": 0.85, "base_cap": 0.08,
+        "extra_per_pct": 0.000, "max_cap": 0.18,
+    },
+    "🏔️ Trail modéré": {
+        "k_up": 18.0, "k_down": 5.0, "down_cap": -0.12,
+        "minetti_weight": 0.40, "elev_smooth_window": 7,
+        "grade_power": 0.75, "base_cap": 0.15,
+        "extra_per_pct": 0.008, "max_cap": 0.35,
+    },
+    "⛰️ Ultra-trail montagneux": {
+        "k_up": 28.0, "k_down": 4.0, "down_cap": -0.15,
+        "minetti_weight": 0.20, "elev_smooth_window": 5,
+        "grade_power": 0.65, "base_cap": 0.25,
+        "extra_per_pct": 0.018, "max_cap": 0.60,
+    },
+}
+
+SURFACE_OPTIONS = {
+    "🏟️ Route / Piste synthétique":  1.00,
+    "🪨 Chemin stabilisé / Gravier": 1.03,
+    "🌿 Sentier herbe / Terre sèche": 1.06,
+    "🧗 Sentier rocheux / Technique":  1.12,
+    "🌧️ Boue / Neige tassée":         1.18,
+}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1548,10 +1489,9 @@ def analyze_interval(df_int: pd.DataFrame, name: str) -> dict:
 with st.sidebar:
     st.markdown('<div class="sidebar-label">⚙️ Paramètres — onglets Tests & Entraînement</div>',
                 unsafe_allow_html=True)
-    sb_opt_temp = st.slider("Température optimale (°C)", 5.0, 20.0, 12.0, 0.5,
-                             key="sb_opt_temp")
-    sb_k_up   = st.number_input("Coefficient montée (k_up)",   value=12.0, step=0.5, key="sb_k_up")
-    sb_k_down = st.number_input("Coefficient descente (k_down)",value=5.0,  step=0.5, key="sb_k_down")
+    sb_opt_temp = st.slider("Température optimale (°C)", 5.0, 20.0, 12.0, 0.5, key="sb_opt_temp")
+    sb_k_up   = st.number_input("Coefficient montée (k_up)",    value=12.0, step=0.5, key="sb_k_up")
+    sb_k_down = st.number_input("Coefficient descente (k_down)", value=5.0,  step=0.5, key="sb_k_down")
     sb_k_temp_hot  = st.number_input("Sensibilité chaleur",  value=0.0016, step=0.0002, format="%.4f", key="sb_kth")
     sb_k_temp_cold = st.number_input("Sensibilité froid",    value=0.0012, step=0.0002, format="%.4f", key="sb_ktc")
     st.caption("Ces paramètres n'affectent que les onglets 🧪 et ⚙️")
@@ -1560,11 +1500,11 @@ main_tabs = st.tabs(["🏃 Prédiction de course", "🧪 Tests d'endurance + VC"
 
 
 # ══════════════════════════════════════════════════════════════
-# ONGLET 0 — PRÉDICTION DE COURSE (v3)
+# ONGLET 0 — PRÉDICTION DE COURSE (v5)
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v4 — WBGT · Minetti · DEM · Recalibration · Saisie hh:mm:ss")
+    st.caption("v5 — Profils terrain · Surface · WBGT · Minetti · DEM · Recalibration")
 
     col_mode1, col_mode2 = st.columns([2,3])
     with col_mode1:
@@ -1611,7 +1551,7 @@ with main_tabs[0]:
 
     st.markdown("---")
     st.header("2️⃣  Courses de référence")
-    st.info("Calibrent le modèle sur l'athlète. Minimum conseillé : **3 références** variées (5 km, semi, marathon…).")
+    st.info("Calibrent le modèle sur l'athlète. Minimum conseillé : **3 références** variées.")
 
     if "n_refs" not in st.session_state: st.session_state.n_refs = 3
     cc1,cc2 = st.columns(2)
@@ -1628,7 +1568,6 @@ with main_tabs[0]:
             use_file = st.checkbox(f"Importer depuis fichier FIT/TCX", key=f"use_file_{i}")
             c1,c2,c3,c4 = st.columns(4)
             dist  = c1.number_input("Distance (m)", value=float(st.session_state.get(f"dist_{i}",5000*i)), key=f"dist_{i}")
-            # ── Temps au format hh:mm:ss ──
             temps = hms_input("Temps (hh:mm:ss)", default="0:40:00", key=f"temps_{i}")
             dup   = c3.number_input("D+ (m)", value=float(st.session_state.get(f"dup_{i}",0.0)), key=f"dup_{i}")
             ddn   = c4.number_input("D- (m)", value=float(st.session_state.get(f"ddn_{i}",0.0)), key=f"ddn_{i}")
@@ -1652,7 +1591,6 @@ with main_tabs[0]:
                         dist,dup,ddn=tcx_data["distance"],tcx_data["D_up"],tcx_data["D_down"]
                         dur_hms_file=tcx_data["duration_hms"]
                         avg_temp_ref,avg_wind_ref,avg_hum_ref=tcx_data["avg_temp"],tcx_data["avg_wind"],tcx_data["avg_humidity"]
-                # ── Segment hh:mm:ss ──
                 cs,ce=st.columns(2)
                 sh = hms_input("Début segment", "0:00:00", key=f"start_{i}", compact=True)
                 eh = hms_input("Fin segment",   "23:59:59", key=f"end_{i}",   compact=True)
@@ -1705,7 +1643,7 @@ with main_tabs[0]:
 <div class="highlight-box">
 <strong>Pourquoi recalibrer ?</strong><br>
 Une course réalisée par 30°C et 80% d'humidité vaut <em>physiologiquement mieux</em>
-qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-estime la performance.
+qu'un temps identique par 12°C et temps sec.
 </div>""", unsafe_allow_html=True)
 
     use_recalibrated = st.checkbox(
@@ -1767,21 +1705,161 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
         if apply_altitude:
             altitude_ref_m=st.number_input("Altitude d'entraînement habituelle (m)",value=0.0,step=100.0)
 
-    with st.expander("🎢 Modèle de pente"):
-        apply_grade=st.checkbox("Prendre en compte la pente",value=True)
-        use_minetti=st.checkbox("Modèle Minetti",value=True)
-        minetti_weight=0.6; elev_smooth_window=11; grade_power=0.85
-        k_up=12.0; k_down=5.0; down_cap=-0.08; g0_up=3.0; g0_down=2.5; max_up=0.30; max_down=-0.06
+    # ══════════════════════════════════════════════════════════
+    # BLOC PENTE v5 — avec profil terrain + surface
+    # ══════════════════════════════════════════════════════════
+    with st.expander("🎢 Modèle de pente & Terrain", expanded=True):
+        apply_grade = st.checkbox("Prendre en compte la pente", value=True)
+        use_minetti = st.checkbox("Modèle Minetti", value=True)
+
+        st.markdown("##### 🗺️ Profil du parcours")
+
+        terrain_profil = st.radio(
+            "Type de terrain",
+            list(TERRAIN_PROFILES.keys()),
+            horizontal=True,
+            key="terrain_profil_radio",
+            help="Pré-remplit les coefficients ci-dessous. Modifiables manuellement."
+        )
+
+        # Détection du changement de profil → reset des valeurs dans session_state
+        _prev = st.session_state.get("_prev_terrain_profil", "")
+        if terrain_profil != _prev:
+            st.session_state["_prev_terrain_profil"] = terrain_profil
+            _d = TERRAIN_PROFILES[terrain_profil]
+            for k, v in _d.items():
+                st.session_state[f"tp_{k}"] = v
+
+        _d = TERRAIN_PROFILES[terrain_profil]
+
+        # Aide contextuelle par profil
+        _profil_info = {
+            "🛣️ Route / Plat":           "Route, piste, parcours plat. Modèle Minetti bien calibré. k_up=12.",
+            "🏔️ Trail modéré":           "D+ moyen < 100m/km. Sentiers, collines. k_up=18. DEM recommandé.",
+            "⛰️ Ultra-trail montagneux": "D+ moyen > 100m/km. Montées techniques. k_up=28. DEM obligatoire.",
+        }
+        st.info(_profil_info.get(terrain_profil, ""))
+
+        # ── Surface du terrain ──────────────────────────────────────────────
+        st.markdown("##### 🌿 Surface du terrain")
+        surface_sel = st.selectbox(
+            "Type de surface",
+            list(SURFACE_OPTIONS.keys()),
+            key="surface_sel",
+            help="Coût énergétique additionnel selon la surface. Route = ×1.00 (référence)."
+        )
+        surface_mult = SURFACE_OPTIONS[surface_sel]
+        st.caption(f"Multiplicateur surface : **×{surface_mult:.2f}** — pénalité **+{(surface_mult-1)*100:.0f}%** sur l'allure de base")
+
+        # ── Minetti ─────────────────────────────────────────────────────────
+        minetti_weight = 0.6
         if use_minetti:
-            minetti_weight=st.slider("Part de Minetti",0.0,1.0,0.6,0.1)
-        if EXPERT:
-            elev_smooth_window=st.slider("Lissage altitude (fenêtre pts GPS)",1,51,11,2)
-            grade_power=st.slider("Amortissement effet pente",0.2,1.0,0.85,0.05)
-            c1,c2,c3=st.columns(3)
-            k_up  =c1.number_input("k_up",  value=12.0,step=0.5)
-            k_down=c2.number_input("k_down",value=5.0,step=0.5)
-            down_cap=c3.number_input("Cap descente",value=-0.08,step=0.01,format="%.2f")
-            st.session_state["k_up_val"]=k_up; st.session_state["k_down_val"]=k_down
+            minetti_weight = st.slider(
+                "Part de Minetti (0 = heuristique pur, 1 = Minetti pur)",
+                0.0, 1.0,
+                float(st.session_state.get("tp_minetti_weight", _d["minetti_weight"])),
+                0.05, key="tp_minetti_weight"
+            )
+
+        # ── Tous les paramètres — toujours visibles et modifiables ──────────
+        st.markdown("##### ⚙️ Coefficients détaillés")
+
+        col_r1a, col_r1b, col_r1c = st.columns(3)
+        with col_r1a:
+            k_up = st.number_input(
+                "k_up — coefficient montée",
+                min_value=1.0, max_value=60.0,
+                value=float(st.session_state.get("tp_k_up", _d["k_up"])),
+                step=0.5, key="tp_k_up",
+                help="Route ≈ 12 · Trail modéré ≈ 18 · Ultra ≈ 28"
+            )
+        with col_r1b:
+            k_down = st.number_input(
+                "k_down — coefficient descente",
+                min_value=0.5, max_value=20.0,
+                value=float(st.session_state.get("tp_k_down", _d["k_down"])),
+                step=0.5, key="tp_k_down",
+                help="Réduire sur sentier technique descendant"
+            )
+        with col_r1c:
+            down_cap = st.number_input(
+                "Cap descente (max gain)",
+                min_value=-0.30, max_value=0.0,
+                value=float(st.session_state.get("tp_down_cap", _d["down_cap"])),
+                step=0.01, format="%.2f", key="tp_down_cap",
+                help="Gain max en descente (valeur négative)"
+            )
+
+        col_r2a, col_r2b = st.columns(2)
+        with col_r2a:
+            elev_smooth_window = st.slider(
+                "Lissage altitude (fenêtre pts GPS)",
+                1, 51,
+                int(st.session_state.get("tp_elev_smooth_window", _d["elev_smooth_window"])),
+                2, key="tp_elev_smooth_window",
+                help="Réduire pour un trail technique (pentes plus précises km par km)"
+            )
+        with col_r2b:
+            grade_power = st.slider(
+                "Amortissement effet pente",
+                0.2, 1.0,
+                float(st.session_state.get("tp_grade_power", _d["grade_power"])),
+                0.05, key="tp_grade_power",
+                help="Réduire = la pente pèse davantage dans le calcul"
+            )
+
+        st.markdown("**Plafond anti-accumulation**")
+        col_r3a, col_r3b, col_r3c = st.columns(3)
+        with col_r3a:
+            base_cap = st.slider(
+                "Plafond de base (%)",
+                0.02, 0.40,
+                float(st.session_state.get("tp_base_cap", _d["base_cap"])),
+                0.01, key="tp_base_cap",
+                help="Multiplicateur max sur km plat/modéré"
+            )
+        with col_r3b:
+            extra_per_pct = st.slider(
+                "Extra par % de pente",
+                0.000, 0.030,
+                float(st.session_state.get("tp_extra_per_pct", _d["extra_per_pct"])),
+                0.001, format="%.3f", key="tp_extra_per_pct",
+                help="Élargit le plafond sur les km raides"
+            )
+        with col_r3c:
+            max_cap = st.slider(
+                "Plafond absolu (%)",
+                0.05, 0.80,
+                float(st.session_state.get("tp_max_cap", _d["max_cap"])),
+                0.01, key="tp_max_cap",
+                help="Multiplicateur max autorisé quelle que soit la pente"
+            )
+
+        # Paramètres internes (gardés pour compatibilité)
+        g0_up = 3.0; g0_down = 2.5; max_up = float(max_cap); max_down = -0.06
+
+        # Sauvegarder pour la recalibration
+        st.session_state["k_up_val"]    = k_up
+        st.session_state["k_down_val"]  = k_down
+        st.session_state["g0_up_val"]   = g0_up
+        st.session_state["g0_down_val"] = g0_down
+
+        # Récapitulatif compact
+        _terrain_colors = {
+            "🛣️ Route / Plat":           "#0C447C",
+            "🏔️ Trail modéré":           "#3B6D11",
+            "⛰️ Ultra-trail montagneux": "#993C1D",
+        }
+        _col = _terrain_colors.get(terrain_profil, "#444")
+        st.markdown(
+            f'<div style="background:rgba(0,0,0,0.04);border-left:3px solid {_col};'
+            f'border-radius:4px;padding:6px 12px;font-size:0.82rem;margin-top:6px;">'
+            f'<b>{terrain_profil}</b> · k_up={k_up:.0f} · k_down={k_down:.0f} · '
+            f'Minetti={minetti_weight:.2f} · Plafond={max_cap:.0%} · '
+            f'Surface <b>{surface_sel.split()[0]} ×{surface_mult:.2f}</b>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
     with st.expander("💨 Vent"):
         apply_wind=st.checkbox("Appliquer l'effet du vent",value=True)
@@ -1796,14 +1874,6 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
             tail_credit=c2.slider("Crédit vent arrière",0.0,0.8,0.35,0.05)
             wind_cap_head=st.slider("Pénalité max vent face (%)",0.00,0.20,0.10,0.01)
             wind_cap_tail=st.slider("Gain max vent dos (%)",-0.10,0.00,-0.04,0.01)
-
-    base_cap=0.08; extra_per_pct=0.004; max_cap=0.18
-    if EXPERT:
-        with st.expander("🧱 Plafond anti-accumulation"):
-            c1,c2,c3=st.columns(3)
-            base_cap=c1.slider("Plafond de base (%)",0.02,0.20,0.08,0.01)
-            extra_per_pct=c2.slider("Extra par % pente",0.000,0.020,0.004,0.001)
-            max_cap=c3.slider("Plafond absolu (%)",0.05,0.40,0.18,0.01)
 
     with st.expander("🔋 Fatigue en course"):
         apply_fatigue=st.checkbox("Activer la fatigue",value=False)
@@ -1834,7 +1904,6 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
         dist_forcee=st.number_input("Distance (km)",value=42.195,format="%.3f") if force_dist else None
     with colf2:
         force_temps=st.checkbox("Travailler à partir d'un objectif de temps",value=False)
-        # ── Objectif au format hh:mm:ss ──
         temps_objectif = hms_input("Temps objectif", "3:30:00", key="temps_objectif_target") if force_temps else None
     st.markdown("---")
 
@@ -1885,9 +1954,9 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
                         apply_ultra=apply_ultra,ultra_amp=ultra_amp,
                         objective_hms=temps_objectif if force_temps else None,
                         show_smooth_pace=show_smooth_pace,smooth_window_km=smooth_window_km,
-                        dem_elevations=dem_elevations)
+                        dem_elevations=dem_elevations,
+                        surface_mult=surface_mult)          # ← NOUVEAU v5
                     st.session_state["res"] = res
-                    # Partager les refs calibrées et K avec l'onglet VC
                     st.session_state["refs_fit_vc"]  = res.get("refs_fit", [])
                     st.session_state["K_riegel_vc"]  = res.get("K", 1.06)
                 except Exception as e:
@@ -1938,7 +2007,6 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
                 st.dataframe(df_out,use_container_width=True)
 
     if gpx_file and points:
-        # ── Calcul de la distance cumulée (partagé pour carte + profil) ──
         cum_d_map = [0.0]
         for i in range(1, len(points)):
             cum_d_map.append(cum_d_map[-1] + haversine_m(
@@ -1948,7 +2016,6 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
         lats_m = [p.latitude  for p in points]
         lons_m = [p.longitude for p in points]
 
-        # ── Section Checkpoints / Ravitaillements ──
         st.markdown("---")
         st.subheader("📍 Checkpoints & Ravitaillements")
         st.caption(f"Distance totale du parcours : **{total_dist_km:.2f} km**")
@@ -1961,44 +2028,33 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
             cp_dist = st.number_input(
                 "Distance du checkpoint (km)", min_value=0.1,
                 max_value=float(total_dist_km), value=min(5.0, float(total_dist_km)),
-                step=0.1, key="cp_dist_input",
-                help="Distance depuis le départ en km"
-            )
+                step=0.1, key="cp_dist_input")
         with col_cp2:
             cp_type = st.selectbox(
                 "Type", ["🥤 Ravitaillement", "⏱ Point de passage", "🏔 Sommet",
                          "🔻 Col", "🏁 Intermédiaire", "⚠️ Point clé"],
-                key="cp_type_input"
-            )
+                key="cp_type_input")
         with col_cp3:
-            cp_nom = st.text_input("Nom (optionnel)", value="", key="cp_nom_input",
-                                   placeholder="ex: Ravito km7")
+            cp_nom = st.text_input("Nom (optionnel)", value="", key="cp_nom_input", placeholder="ex: Ravito km7")
 
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
             if st.button("➕ Ajouter ce checkpoint"):
-                # Trouver lat/lon interpolé à cette distance
                 cp_dist_m = cp_dist * 1000.0
                 cp_lat = float(np.interp(cp_dist_m, cum_d_map, lats_m))
                 cp_lon = float(np.interp(cp_dist_m, cum_d_map, lons_m))
-                # Trouver l'altitude interpolée
                 y_gps_cp = [getattr(p, "elevation", 0.0) or 0.0 for p in points]
                 cp_alt = float(np.interp(cp_dist_m, cum_d_map, y_gps_cp))
                 label = cp_nom.strip() if cp_nom.strip() else f"{cp_type} km {cp_dist:.1f}"
                 st.session_state["checkpoints"].append({
-                    "dist_km": cp_dist,
-                    "type": cp_type,
-                    "label": label,
-                    "lat": cp_lat,
-                    "lon": cp_lon,
-                    "alt": round(cp_alt),
+                    "dist_km": cp_dist, "type": cp_type, "label": label,
+                    "lat": cp_lat, "lon": cp_lon, "alt": round(cp_alt),
                 })
                 st.success(f"✅ Checkpoint ajouté : {label}")
         with col_btn2:
             if st.button("🗑️ Effacer tous les checkpoints"):
                 st.session_state["checkpoints"] = []
 
-        # Afficher les checkpoints existants
         checkpoints = st.session_state["checkpoints"]
         if checkpoints:
             df_cp = pd.DataFrame([{
@@ -2009,110 +2065,60 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
             } for c in sorted(checkpoints, key=lambda x: x["dist_km"])])
             st.dataframe(df_cp, use_container_width=True, hide_index=True)
 
-        # ── Carte 3D Mapbox ──
         st.markdown("---")
         with st.expander("🗺️ Carte 3D satellite & Profil d'altitude", expanded=False):
             map_style_opt = st.radio(
                 "Style de carte",
                 ["🛰 Satellite ESRI (gratuit)", "🗺️ OpenStreetMap", "🌄 Topo CartoDB"],
-                horizontal=True, key="map_style_opt"
-            )
+                horizontal=True, key="map_style_opt")
             st.caption("✅ Toutes ces cartes sont **100% gratuites**, sans inscription ni carte bancaire.")
 
-            # Sous-échantillonnage pour perf
             n_pts = len(points)
             step = max(1, n_pts // 800)
             coords_line = [[lats_m[i], lons_m[i]] for i in range(0, n_pts, step)]
 
-            # Construire la carte Folium en HTML
             import json as _json
             center_lat = float(np.mean(lats_m))
             center_lon = float(np.mean(lons_m))
 
-            # Choix des tuiles
             if "Satellite" in map_style_opt:
                 tiles_url  = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-                tiles_attr = "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
-                tiles_name = "ESRI Satellite"
+                tiles_attr = "Tiles &copy; Esri"
             elif "Topo" in map_style_opt:
                 tiles_url  = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
                 tiles_attr = "CartoDB"
-                tiles_name = "CartoDB Voyager"
             else:
                 tiles_url  = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 tiles_attr = "OpenStreetMap"
-                tiles_name = "OpenStreetMap"
 
             y_elev = [getattr(p, "elevation", 0.0) or 0.0 for p in points]
-
-            # Couleurs gradient tracé (rouge→orange selon progression)
             segments_html = []
             seg_step = max(1, len(coords_line) // 60)
             for si in range(0, len(coords_line) - 1, seg_step):
                 seg = coords_line[si:si + seg_step + 1]
                 if len(seg) < 2: continue
                 prog = si / max(1, len(coords_line))
-                r = int(255 - prog * 40)
-                g = int(60  + prog * 120)
-                color = f"rgb({r},{g},40)"
+                r_c = int(255 - prog * 40)
+                g_c = int(60  + prog * 120)
+                color = f"rgb({r_c},{g_c},40)"
                 seg_json = _json.dumps(seg)
-                segments_html.append(f"""
-                    L.polyline({seg_json}, {{color: '{color}', weight: 5, opacity: 0.9}}).addTo(map);
-                """)
+                segments_html.append(f"L.polyline({seg_json}, {{color: '{color}', weight: 5, opacity: 0.9}}).addTo(map);")
 
-            # Checkpoints markers
             cp_colors_js = {
-                "🥤 Ravitaillement": "#00c864",
-                "⏱ Point de passage": "#6496ff",
-                "🏔 Sommet":          "#ffc800",
-                "🔻 Col":             "#c864ff",
-                "🏁 Intermédiaire":   "#aaaaaa",
-                "⚠️ Point clé":       "#ff5050",
+                "🥤 Ravitaillement": "#00c864", "⏱ Point de passage": "#6496ff",
+                "🏔 Sommet": "#ffc800", "🔻 Col": "#c864ff",
+                "🏁 Intermédiaire": "#aaaaaa", "⚠️ Point clé": "#ff5050",
             }
             cp_markers_html = []
             for cp in checkpoints:
-                col = cp_colors_js.get(cp["type"], "#ffcc00")
+                col_cp_js = cp_colors_js.get(cp["type"], "#ffcc00")
                 popup = f"{cp['label']} — {cp['dist_km']:.1f} km — {cp['alt']} m"
-                cp_markers_html.append(f"""
-                    L.circleMarker([{cp['lat']}, {cp['lon']}], {{
-                        radius: 10, color: '{col}', fillColor: '{col}',
-                        fillOpacity: 0.9, weight: 2
-                    }}).bindPopup('<b>{popup}</b>').addTo(map);
-                    L.marker([{cp['lat']}, {cp['lon']}], {{
-                        icon: L.divIcon({{
-                            className: '', html: '<div style="background:{col};color:white;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold;white-space:nowrap">{cp['label']}</div>',
-                            iconAnchor: [0, 20]
-                        }})
-                    }}).addTo(map);
-                """)
+                cp_markers_html.append(
+                    f"L.circleMarker([{cp['lat']}, {cp['lon']}], {{radius: 10, color: '{col_cp_js}', fillColor: '{col_cp_js}', fillOpacity: 0.9, weight: 2}}).bindPopup('<b>{popup}</b>').addTo(map);"
+                    f"L.marker([{cp['lat']}, {cp['lon']}], {{icon: L.divIcon({{className: '', html: '<div style=\"background:{col_cp_js};color:white;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold;white-space:nowrap\">{cp['label']}</div>', iconAnchor: [0, 20]}})}} ).addTo(map);"
+                )
 
-            # Départ / Arrivée
-            depart_arrivee_html = f"""
-                L.circleMarker([{lats_m[0]}, {lons_m[0]}], {{
-                    radius: 12, color: '#00ff44', fillColor: '#00ff44', fillOpacity: 1, weight: 3
-                }}).bindPopup('<b>🟢 Départ</b>').addTo(map);
-                L.marker([{lats_m[0]}, {lons_m[0]}], {{
-                    icon: L.divIcon({{
-                        className: '', html: '<div style="background:#00ff44;color:#000;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold">Départ</div>',
-                        iconAnchor: [0, 20]
-                    }})
-                }}).addTo(map);
-                L.circleMarker([{lats_m[-1]}, {lons_m[-1]}], {{
-                    radius: 12, color: '#ff2222', fillColor: '#ff2222', fillOpacity: 1, weight: 3
-                }}).bindPopup('<b>🔴 Arrivée</b>').addTo(map);
-                L.marker([{lats_m[-1]}, {lons_m[-1]}], {{
-                    icon: L.divIcon({{
-                        className: '', html: '<div style="background:#ff2222;color:white;padding:2px 5px;border-radius:4px;font-size:11px;font-weight:bold">Arrivée</div>',
-                        iconAnchor: [0, 20]
-                    }})
-                }}).addTo(map);
-            """
-
-            segments_js   = "\n".join(segments_html)
-            cp_markers_js = "\n".join(cp_markers_html)
-
-            html_map = f"""<!DOCTYPE html>
-<html><head>
+            html_map = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"/>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -2122,85 +2128,64 @@ qu'un temps identique par 12°C et temps sec. Sans correction, le modèle sous-e
 <script>
 var map = L.map('map').setView([{center_lat}, {center_lon}], 13);
 L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map);
-{segments_js}
-{cp_markers_js}
-{depart_arrivee_html}
+{chr(10).join(segments_html)}
+{chr(10).join(cp_markers_html)}
+L.circleMarker([{lats_m[0]}, {lons_m[0]}], {{radius:12,color:'#00ff44',fillColor:'#00ff44',fillOpacity:1,weight:3}}).bindPopup('<b>🟢 Départ</b>').addTo(map);
+L.circleMarker([{lats_m[-1]}, {lons_m[-1]}], {{radius:12,color:'#ff2222',fillColor:'#ff2222',fillOpacity:1,weight:3}}).bindPopup('<b>🔴 Arrivée</b>').addTo(map);
 </script></body></html>"""
 
             import streamlit.components.v1 as components
             components.html(html_map, height=510, scrolling=False)
 
-            # ── Profil d'altitude avec checkpoints ──
             x_km  = np.array(cum_d_map) / 1000.0
             y_gps = np.array(y_elev)
-            w     = int(elev_smooth_window); w += (1 if w % 2 == 0 else 0)
-
+            w_e   = int(elev_smooth_window); w_e += (1 if w_e % 2 == 0 else 0)
             fig3, ax3 = plt.subplots(figsize=(11, 3.5))
-
-            # Remplissage sous la courbe
-            if w >= 3 and y_gps.size >= w:
-                y_s = np.convolve(y_gps, np.ones(w) / w, mode="same")
+            if w_e >= 3 and y_gps.size >= w_e:
+                y_s = np.convolve(y_gps, np.ones(w_e) / w_e, mode="same")
                 ax3.fill_between(x_km, y_s.min() - 5, y_s, alpha=0.15, color="steelblue")
                 ax3.plot(x_km, y_s, lw=2.5, label="Altitude GPS lissée", color="steelblue")
                 ax3.plot(x_km, y_gps, lw=0.8, alpha=0.2, color="gray", label="GPS brut")
             else:
                 ax3.fill_between(x_km, y_gps.min() - 5, y_gps, alpha=0.15, color="steelblue")
                 ax3.plot(x_km, y_gps, lw=2.5, label="Altitude GPS", color="steelblue")
-
             if dem_elevations is not None and len(dem_elevations) == len(points):
                 y_dem = np.array([e if e is not None else 0.0 for e in dem_elevations])
                 ax3.plot(x_km, y_dem, lw=2, ls="--", label="DEM corrigé", color="forestgreen")
-
-            # Tracer les checkpoints sur le profil
             cp_colors_profile = {
-                "🥤 Ravitaillement": "#00c864",
-                "⏱ Point de passage": "#6496ff",
-                "🏔 Sommet":          "#ffc800",
-                "🔻 Col":             "#c864ff",
-                "🏁 Intermédiaire":   "#ffffff",
-                "⚠️ Point clé":       "#ff5050",
+                "🥤 Ravitaillement": "#00c864", "⏱ Point de passage": "#6496ff",
+                "🏔 Sommet": "#ffc800", "🔻 Col": "#c864ff",
+                "🏁 Intermédiaire": "#ffffff", "⚠️ Point clé": "#ff5050",
             }
             for cp in sorted(checkpoints, key=lambda x: x["dist_km"]):
                 cp_x = cp["dist_km"]
                 cp_y = float(np.interp(cp_x * 1000, cum_d_map, y_gps))
-                col_cp = cp_colors_profile.get(cp["type"], "#ffcc00")
-                ax3.axvline(cp_x, color=col_cp, lw=1.5, ls="--", alpha=0.7)
-                ax3.annotate(
-                    cp["label"], xy=(cp_x, cp_y),
-                    xytext=(0, 12), textcoords="offset points",
-                    ha="center", fontsize=7.5, color=col_cp, fontweight="bold",
-                    arrowprops=dict(arrowstyle="-", color=col_cp, lw=1),
-                )
-                ax3.scatter([cp_x], [cp_y], s=60, color=col_cp, zorder=5)
-
-            # Départ / Arrivée
-            ax3.scatter([x_km[0]],  [y_gps[0]],  s=80, color="lime",  zorder=6, marker="^", label="Départ")
-            ax3.scatter([x_km[-1]], [y_gps[-1]], s=80, color="red",   zorder=6, marker="s", label="Arrivée")
-
+                col_p = cp_colors_profile.get(cp["type"], "#ffcc00")
+                ax3.axvline(cp_x, color=col_p, lw=1.5, ls="--", alpha=0.7)
+                ax3.annotate(cp["label"], xy=(cp_x, cp_y), xytext=(0, 12),
+                             textcoords="offset points", ha="center", fontsize=7.5,
+                             color=col_p, fontweight="bold",
+                             arrowprops=dict(arrowstyle="-", color=col_p, lw=1))
+                ax3.scatter([cp_x], [cp_y], s=60, color=col_p, zorder=5)
+            ax3.scatter([x_km[0]],  [y_gps[0]],  s=80, color="lime", zorder=6, marker="^", label="Départ")
+            ax3.scatter([x_km[-1]], [y_gps[-1]], s=80, color="red",  zorder=6, marker="s", label="Arrivée")
             ax3.set_xlabel("Distance (km)"); ax3.set_ylabel("Altitude (m)")
             ax3.set_title(f"Profil d'altitude — {total_dist_km:.1f} km")
-            ax3.legend(fontsize=8); ax3.grid(alpha=0.25)
-            fig3.tight_layout()
+            ax3.legend(fontsize=8); ax3.grid(alpha=0.25); fig3.tight_layout()
             st.pyplot(fig3); plt.close(fig3)
 
-            # ── Tableau des temps de passage aux checkpoints ──
             if checkpoints and "res" in st.session_state:
                 res_cp = st.session_state["res"]
                 df_out_cp = res_cp.get("df")
                 if df_out_cp is not None and not df_out_cp.empty:
                     st.markdown("#### ⏱ Temps de passage aux checkpoints")
-                    st.caption("Estimé d'après la prédiction km par km.")
-                    # Construire un index distance→temps cumulé depuis df_out
                     km_vals, t_cum_vals = [], []
                     for _, row_cp in df_out_cp.iterrows():
                         km_str = str(row_cp["Km"])
-                        try:
-                            km_num = float(km_str.split()[0])
-                        except:
-                            continue
+                        try:    km_num = float(km_str.split()[0])
+                        except: continue
                         t_s_val = hms_to_seconds(str(row_cp["Temps cumulé"]))
                         km_vals.append(km_num); t_cum_vals.append(t_s_val)
-
                     if len(km_vals) >= 2:
                         passage_rows = []
                         for cp in sorted(checkpoints, key=lambda x: x["dist_km"]):
@@ -2214,146 +2199,48 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
                                     t_passage / max(0.001, cp["dist_km"])) + "/km"
                                     if cp["dist_km"] > 0 else "—",
                             })
-                        st.dataframe(pd.DataFrame(passage_rows),
-                                     use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("Lancez d'abord le calcul de prédiction pour voir les temps de passage.")
+                        st.dataframe(pd.DataFrame(passage_rows), use_container_width=True, hide_index=True)
 
-        # ── Animation style Tour de France ──────────────────────────────
         st.markdown("---")
         st.subheader("🎬 Animation du parcours — style présentation d'étape")
-        st.caption("Le tracé se dessine progressivement avec un point qui avance, coloré par altitude. "
-                   "Téléchargez le fichier HTML pour le partager ou le lire hors-ligne.")
+        st.caption("Le tracé se dessine progressivement avec un point qui avance, coloré par altitude.")
 
         with st.expander("⚙️ Paramètres de l'animation", expanded=True):
             col_an1, col_an2, col_an3 = st.columns(3)
             with col_an1:
-                anim_frames   = st.slider("Nombre de frames", 60, 300, 120, 10,
-                                          help="Plus = animation plus fluide mais fichier plus lourd")
+                anim_frames   = st.slider("Nombre de frames", 60, 300, 120, 10)
                 anim_duration = st.slider("Durée totale (secondes)", 5, 60, 20, 5)
             with col_an2:
-                anim_color = st.selectbox(
-                    "Colorier le tracé par",
-                    ["Altitude", "Pente", "Distance"],
-                    key="anim_color_by"
-                )
-                anim_style = st.selectbox(
-                    "Style de carte fond",
-                    ["Sombre (trail)", "Satellite ESRI", "Topo", "Blanc (épuré)"],
-                    key="anim_map_style"
-                )
+                anim_color = st.selectbox("Colorier le tracé par", ["Altitude", "Pente", "Distance"], key="anim_color_by")
+                anim_style = st.selectbox("Style de carte fond", ["Sombre (trail)", "Satellite ESRI", "Topo", "Blanc (épuré)"], key="anim_map_style")
             with col_an3:
-                anim_width     = st.slider("Épaisseur du tracé", 2, 8, 4)
-                anim_dot_size  = st.slider("Taille du point", 8, 30, 16)
-                anim_show_elev = st.checkbox("Afficher profil d'altitude animé", value=True)
-                anim_show_cp   = st.checkbox("Afficher les checkpoints", value=True)
+                anim_width    = st.slider("Épaisseur du tracé", 2, 8, 4)
+                anim_dot_size = st.slider("Taille du point", 8, 30, 16)
+                anim_show_elev= st.checkbox("Afficher profil d'altitude animé", value=True)
+                anim_show_cp  = st.checkbox("Afficher les checkpoints", value=True)
 
         if st.button("🎬 Générer l'animation", type="primary", key="btn_generate_anim"):
             with st.spinner("Génération de l'animation en cours..."):
-
-                # Sous-échantillonnage
-                n_pts   = len(points)
-                step_a  = max(1, n_pts // 600)
-                lats_a  = lats_m[::step_a]
-                lons_a  = lons_m[::step_a]
-                elev_a  = [getattr(p, "elevation", 0.0) or 0.0 for p in points][::step_a]
-                dist_a  = [cum_d_map[i] / 1000.0 for i in range(0, n_pts, step_a)]
-                n_sub   = len(lats_a)
-
-                # Calcul des pentes
+                n_pts_a  = len(points)
+                step_a   = max(1, n_pts_a // 600)
+                lats_a   = lats_m[::step_a]
+                lons_a   = lons_m[::step_a]
+                elev_a   = [getattr(p, "elevation", 0.0) or 0.0 for p in points][::step_a]
+                dist_a   = [cum_d_map[i] / 1000.0 for i in range(0, n_pts_a, step_a)]
+                n_sub    = len(lats_a)
                 slopes_a = [0.0]
                 for i in range(1, n_sub):
                     dd = (dist_a[i] - dist_a[i-1]) * 1000.0
                     de = elev_a[i] - elev_a[i-1]
                     slopes_a.append((de / dd * 100.0) if dd > 0.5 else 0.0)
 
-                # Valeur de couleur selon choix
-                if anim_color == "Altitude":
-                    color_vals = elev_a
-                    color_label = "Altitude (m)"
-                elif anim_color == "Pente":
-                    color_vals = slopes_a
-                    color_label = "Pente (%)"
-                else:
-                    color_vals = dist_a
-                    color_label = "Distance (km)"
+                if anim_color == "Altitude":   color_vals = elev_a
+                elif anim_color == "Pente":    color_vals = slopes_a
+                else:                          color_vals = dist_a
 
                 cv_min = min(color_vals)
                 cv_max = max(color_vals) if max(color_vals) != cv_min else cv_min + 1
-
-                # Normalisation 0-1
                 cv_norm = [(v - cv_min) / (cv_max - cv_min) for v in color_vals]
-
-                # Colorscale selon style
-                if anim_color == "Pente":
-                    colorscale = "RdYlGn_r"  # rouge montée, vert descente
-                else:
-                    colorscale = "plasma"     # bleu bas → jaune sommet
-
-                # Fond de carte
-                map_styles = {
-                    "Sombre (trail)":  "carto-darkmatter",
-                    "Satellite ESRI":  "white-bg",   # on overlay ESRI tiles
-                    "Topo":            "carto-voyager",
-                    "Blanc (épuré)":   "carto-positron",
-                }
-                mb_style = map_styles.get(anim_style, "carto-darkmatter")
-
-                # Couleur de texte selon fond
-                txt_color = "#ffffff" if "dark" in mb_style or "matter" in mb_style else "#111111"
-
-                # ── Génération des frames ──
-                import json as _json
-
-                frame_step = max(1, n_sub // anim_frames)
-                frame_indices = list(range(frame_step, n_sub + 1, frame_step))
-                if frame_indices[-1] < n_sub:
-                    frame_indices.append(n_sub)
-
-                # Construire le HTML avec Plotly CDN + animation JS pure
-                # (pas de dépendance Python plotly — tout en JS vanilla)
-
-                # Données complètes
-                all_lons_js   = _json.dumps(lons_a)
-                all_lats_js   = _json.dumps(lats_a)
-                all_dist_js   = _json.dumps([round(d, 2) for d in dist_a])
-                all_elev_js   = _json.dumps([round(e, 1) for e in elev_a])
-                all_slope_js  = _json.dumps([round(s, 1) for s in slopes_a])
-                all_cv_js     = _json.dumps([round(v, 4) for v in cv_norm])
-
-                # Checkpoints JS
-                cp_js = "[]"
-                if anim_show_cp and checkpoints:
-                    cp_list = [{"lat": c["lat"], "lon": c["lon"],
-                                "label": c["label"], "dist": c["dist_km"]}
-                               for c in sorted(checkpoints, key=lambda x: x["dist_km"])]
-                    cp_js = _json.dumps(cp_list)
-
-                frame_count  = len(frame_indices)
-                interval_ms  = int(anim_duration * 1000 / frame_count)
-                center_lat   = float(np.mean(lats_a))
-                center_lon   = float(np.mean(lons_a))
-                elev_min_v   = round(min(elev_a))
-                elev_max_v   = round(max(elev_a))
-                total_km_v   = round(dist_a[-1], 1)
-                dplus_v      = round(sum(max(0, elev_a[i]-elev_a[i-1]) for i in range(1, len(elev_a))))
-
-                # Tuiles ESRI si satellite
-                tile_layer_js = ""
-                if anim_style == "Satellite ESRI":
-                    tile_layer_js = """
-                        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                            {attribution: 'ESRI', maxZoom: 19}).addTo(map);
-                    """
-                    use_leaflet = True
-                else:
-                    use_leaflet = False
-
-                dot_color    = "#ff4444"
-                trace_width  = anim_width
-
-                # ── Build animation HTML — Leaflet satellite + relief 3D isométrique ──
-                import json as _json
 
                 _n = len(lons_a)
                 LO_js = _json.dumps([round(x,6) for x in lons_a])
@@ -2405,13 +2292,10 @@ L.tileLayer('{tiles_url}', {{maxZoom:19, attribution:'{tiles_attr}'}}).addTo(map
 .tn{{font-size:.82rem;font-weight:700;}}.tm{{font-size:.6rem;color:#64748b;font-family:'Space Mono';}}
 #bottom{{display:grid;background:rgba(6,10,20,.97);border-top:1px solid rgba(255,255,255,.07);}}
 #prof{{padding:6px 16px 4px;}}#prof canvas{{width:100%;height:100%;display:block;}}
-#relief-wrap{{border-left:1px solid rgba(255,255,255,.07);padding:4px 8px;display:flex;flex-direction:column;}}
-#relief-title{{font-size:.5rem;color:#64748b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:2px;text-align:center;}}
-#relief-canvas{{width:100%;flex:1;display:block;}}
 </style></head><body>
 <div id="app">
 <div id="hdr">
-  <div id="ti"><h1>🏔 TRAIL — {_total_km} KM</h1><p>D+{_dplus_a}M · {_emin}–{_emax}M · SAT + RELIEF 3D</p></div>
+  <div id="ti"><h1>🏔 TRAIL — {_total_km} KM</h1><p>D+{_dplus_a}M · {_emin}–{_emax}M</p></div>
   <div id="stats">
     <div class="sc"><div class="sv" id="sd">0.0</div><div class="sl">km</div></div>
     <div class="sc"><div class="sv" id="se">—</div><div class="sl">m alt</div></div>
@@ -2495,17 +2379,16 @@ function drawProf(c){
   gM.addColorStop(0,'rgba(80,160,80,.55)');gM.addColorStop(.4,'rgba(130,100,60,.45)');gM.addColorStop(.8,'rgba(160,140,120,.35)');gM.addColorStop(1,'rgba(40,40,40,.2)');
   pctx.fillStyle=gM;pctx.fill();
   for(var i=startI+1;i<=endI;i++){var pa=proj(i-1),pb=proj(i);pctx.beginPath();pctx.moveTo(pa.x,pa.y);pctx.lineTo(pb.x,pb.y);pctx.strokeStyle=i<=fi?cs(CV[i]):'rgba(255,255,255,.18)';pctx.lineWidth=2;pctx.stroke();}
-  for(var i=startI+1;i<=endI;i++){var pa=proj(i-1),pb=proj(i),slope=EL[i]-EL[i-1];if(slope>5){pctx.beginPath();pctx.moveTo(pa.x,pa.y);pctx.lineTo(pb.x,pb.y);pctx.lineTo(pb.x,H3);pctx.lineTo(pa.x,H3);pctx.closePath();pctx.fillStyle='rgba(0,0,0,'+Math.min(.25,slope/200)+')';pctx.fill();}}
-  if(fi>=startI&&fi<=endI){var pc2=proj(fi);pctx.beginPath();pctx.arc(pc2.x,pc2.y,12,0,Math.PI*2);pctx.fillStyle='rgba(249,115,22,.2)';pctx.fill();pctx.beginPath();pctx.arc(pc2.x,pc2.y,6,0,Math.PI*2);pctx.fillStyle='#f97316';pctx.fill();pctx.strokeStyle='white';pctx.lineWidth=2.5;pctx.stroke();pctx.fillStyle='#f97316';pctx.font='bold 11px Space Mono,monospace';pctx.fillText(Math.round(EL[fi])+' m',pc2.x+10,pc2.y-4);pctx.beginPath();pctx.moveTo(pc2.x,pc2.y+6);pctx.lineTo(pc2.x,H3);pctx.strokeStyle='rgba(249,115,22,.35)';pctx.lineWidth=1;pctx.setLineDash([4,4]);pctx.stroke();pctx.setLineDash([]);}
+  if(fi>=startI&&fi<=endI){var pc2=proj(fi);pctx.beginPath();pctx.arc(pc2.x,pc2.y,12,0,Math.PI*2);pctx.fillStyle='rgba(249,115,22,.2)';pctx.fill();pctx.beginPath();pctx.arc(pc2.x,pc2.y,6,0,Math.PI*2);pctx.fillStyle='#f97316';pctx.fill();pctx.strokeStyle='white';pctx.lineWidth=2.5;pctx.stroke();pctx.fillStyle='#f97316';pctx.font='bold 11px Space Mono,monospace';pctx.fillText(Math.round(EL[fi])+' m',pc2.x+10,pc2.y-4);}
   pctx.fillStyle='rgba(255,255,255,.06)';pctx.fillRect(0,H3,W,1);
   var HB=H-H3-1,offY=H3+1,g=pctx.createLinearGradient(0,offY,0,H);
   g.addColorStop(0,'rgba(249,115,22,.18)');g.addColorStop(1,'rgba(0,0,0,0)');
   pctx.beginPath();EL.forEach(function(e,i){var x=i/N*W,y=offY+HB-((e-EMIN)/(EMAX-EMIN+1))*(HB-4)-2;i?pctx.lineTo(x,y):pctx.moveTo(x,y);});pctx.lineTo(W,H);pctx.lineTo(0,H);pctx.closePath();pctx.fillStyle=g;pctx.fill();
   for(var i=1;i<N;i++){var x0=(i-1)/N*W,x1=i/N*W,y0=offY+HB-((EL[i-1]-EMIN)/(EMAX-EMIN+1))*(HB-4)-2,y1=offY+HB-((EL[i]-EMIN)/(EMAX-EMIN+1))*(HB-4)-2;pctx.beginPath();pctx.moveTo(x0,y0);pctx.lineTo(x1,y1);pctx.strokeStyle=i<=(c||0)?cs(CV[i]):'rgba(255,255,255,.08)';pctx.lineWidth=1.4;pctx.stroke();}
-  if(c>=0&&c<N){var cx2=c/N*W,cy2=offY+HB-((EL[Math.min(Math.floor(c),N-1)]-EMIN)/(EMAX-EMIN+1))*(HB-4)-2;pctx.beginPath();pctx.moveTo(cx2,offY);pctx.lineTo(cx2,H);pctx.strokeStyle='rgba(249,115,22,.5)';pctx.lineWidth=1;pctx.stroke();pctx.beginPath();pctx.arc(cx2,cy2,3.5,0,Math.PI*2);pctx.fillStyle='#f97316';pctx.fill();}
+  if(c>=0&&c<N){var cx2=c/N*W,cy2=offY+HB-((EL[Math.min(Math.floor(c),N-1)]-EMIN)/(EMAX-EMIN+1))*(HB-4)-2;pctx.beginPath();pctx.moveTo(cx2,offY);pctx.lineTo(cx2,H);pctx.strokeStyle='rgba(249,115,22,.5)';pctx.lineWidth=1;pctx.stroke();}
 }
-
 function tgF(){follow=!follow;var b=document.getElementById('bf');b.classList.toggle('on',follow);b.textContent=follow?'CAM':'MAP';}
+function tgP(){playing=!playing;document.getElementById('bp').innerHTML=playing?'&#9646;&#9646;':'&#9654;';if(playing){lastTs=null;requestAnimationFrame(frame);}}
 function spd(m){SPD=m;['s1','s2','s4'].forEach(function(id){document.getElementById(id).classList.remove('on');});document.getElementById('s'+m).classList.add('on');}
 function rst(){playing=false;frac=0;cur=0;dp=0;lcp=-1;lastTs=null;segs.forEach(function(s){map.removeLayer(s);});segs=[];if(dotMk){map.removeLayer(dotMk);dotMk=null;}document.getElementById('bp').innerHTML='&#9646;&#9646;';document.getElementById('progf').style.width='0%';map.setView([CLT,CLO],14);drawProf(-1);playing=true;lastTs=null;requestAnimationFrame(frame);}
 window.addEventListener('load',function(){drawProf(-1);requestAnimationFrame(frame);});
@@ -2514,17 +2397,14 @@ window.addEventListener('resize',function(){drawProf(frac>0?frac:-1);});
 
                 _js = _js_raw.replace('__LO__',LO_js).replace('__LA__',LA_js)
                 _js = _js.replace('__DI__',DI_js).replace('__EL__',EL_js)
-                _js = _js.replace('__SL__',SL_js).replace('__CV__',CV_js)
-                _js = _js.replace('__CP__',CP_js)
+                _js = _js.replace('__SL__',SL_js).replace('__CV__',CV_js).replace('__CP__',CP_js)
                 _js = _js.replace('__EMIN__',str(_emin)).replace('__EMAX__',str(_emax))
                 _js = _js.replace('__TOT__',str(_total_km))
                 _js = _js.replace('__CLT__',str(_clat)).replace('__CLO__',str(_clon))
                 html_anim = _head + _js
-                # Sauvegarder dans session_state pour persistance
                 st.session_state["html_anim"] = html_anim
                 st.session_state["html_anim_km"] = int(total_dist_km)
 
-        # ── Affichage HORS du bloc if button (persiste après clic) ──
         if "html_anim" in st.session_state:
             import streamlit.components.v1 as components
             components.html(st.session_state["html_anim"], height=620, scrolling=False)
@@ -2534,14 +2414,13 @@ window.addEventListener('resize',function(){drawProf(frac>0?frac:-1);});
                     label="⬇️ Télécharger le fichier HTML",
                     data=st.session_state["html_anim"].encode("utf-8"),
                     file_name=f"trail_{st.session_state['html_anim_km']}km.html",
-                    mime="text/html",
-                )
+                    mime="text/html")
             with col_dl2:
-                st.caption("💡 Fichier autonome — ouvrez-le dans Chrome, partagez par email ou WhatsApp. "
-                           "Fonctionne sans connexion.")
+                st.caption("💡 Fichier autonome — ouvrez dans Chrome, partageable sans connexion.")
 
 
-
+# ══════════════════════════════════════════════════════════════
+# ONGLET 1 — TESTS D'ENDURANCE + VC
 # ══════════════════════════════════════════════════════════════
 with main_tabs[1]:
     st.title("🧪 Tests d'endurance & Vitesse Critique (VC)")
@@ -2554,13 +2433,9 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
     if not HAS_FITDECODE:
         st.warning("⚠️ `fitdecode` non installé — fichiers FIT non disponibles. `pip install fitdecode`")
 
-    col_nt1, col_nt2 = st.columns([1,3])
-    with col_nt1:
-        n_tests = st.number_input("Nombre de tests", min_value=2, max_value=6, value=3, step=1, key="n_tests_vc")
-
+    n_tests = st.number_input("Nombre de tests", min_value=2, max_value=6, value=3, step=1, key="n_tests_vc")
     st.info(f"**{n_tests} tests** à charger. Conseil : mélanger des efforts courts (6 min) et longs (20-30 min).")
 
-    # test_ranges : liste de (start_s, end_s) ou (None, None) si pas de plage
     test_files = []; test_names = []; test_ranges = []
 
     for i in range(int(n_tests)):
@@ -2570,31 +2445,20 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                 t_name = st.text_input("Nom du test", value=f"Test {i+1}", key=f"tname_{i}")
             with c_file:
                 t_file = st.file_uploader("Fichier activité", type=["fit","gpx","tcx","csv"], key=f"tfile_{i}")
-
-            # ── Plage de temps hh:mm:ss (optionnelle) ──
-            use_range = st.checkbox("Délimiter une plage de temps dans le fichier",
-                                     key=f"frange_{i}",
-                                     help="Utile si le fichier contient l'échauffement ou la récupération")
+            use_range = st.checkbox("Délimiter une plage de temps", key=f"frange_{i}")
             if use_range:
                 cr1, cr2 = st.columns(2)
                 with cr1:
-                    t_start_hms = hms_input("Début de l'effort", "0:00:00",
-                                             key=f"tstart_hms_{i}",
-                                             help="Temps relatif depuis le début du fichier (hh:mm:ss)")
+                    t_start_hms = hms_input("Début de l'effort", "0:00:00", key=f"tstart_hms_{i}")
                 with cr2:
-                    t_end_hms = hms_input("Fin de l'effort", "0:20:00",
-                                           key=f"tend_hms_{i}",
-                                           help="Temps relatif depuis le début du fichier (hh:mm:ss)")
+                    t_end_hms = hms_input("Fin de l'effort", "0:20:00", key=f"tend_hms_{i}")
                 t_start_s = float(hms_to_seconds(t_start_hms)) if validate_hms(t_start_hms) else 0.0
                 t_end_s   = float(hms_to_seconds(t_end_hms))   if validate_hms(t_end_hms)   else None
                 if t_end_s is not None and t_end_s <= t_start_s:
                     st.warning("⚠️ La fin doit être postérieure au début.")
                     t_start_s, t_end_s = None, None
-                st.caption(f"→ Plage sélectionnée : **{t_start_hms}** → **{t_end_hms}** "
-                           f"({seconds_to_hms(t_end_s - t_start_s) if t_end_s else '—'} d'effort)")
             else:
                 t_start_s, t_end_s = None, None
-
             test_files.append(t_file)
             test_names.append(t_name)
             test_ranges.append((t_start_s, t_end_s))
@@ -2611,7 +2475,6 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
             if df_act is None or df_act.empty:
                 st.warning(f"Test {i+1} ({name}) : impossible de lire le fichier.")
                 continue
-            # Appliquer la plage de temps si définie
             if rng_start is not None or rng_end is not None:
                 t0_act = float(df_act["elapsed_s"].min())
                 t_lo = (rng_start if rng_start is not None else t0_act)
@@ -2619,7 +2482,7 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                 df_act = df_act[(df_act["elapsed_s"] >= t_lo) & (df_act["elapsed_s"] <= t_hi)].copy()
                 df_act["elapsed_s"] = df_act["elapsed_s"] - t_lo
             if df_act.empty:
-                st.warning(f"Test {i+1} ({name}) : données vides après troncature de la plage.")
+                st.warning(f"Test {i+1} ({name}) : données vides après troncature.")
                 continue
             dur_s = float(df_act["elapsed_s"].max())
             if df_act["distance_m"].notna().any():
@@ -2649,7 +2512,7 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     with cols[col_idx]:
                         hr  = item["hr"]
                         spd = item["spd"]
-                        dur_str = seconds_to_hms(item["dur_s"])
+                        dur_str  = seconds_to_hms(item["dur_s"])
                         dist_str = f"{item['dist_m']/1000:.2f} km" if item["dist_m"] else "—"
                         avg_v = (item["dist_m"] / item["dur_s"]) if item["dist_m"] and item["dur_s"] > 0 else None
                         st.markdown(f'<div class="test-card"><h4>🔵 {item["name"]}</h4>', unsafe_allow_html=True)
@@ -2694,10 +2557,8 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     cv2.metric("Allure VC", pace_str(1000.0/vc)+"/km")
                     cv3.metric("D' (réserve anaérobie)", f"{d_prime:.0f} m" if d_prime else "—")
                     cv4.metric("R² régression", f"{r2:.3f}")
-                    if r2 < 0.90:
-                        st.warning(f"⚠️ R²={r2:.3f} — régression faible.")
-                    else:
-                        st.success(f"✅ R²={r2:.3f} — bonne qualité.")
+                    if r2 < 0.90: st.warning(f"⚠️ R²={r2:.3f} — régression faible.")
+                    else:         st.success(f"✅ R²={r2:.3f} — bonne qualité.")
 
                     fig_vc, ax_vc = plt.subplots(figsize=(7,4))
                     T_arr = np.array(durs_vc); D_arr = np.array(dists_vc)
@@ -2710,23 +2571,15 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     ax_vc.set_title("Modèle D = VC × T + D'"); ax_vc.legend(); ax_vc.grid(alpha=0.3)
                     st.pyplot(fig_vc); plt.close(fig_vc)
 
-                    # ── Seuils physiologiques ──────────────────────────────────────────
                     st.markdown("---")
                     st.subheader("📊 Seuils physiologiques (SV1 & SV2)")
-
                     col_sv1, col_sv2 = st.columns(2)
                     with col_sv1:
-                        sv1_input = hms_input(
-                            "🟢 SV1 — allure (mm:ss/km)",
-                            default="0:05:00", key="sv1_pace_input",
-                            help="Premier seuil ventilatoire — allure de footing rapide, conversation encore possible"
-                        )
+                        sv1_input = hms_input("🟢 SV1 — allure (mm:ss/km)", default="0:05:00", key="sv1_pace_input",
+                                              help="Premier seuil ventilatoire")
                     with col_sv2:
-                        sv2_input = hms_input(
-                            "🔴 SV2 — allure (mm:ss/km)",
-                            default="0:04:00", key="sv2_pace_input",
-                            help="Deuxième seuil ventilatoire — allure maximale tenable ~30-60 min"
-                        )
+                        sv2_input = hms_input("🔴 SV2 — allure (mm:ss/km)", default="0:04:00", key="sv2_pace_input",
+                                              help="Deuxième seuil ventilatoire / anaérobie")
 
                     sv1_pace_s = hms_to_seconds(sv1_input)
                     sv2_pace_s = hms_to_seconds(sv2_input)
@@ -2734,34 +2587,18 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
                     sv2_ms = (1000.0 / sv2_pace_s) if sv2_pace_s > 0 else None
 
                     if sv1_ms and sv2_ms and sv1_ms > 0 and sv2_ms > 0 and sv1_ms < sv2_ms:
-
-                        # ── Métriques principales ──
                         m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("🟢 SV1",
-                                  pace_str(1000/sv1_ms) + "/km",
-                                  delta=f"{sv1_ms/vc*100:.1f}% de VC")
-                        m2.metric("🔴 SV2",
-                                  pace_str(1000/sv2_ms) + "/km",
-                                  delta=f"{sv2_ms/vc*100:.1f}% de VC")
-                        m3.metric("🔵 VC",
-                                  pace_str(1000/vc) + "/km",
-                                  delta="100% VC — référence")
-
+                        m1.metric("🟢 SV1", pace_str(1000/sv1_ms) + "/km", delta=f"{sv1_ms/vc*100:.1f}% de VC")
+                        m2.metric("🔴 SV2", pace_str(1000/sv2_ms) + "/km", delta=f"{sv2_ms/vc*100:.1f}% de VC")
+                        m3.metric("🔵 VC",  pace_str(1000/vc) + "/km",     delta="100% VC — référence")
                         ecart_sv1_sv2_pct = (sv2_ms - sv1_ms) / sv1_ms * 100
                         ecart_sv2_vc_pct  = (vc - sv2_ms) / sv2_ms * 100
-                        m4.metric("Écart SV1→SV2",
-                                  f"+{ecart_sv1_sv2_pct:.1f}%",
+                        m4.metric("Écart SV1→SV2", f"+{ecart_sv1_sv2_pct:.1f}%",
                                   delta=f"SV2→VC : +{ecart_sv2_vc_pct:.1f}%")
-
-                        # ── Analyse et conseil ──
-                        st.markdown("#### 📋 Analyse")
 
                         sv1_pct_vc = sv1_ms / vc * 100
                         sv2_pct_vc = sv2_ms / vc * 100
-
-                        # Largeur de la zone aérobie (entre SV1 et SV2)
                         zone_aerob_pct = sv2_pct_vc - sv1_pct_vc
-
                         col_a, col_b = st.columns(2)
                         with col_a:
                             st.markdown(f"""
@@ -2769,170 +2606,95 @@ La <em>Vitesse Critique</em> est la vitesse maximale que l'athlète peut mainten
 |---|---|
 | SV1 / VC | **{sv1_pct_vc:.1f} %** |
 | SV2 / VC | **{sv2_pct_vc:.1f} %** |
-| Zone aérobie (SV1→SV2) | **{zone_aerob_pct:.1f} points de % VC** |
+| Zone aérobie (SV1→SV2) | **{zone_aerob_pct:.1f} pts %VC** |
 | Écart SV1→SV2 | **+{ecart_sv1_sv2_pct:.1f} %** |
 | Écart SV2→VC | **+{ecart_sv2_vc_pct:.1f} %** |
 """)
-
                         with col_b:
-                            # Conseil prioritaire
                             if sv1_pct_vc < 65:
-                                conseil = ("🟢 **SV1 bas** (< 65% VC) — priorité à l'**endurance fondamentale** : "
-                                           "volume à basse intensité (Z2) pour repousser SV1 vers le haut.")
-                                couleur = "success"
+                                st.success("🟢 **SV1 bas** (< 65% VC) — priorité à l'**endurance fondamentale** : volume Z2.")
                             elif sv2_pct_vc < 85:
-                                conseil = ("🔴 **SV2 bas** (< 85% VC) — priorité au travail au **seuil** : "
-                                           "tempo, allure marathon, séances à SV2 pour rapprocher SV2 de VC.")
-                                couleur = "warning"
+                                st.warning("🔴 **SV2 bas** (< 85% VC) — priorité au **seuil** : tempo, allure marathon.")
                             elif ecart_sv2_vc_pct > 15:
-                                conseil = ("🔵 **Bon profil aérobie** — SV2 proche de VC. "
-                                           "Priorité à la **VC elle-même** : intervalles longs (8-15 min à VC) "
-                                           "pour repousser la limite supérieure.")
-                                couleur = "info"
+                                st.info("🔵 **Bon profil aérobie** — priorité à la **VC** : intervalles 8-15 min.")
                             else:
-                                conseil = ("✅ **Profil équilibré** — SV1, SV2 et VC bien répartis. "
-                                           "Travail polyvalent : maintenir l'endurance (Z2) et "
-                                           "entretenir le seuil (Z4).")
-                                couleur = "success"
+                                st.success("✅ **Profil équilibré** — travail polyvalent Z2 + Z4.")
 
-                            if couleur == "success":
-                                st.success(conseil)
-                            elif couleur == "warning":
-                                st.warning(conseil)
-                            else:
-                                st.info(conseil)
-
-                        # ── Représentation graphique ──
                         fig_sv, ax_sv = plt.subplots(figsize=(9, 2.5))
-
                         zones_def = [
-                            ("Z1 Récup",        0.0,        sv1_ms*0.85, "#81c784"),
-                            ("Z2 EF",           sv1_ms*0.85, sv1_ms,     "#aed581"),
-                            ("Z3 Tempo",        sv1_ms,     sv2_ms,      "#ffb74d"),
-                            ("Z4 Seuil",        sv2_ms,     vc,          "#ef5350"),
-                            ("Z5 >VC",          vc,         vc * 1.15,   "#ab47bc"),
+                            ("Z1 Récup",  0.0,         sv1_ms*0.85, "#81c784"),
+                            ("Z2 EF",     sv1_ms*0.85, sv1_ms,      "#aed581"),
+                            ("Z3 Tempo",  sv1_ms,      sv2_ms,      "#ffb74d"),
+                            ("Z4 Seuil",  sv2_ms,      vc,          "#ef5350"),
+                            ("Z5 >VC",    vc,          vc * 1.15,   "#ab47bc"),
                         ]
-                        for (label, v_lo, v_hi, color) in zones_def:
+                        for (lbl_z, v_lo, v_hi, col_z) in zones_def:
                             if v_hi <= v_lo: continue
-                            ax_sv.barh(0, v_hi - v_lo, left=v_lo, height=0.5,
-                                       color=color, alpha=0.85)
-                            ax_sv.text((v_lo+v_hi)/2, 0, label,
-                                       ha="center", va="center", fontsize=7.5,
+                            ax_sv.barh(0, v_hi - v_lo, left=v_lo, height=0.5, color=col_z, alpha=0.85)
+                            ax_sv.text((v_lo+v_hi)/2, 0, lbl_z, ha="center", va="center", fontsize=7.5,
                                        color="white", fontweight="bold")
-
-                        # Marqueurs SV1, SV2, VC
-                        for v_mark, lbl, col_m in [
+                        for v_mark, lbl_m, col_m in [
                             (sv1_ms, f"SV1 {pace_str(1000/sv1_ms)}/km {sv1_pct_vc:.0f}%VC", "#2e7d32"),
                             (sv2_ms, f"SV2 {pace_str(1000/sv2_ms)}/km {sv2_pct_vc:.0f}%VC", "#b71c1c"),
                             (vc,     f"VC {pace_str(1000/vc)}/km 100%",                       "#4a148c"),
                         ]:
                             ax_sv.axvline(v_mark, color=col_m, lw=2)
-                            ax_sv.text(v_mark, 0.32, lbl, ha="center",
-                                       fontsize=7, color=col_m, fontweight="bold",
-                                       va="bottom")
-
-                        ax_sv.set_xlabel("Vitesse (m/s)")
-                        ax_sv.set_yticks([])
+                            ax_sv.text(v_mark, 0.32, lbl_m, ha="center", fontsize=7,
+                                       color=col_m, fontweight="bold", va="bottom")
+                        ax_sv.set_xlabel("Vitesse (m/s)"); ax_sv.set_yticks([])
                         ax_sv.set_xlim(sv1_ms * 0.75, vc * 1.20)
                         ax_sv.set_title("Positionnement SV1 / SV2 / VC")
-                        ax_sv.grid(axis="x", alpha=0.3)
-                        fig_sv.tight_layout()
+                        ax_sv.grid(axis="x", alpha=0.3); fig_sv.tight_layout()
                         st.pyplot(fig_sv); plt.close(fig_sv)
 
                     elif sv1_ms and sv2_ms and sv1_ms >= sv2_ms:
-                        st.warning("⚠️ SV1 doit être inférieur à SV2 (allure SV1 plus lente = plus de secondes/km).")
+                        st.warning("⚠️ SV1 doit être inférieur à SV2.")
                     else:
                         st.info("Entrez vos allures SV1 et SV2 pour voir l'analyse.")
+
                     st.markdown("---")
                     st.subheader("📋 Table des temps de maintien")
-                    st.caption(
-                        "**80 % → 100 % VC** : modèle Riegel calé sur vos références. "
-                        "**100 % → 120 % VC** : modèle D' (réserve anaérobie). "
-                        "Paliers de 2 % de VC."
-                    )
                     refs_for_table = st.session_state.get("refs_fit_vc", [])
                     if not refs_for_table:
-                        refs_for_table = [
-                            {"distance": item["dist_m"], "temps": item["dur_s"]}
-                            for item in loaded if item["dist_m"] and item["dur_s"] > 0
-                        ]
+                        refs_for_table = [{"distance": item["dist_m"], "temps": item["dur_s"]}
+                                          for item in loaded if item["dist_m"] and item["dur_s"] > 0]
                     K_for_table = st.session_state.get("K_riegel_vc", 1.06)
                     df_hold = build_holding_table(vc, d_prime, refs_for_table, K_for_table)
                     if not df_hold.empty:
-                        # Mise en évidence de la ligne VC (100 %)
                         def style_vc_row(row):
                             if row["% VC"] == "100 %":
                                 return ["background-color: #2c5282; color: white; font-weight: bold"] * len(row)
                             return [""] * len(row)
-                        st.dataframe(
-                            df_hold.style.apply(style_vc_row, axis=1),
-                            use_container_width=True,
-                        )
-
-                        # Graphique en % VC
+                        st.dataframe(df_hold.style.apply(style_vc_row, axis=1), use_container_width=True)
                         fig_hold, ax_hold = plt.subplots(figsize=(9, 4))
                         pcts = [float(p.replace(" %", "")) for p in df_hold["% VC"]]
                         mask_ri = df_hold["Modèle"] == "Riegel"
                         mask_dp = df_hold["Modèle"] == "Modèle D'"
                         if mask_ri.any():
-                            ax_hold.plot(
-                                [pcts[i] for i in df_hold.index[mask_ri]],
-                                df_hold.loc[mask_ri, "Durée (min)"],
-                                "o-", color="#1f77b4", lw=2.5, ms=6,
-                                label="Riegel (80 %–100 % VC)"
-                            )
+                            ax_hold.plot([pcts[i] for i in df_hold.index[mask_ri]],
+                                         df_hold.loc[mask_ri, "Durée (min)"],
+                                         "o-", color="#1f77b4", lw=2.5, ms=6, label="Riegel")
                         if mask_dp.any():
-                            ax_hold.plot(
-                                [pcts[i] for i in df_hold.index[mask_dp]],
-                                df_hold.loc[mask_dp, "Durée (min)"],
-                                "o--", color="#d62728", lw=2.5, ms=6,
-                                label="Modèle D' (100 %–120 % VC)"
-                            )
+                            ax_hold.plot([pcts[i] for i in df_hold.index[mask_dp]],
+                                         df_hold.loc[mask_dp, "Durée (min)"],
+                                         "o--", color="#d62728", lw=2.5, ms=6, label="Modèle D'")
                         ax_hold.axvline(100, color="gray", lw=1.5, ls=":",
-                                        label=f"VC = 100 % ({pace_str(1000/vc)}/km)")
-                        # Annoter chaque point avec l'allure
-                        for i, row in df_hold.iterrows():
-                            ax_hold.annotate(
-                                row["Allure (/km)"],
-                                xy=(pcts[i], row["Durée (min)"]),
-                                xytext=(0, 7), textcoords="offset points",
-                                ha="center", fontsize=7, color="#444"
-                            )
-                        ax_hold.set_xlabel("% de la Vitesse Critique")
-                        ax_hold.set_ylabel("Temps de maintien (min)")
-                        ax_hold.set_title("Temps de maintien par pourcentage de VC")
-                        ax_hold.set_xticks([float(p.replace(" %","")) for p in df_hold["% VC"]])
-                        ax_hold.set_xticklabels([p for p in df_hold["% VC"]], rotation=45, fontsize=8)
+                                        label=f"VC ({pace_str(1000/vc)}/km)")
+                        ax_hold.set_xlabel("% de la Vitesse Critique"); ax_hold.set_ylabel("Durée (min)")
+                        ax_hold.set_title("Temps de maintien par % VC")
                         ax_hold.legend(); ax_hold.grid(alpha=0.3); ax_hold.set_ylim(0)
-                        fig_hold.tight_layout()
-                        st.pyplot(fig_hold); plt.close(fig_hold)
+                        fig_hold.tight_layout(); st.pyplot(fig_hold); plt.close(fig_hold)
 
-                    # ── Prédictions & standards ──
                     st.markdown("---")
                     st.subheader("🏆 Prédictions & Standards de performance")
-                    st.markdown("""
-<div class="highlight-box">
-Temps prévisionnels sur 5 km, 10 km, semi-marathon et marathon calculés par le modèle Riegel
-calé sur vos performances, avec comparaison aux standards nationaux et records.
-</div>""", unsafe_allow_html=True)
-
-                    genre_sel = st.radio("Catégorie", ["H", "F"], horizontal=True,
-                                         key="genre_standards")
-
+                    genre_sel = st.radio("Catégorie", ["H", "F"], horizontal=True, key="genre_standards")
                     refs_pred = st.session_state.get("refs_fit_vc", [])
                     if not refs_pred:
-                        refs_pred = [
-                            {"distance": item["dist_m"], "temps": item["dur_s"]}
-                            for item in loaded if item["dist_m"] and item["dur_s"] > 0
-                        ]
+                        refs_pred = [{"distance": item["dist_m"], "temps": item["dur_s"]}
+                                     for item in loaded if item["dist_m"] and item["dur_s"] > 0]
                     K_pred = st.session_state.get("K_riegel_vc", 1.06)
-
-                    perf_results, best_dist = predict_performances(
-                        vc, d_prime, refs_pred, K_pred, genre=genre_sel
-                    )
-
+                    perf_results, best_dist = predict_performances(vc, d_prime, refs_pred, K_pred, genre=genre_sel)
                     if perf_results:
-                        # Ligne de résumé des 4 distances
                         cols_dist = st.columns(4)
                         for col_d, (dist_label, info) in zip(cols_dist, perf_results.items()):
                             with col_d:
@@ -2942,72 +2704,36 @@ calé sur vos performances, avec comparaison aux standards nationaux et records.
                                     sign = "✅" if c["atteint"] else "⏳"
                                     delta_txt = f"{sign} {c['diff_str']} de {c['standard']}"
                                 star = " ⭐" if dist_label == best_dist else ""
-                                st.metric(
-                                    label=f"{dist_label}{star}",
-                                    value=info["t_pred_hms"],
-                                    delta=delta_txt,
-                                    delta_color="inverse",
-                                )
-
+                                st.metric(label=f"{dist_label}{star}", value=info["t_pred_hms"],
+                                          delta=delta_txt, delta_color="inverse")
                         if best_dist:
-                            st.success(
-                                f"⭐ Distance de prédilection : **{best_dist}** "
-                                f"— c'est là où vous êtes proportionnellement le plus proche d'un standard."
-                            )
-
-                        # Détail par distance
+                            st.success(f"⭐ Distance de prédilection : **{best_dist}**")
                         for dist_label, info in perf_results.items():
-                            with st.expander(
-                                f"📏 {dist_label} — {info['t_pred_hms']} "
-                                f"({info['pace_pred']}/km){'  ⭐' if dist_label == best_dist else ''}",
-                                expanded=(dist_label == best_dist),
-                            ):
+                            with st.expander(f"📏 {dist_label} — {info['t_pred_hms']} ({info['pace_pred']}/km)"
+                                             + ("  ⭐" if dist_label == best_dist else ""),
+                                             expanded=(dist_label == best_dist)):
                                 if not info["standards"]:
-                                    st.caption("Aucun standard disponible pour cette distance.")
-                                    continue
-
-                                # Tableau des écarts
+                                    st.caption("Aucun standard disponible."); continue
                                 rows_std = []
                                 for s in info["standards"]:
-                                    atteint_str = "✅ Atteint" if s["atteint"] else "⏳ À réaliser"
-                                    rows_std.append({
-                                        "Standard":        f"{s['emoji']} {s['standard']}",
-                                        "Temps standard":  s["temps_std"],
-                                        "Votre prévu":     info["t_pred_hms"],
-                                        "Écart":           s["diff_str"],
-                                        "Statut":          atteint_str,
-                                    })
+                                    rows_std.append({"Standard": f"{s['emoji']} {s['standard']}",
+                                                     "Temps standard": s["temps_std"],
+                                                     "Votre prévu": info["t_pred_hms"],
+                                                     "Écart": s["diff_str"],
+                                                     "Statut": "✅ Atteint" if s["atteint"] else "⏳ À réaliser"})
                                 df_std = pd.DataFrame(rows_std)
-
                                 def style_std_row(row):
                                     if "✅" in row["Statut"]:
                                         return ["background-color: #d4edda"] * len(row)
-                                    if row["Standard"] == (
-                                        f"{info['closest']['emoji']} {info['closest']['standard']}"
-                                        if info["closest"] else ""
-                                    ):
-                                        return ["background-color: #2c5282; color: white; font-weight: bold"] * len(row)
                                     return [""] * len(row)
-
-                                st.dataframe(
-                                    df_std.style.apply(style_std_row, axis=1),
-                                    use_container_width=True, hide_index=True,
-                                )
-
-                                # Message narratif sur le standard le plus proche
+                                st.dataframe(df_std.style.apply(style_std_row, axis=1),
+                                             use_container_width=True, hide_index=True)
                                 c = info["closest"]
                                 if c:
                                     if c["atteint"]:
-                                        st.success(
-                                            f"{c['emoji']} Vous atteignez le standard **{c['standard']}** "
-                                            f"avec **{c['diff_str']}** d'avance."
-                                        )
+                                        st.success(f"{c['emoji']} Vous atteignez **{c['standard']}** avec **{c['diff_str']}** d'avance.")
                                     else:
-                                        st.info(
-                                            f"{c['emoji']} Standard le plus proche : **{c['standard']}** "
-                                            f"— il vous manque **{c['diff_str'].lstrip('+')}** "
-                                            f"pour l'atteindre (objectif à {c['temps_std']})."
-                                        )
+                                        st.info(f"{c['emoji']} Standard le plus proche : **{c['standard']}** — il manque **{c['diff_str'].lstrip('+')}** (objectif : {c['temps_std']}).")
 
                     st.markdown("---")
                     st.subheader("📄 Export PDF")
@@ -3023,24 +2749,18 @@ calé sur vos performances, avec comparaison aux standards nationaux et records.
                             if not df_hold.empty:
                                 pcts_pdf = [float(p.replace(" %","")) for p in df_hold["% VC"]]
                                 if mask_ri.any():
-                                    axes[1].plot(
-                                        [pcts_pdf[i] for i in df_hold.index[mask_ri]],
-                                        df_hold.loc[mask_ri, "Durée (min)"],
-                                        "o-", color="#1f77b4", lw=2, label="Riegel")
+                                    axes[1].plot([pcts_pdf[i] for i in df_hold.index[mask_ri]],
+                                                 df_hold.loc[mask_ri, "Durée (min)"], "o-", color="#1f77b4", lw=2, label="Riegel")
                                 if mask_dp.any():
-                                    axes[1].plot(
-                                        [pcts_pdf[i] for i in df_hold.index[mask_dp]],
-                                        df_hold.loc[mask_dp, "Durée (min)"],
-                                        "o--", color="#d62728", lw=2, label="Modèle D'")
+                                    axes[1].plot([pcts_pdf[i] for i in df_hold.index[mask_dp]],
+                                                 df_hold.loc[mask_dp, "Durée (min)"], "o--", color="#d62728", lw=2, label="Modèle D'")
                                 axes[1].axvline(100, color="gray", lw=1.5, ls=":")
                                 axes[1].set_xlabel("% VC"); axes[1].set_ylabel("Durée (min)")
-                                axes[1].set_title("Temps de maintien par % VC")
-                                axes[1].legend(); axes[1].grid(alpha=0.3); axes[1].set_ylim(0)
+                                axes[1].set_title("Temps de maintien"); axes[1].legend(); axes[1].grid(alpha=0.3); axes[1].set_ylim(0)
                             fig_p1.tight_layout(); pdf.savefig(fig_p1); plt.close(fig_p1)
                             for item in loaded:
                                 df_act = item["df"]
-                                if "heart_rate" not in df_act.columns or not df_act["heart_rate"].notna().any():
-                                    continue
+                                if "heart_rate" not in df_act.columns or not df_act["heart_rate"].notna().any(): continue
                                 fig_fc, ax_fc = plt.subplots(figsize=(8.27, 4))
                                 hr_s = smooth_hr(df_act["heart_rate"].ffill(), window=15)
                                 ax_fc.plot(df_act["elapsed_s"]/60.0, hr_s, color="#d62728", lw=1.5)
@@ -3055,15 +2775,11 @@ calé sur vos performances, avec comparaison aux standards nationaux et records.
 
 
 # ══════════════════════════════════════════════════════════════
-# ONGLET 2 — ANALYSE ENTRAÎNEMENT (avec analyse fractionné)
+# ONGLET 2 — ANALYSE ENTRAÎNEMENT
 # ══════════════════════════════════════════════════════════════
 with main_tabs[2]:
     st.title("⚙️  Analyse d'entraînement")
-    st.markdown("""
-Chargez une activité (sortie longue, fartlek, tempo...) pour analyser la **dérive cardiaque**,
-la **cinétique de vitesse** et la **qualité de l'effort**.
-Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
-""")
+    st.markdown("Chargez une activité pour analyser la **dérive cardiaque**, la **cinétique de vitesse** et la **qualité de l'effort**.")
 
     if not HAS_FITDECODE:
         st.warning("⚠️ `fitdecode` non installé — `pip install fitdecode`")
@@ -3075,16 +2791,12 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
         col_o1,col_o2 = st.columns(2)
         with col_o1:
             hr_smooth_win = st.slider("Lissage FC (fenêtre points)", 3, 61, 15, 2)
-            # ── Début d'analyse au format hh:mm:ss ──
-            trim_start_hms = hms_input("Écarter début (hh:mm:ss)", "0:00:00",
-                                        key="trim_start_hms",
+            trim_start_hms = hms_input("Écarter début (hh:mm:ss)", "0:00:00", key="trim_start_hms",
                                         help="Ignorer les N premières minutes (chauffe)")
             trim_start_s = float(hms_to_seconds(trim_start_hms))
         with col_o2:
             show_speed = st.checkbox("Afficher la cinétique de vitesse", value=True)
-            # ── Fin d'analyse au format hh:mm:ss ──
-            trim_end_hms = hms_input("Écarter fin (hh:mm:ss)", "0:00:00",
-                                      key="trim_end_hms",
+            trim_end_hms = hms_input("Écarter fin (hh:mm:ss)", "0:00:00", key="trim_end_hms",
                                       help="Ignorer les N dernières minutes (récup)")
             trim_end_s = float(hms_to_seconds(trim_end_hms))
 
@@ -3096,9 +2808,7 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
             st.error("Impossible de lire ce fichier.")
         else:
             t_max_raw = float(df_entr_raw["elapsed_s"].max())
-            # Durée totale affichée pour aider l'utilisateur
-            st.info(f"⏱ Durée totale de l'activité : **{seconds_to_hms(t_max_raw)}** "
-                    f"({t_max_raw/60:.1f} min) — utilisez ce repère pour vos plages de temps.")
+            st.info(f"⏱ Durée totale : **{seconds_to_hms(t_max_raw)}** ({t_max_raw/60:.1f} min)")
 
             t_start = trim_start_s
             t_end   = t_max_raw - trim_end_s
@@ -3109,7 +2819,7 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
                 df_entr = df_entr_raw.copy()
 
             if df_entr.empty:
-                st.error("Après troncature, il ne reste plus de données. Réduisez les marges.")
+                st.error("Après troncature, aucune donnée. Réduisez les marges.")
             else:
                 dur_s  = float(df_entr["elapsed_s"].max())
                 if df_entr["distance_m"].notna().any():
@@ -3128,7 +2838,6 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
                 mg3.metric("Vitesse moy.", f"{v_avg:.2f} m/s" if v_avg else "—")
                 mg4.metric("Allure moy.", pace_str(1000.0/v_avg)+"/km" if v_avg else "—")
 
-                # ── Analyse FC globale ──
                 hr_stats = analyze_heart_rate(df_entr)
                 st.subheader("💓 Analyse de la fréquence cardiaque")
                 if not hr_stats.get("available"):
@@ -3151,11 +2860,11 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
                                color="#d62728", alpha=0.2, lw=1, label="FC brute")
                     ax_hr.plot(df_entr["elapsed_s"]/60.0, hr_s,
                                color="#d62728", lw=2, label="FC lissée")
-                    n = len(df_entr)
-                    q1_t = df_entr["elapsed_s"].iloc[int(n*0.25)]/60.0
-                    q3_t = df_entr["elapsed_s"].iloc[int(n*0.75)]/60.0
-                    fc_q1_mean = float(df_entr["heart_rate"].iloc[:int(n*0.25)].mean())
-                    fc_q3_mean = float(df_entr["heart_rate"].iloc[int(n*0.75):].mean())
+                    n_e = len(df_entr)
+                    q1_t = df_entr["elapsed_s"].iloc[int(n_e*0.25)]/60.0
+                    q3_t = df_entr["elapsed_s"].iloc[int(n_e*0.75)]/60.0
+                    fc_q1_mean = float(df_entr["heart_rate"].iloc[:int(n_e*0.25)].mean())
+                    fc_q3_mean = float(df_entr["heart_rate"].iloc[int(n_e*0.75):].mean())
                     ax_hr.axvline(q1_t, color="steelblue", lw=1, ls="--", alpha=0.7)
                     ax_hr.axvline(q3_t, color="steelblue", lw=1, ls="--", alpha=0.7)
                     ax_hr.axhline(fc_q1_mean, color="green",  lw=1, ls=":", alpha=0.8, label=f"Moy Q1 {fc_q1_mean:.0f}")
@@ -3165,24 +2874,20 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
                     st.pyplot(fig_hr); plt.close(fig_hr)
 
                     drift = hr_stats["drift_abs"]
-                    if drift < 5:
-                        st.success(f"✅ Dérive faible (+{drift:.1f} bpm).")
-                    elif drift < 12:
-                        st.warning(f"⚠️ Dérive modérée (+{drift:.1f} bpm).")
-                    else:
-                        st.error(f"❌ Dérive élevée (+{drift:.1f} bpm).")
+                    if drift < 5:    st.success(f"✅ Dérive faible (+{drift:.1f} bpm).")
+                    elif drift < 12: st.warning(f"⚠️ Dérive modérée (+{drift:.1f} bpm).")
+                    else:            st.error(f"❌ Dérive élevée (+{drift:.1f} bpm).")
 
-                # ── Cinétique de vitesse ──
                 if show_speed:
                     st.subheader("🏃 Cinétique de vitesse")
                     spd_stats = analyze_speed_kinetics(df_entr)
                     if not spd_stats.get("available"):
                         st.info("Données de vitesse non disponibles.")
                     else:
-                        sv1,sv2,sv3 = st.columns(3)
-                        sv1.metric("Vitesse moy.",  f"{spd_stats['speed_avg_ms']:.2f} m/s")
-                        sv2.metric("Vitesse max (P95)", f"{spd_stats['speed_max_ms']:.2f} m/s")
-                        sv3.metric("Corrélation dérive", f"r = {spd_stats['r_value']:.3f}")
+                        sv1_e,sv2_e,sv3_e = st.columns(3)
+                        sv1_e.metric("Vitesse moy.",       f"{spd_stats['speed_avg_ms']:.2f} m/s")
+                        sv2_e.metric("Vitesse max (P95)",  f"{spd_stats['speed_max_ms']:.2f} m/s")
+                        sv3_e.metric("Corrélation dérive", f"r = {spd_stats['r_value']:.3f}")
                         spd_s = df_entr["speed_ms"].rolling(int(hr_smooth_win), center=True, min_periods=1).mean()
                         fig_spd, ax_spd = plt.subplots(figsize=(11,3))
                         ax_spd.plot(df_entr["elapsed_s"]/60.0, df_entr["speed_ms"],
@@ -3195,23 +2900,14 @@ Utilisez l'**analyse fractionné** pour isoler et comparer chaque répétition.
                             sl, ic_r, _, _, _ = sp_stats.linregress(x_arr, v_arr)
                             trend_line = sl * x_arr + ic_r
                             ax_spd.plot(x_arr/60.0, trend_line, color="red", lw=1.5, ls="--",
-                                        label=f"Tendance (pente={sl*60:.4f} m/s/min)")
+                                        label=f"Tendance ({sl*60:.4f} m/s/min)")
                         ax_spd.set_xlabel("Temps (min)"); ax_spd.set_ylabel("Vitesse (m/s)")
                         ax_spd.set_title("Profil de vitesse"); ax_spd.legend(fontsize=8); ax_spd.grid(alpha=0.3)
                         st.pyplot(fig_spd); plt.close(fig_spd)
 
-                # ══════════════════════════════════════════════════════════
-                # ANALYSE FRACTIONNÉ (nouveau bloc)
-                # ══════════════════════════════════════════════════════════
                 st.markdown("---")
                 st.subheader("🔁 Analyse des intervalles (fractionné)")
-                st.markdown("""
-Définissez jusqu'à **6 intervalles** en saisissant les bornes de début et fin au format **hh:mm:ss**,
-relatifs au **début de l'activité** (après troncature éventuelle).
-Chaque intervalle est analysé indépendamment : FC, vitesse, dérive, allure.
-""")
-                # Repère visuel de durée
-                st.caption(f"🕐 Durée disponible après troncature : **{seconds_to_hms(dur_s)}**")
+                st.caption(f"🕐 Durée disponible : **{seconds_to_hms(dur_s)}**")
 
                 if "n_intervals" not in st.session_state:
                     st.session_state["n_intervals"] = 3
@@ -3231,20 +2927,15 @@ Chaque intervalle est analysé indépendamment : FC, vitesse, dérive, allure.
                         with col_n:
                             iv_name = st.text_input("Nom", value=f"Rép. {iv+1}", key=f"iv_name_{iv}")
                         with col_s:
-                            iv_start = hms_input("Début (hh:mm:ss)", "0:00:00",
-                                                  key=f"iv_start_{iv}",
-                                                  help="Temps relatif depuis le début de l'activité")
+                            iv_start = hms_input("Début (hh:mm:ss)", "0:00:00", key=f"iv_start_{iv}")
                         with col_e:
-                            iv_end = hms_input("Fin (hh:mm:ss)", "0:05:00",
-                                                key=f"iv_end_{iv}",
-                                                help="Temps relatif depuis le début de l'activité")
-                        # Validation rapide
+                            iv_end = hms_input("Fin (hh:mm:ss)", "0:05:00", key=f"iv_end_{iv}")
                         s_s = hms_to_seconds(iv_start)
                         e_s = hms_to_seconds(iv_end)
                         if e_s <= s_s:
                             st.warning("⚠️ La fin doit être postérieure au début.")
                         elif e_s > dur_s:
-                            st.warning(f"⚠️ La fin ({iv_end}) dépasse la durée analysée ({seconds_to_hms(dur_s)}).")
+                            st.warning(f"⚠️ La fin ({iv_end}) dépasse la durée ({seconds_to_hms(dur_s)}).")
                         interval_defs.append({"name": iv_name, "start": iv_start, "end": iv_end})
 
                 if st.button("🔍 Analyser les intervalles", type="primary", key="btn_analyze_intervals"):
@@ -3258,17 +2949,13 @@ Chaque intervalle est analysé indépendamment : FC, vitesse, dérive, allure.
                 if "interval_results" in st.session_state:
                     results_intervals = st.session_state["interval_results"]
                     valid_ivs = [r for r in results_intervals if r.get("valid")]
-
                     if not valid_ivs:
                         st.error("Aucun intervalle valide. Vérifiez les bornes.")
                     else:
-                        st.subheader(f"📈 Résultats — {len(valid_ivs)} intervalles analysés")
-
-                        # ── Tableau récapitulatif ──
+                        st.subheader(f"📈 Résultats — {len(valid_ivs)} intervalles")
                         recap_rows = []
                         for r in valid_ivs:
-                            hr = r["hr"]
-                            spd = r["spd"]
+                            hr = r["hr"]; spd = r["spd"]
                             recap_rows.append({
                                 "Intervalle": r["name"],
                                 "Durée": seconds_to_hms(r["dur_s"]),
@@ -3279,114 +2966,87 @@ Chaque intervalle est analysé indépendamment : FC, vitesse, dérive, allure.
                                 "Dérive FC": f"+{hr['drift_abs']:.1f} bpm" if hr.get("available") else "—",
                                 "Fiabilité FC": hr.get("reliability","—") if hr.get("available") else "—",
                             })
-                        df_recap = pd.DataFrame(recap_rows)
-                        st.dataframe(df_recap, use_container_width=True)
+                        st.dataframe(pd.DataFrame(recap_rows), use_container_width=True)
 
-                        # ── Graphiques FC superposés ──
                         has_hr_data = any(r["hr"].get("available") for r in valid_ivs)
+                        colors_list = ["#d62728","#1f77b4","#2ca02c","#ff7f0e","#9467bd","#8c564b"]
                         if has_hr_data:
                             st.subheader("💓 Profils FC superposés")
                             fig_comp, ax_comp = plt.subplots(figsize=(11, 4))
-                            colors_list = ["#d62728","#1f77b4","#2ca02c","#ff7f0e","#9467bd","#8c564b"]
                             for idx_r, r in enumerate(valid_ivs):
                                 df_iv = r["df"]
-                                if "heart_rate" not in df_iv.columns or not df_iv["heart_rate"].notna().any():
-                                    continue
+                                if "heart_rate" not in df_iv.columns or not df_iv["heart_rate"].notna().any(): continue
                                 hr_sv = smooth_hr(df_iv["heart_rate"].ffill(), window=15)
-                                col_iv = colors_list[idx_r % len(colors_list)]
-                                ax_comp.plot(df_iv["elapsed_s"]/60.0, hr_sv,
-                                             lw=2, color=col_iv, label=r["name"])
-                            ax_comp.set_xlabel("Temps depuis début de l'intervalle (min)")
-                            ax_comp.set_ylabel("FC (bpm)")
+                                ax_comp.plot(df_iv["elapsed_s"]/60.0, hr_sv, lw=2,
+                                             color=colors_list[idx_r % len(colors_list)], label=r["name"])
+                            ax_comp.set_xlabel("Temps (min)"); ax_comp.set_ylabel("FC (bpm)")
                             ax_comp.set_title("Comparaison FC — intervalles superposés")
                             ax_comp.legend(); ax_comp.grid(alpha=0.3)
                             st.pyplot(fig_comp); plt.close(fig_comp)
 
-                        # ── Graphiques vitesse superposés ──
                         has_spd_data = any(r["spd"].get("available") for r in valid_ivs)
                         if has_spd_data and show_speed:
                             st.subheader("🏃 Profils de vitesse superposés")
                             fig_spd2, ax_spd2 = plt.subplots(figsize=(11, 4))
                             for idx_r, r in enumerate(valid_ivs):
                                 df_iv = r["df"]
-                                if "speed_ms" not in df_iv.columns or not df_iv["speed_ms"].notna().any():
-                                    continue
+                                if "speed_ms" not in df_iv.columns or not df_iv["speed_ms"].notna().any(): continue
                                 spd_sv = df_iv["speed_ms"].rolling(15, center=True, min_periods=1).mean()
-                                col_iv = colors_list[idx_r % len(colors_list)]
-                                ax_spd2.plot(df_iv["elapsed_s"]/60.0, spd_sv,
-                                             lw=2, color=col_iv, label=r["name"])
-                            ax_spd2.set_xlabel("Temps depuis début de l'intervalle (min)")
-                            ax_spd2.set_ylabel("Vitesse (m/s)")
+                                ax_spd2.plot(df_iv["elapsed_s"]/60.0, spd_sv, lw=2,
+                                             color=colors_list[idx_r % len(colors_list)], label=r["name"])
+                            ax_spd2.set_xlabel("Temps (min)"); ax_spd2.set_ylabel("Vitesse (m/s)")
                             ax_spd2.set_title("Comparaison vitesse — intervalles superposés")
                             ax_spd2.legend(); ax_spd2.grid(alpha=0.3)
                             st.pyplot(fig_spd2); plt.close(fig_spd2)
 
-                        # ── Évolution des métriques clés d'un intervalle à l'autre ──
                         if len(valid_ivs) >= 2:
                             st.subheader("📉 Évolution inter-répétitions")
                             fig_ev, axes_ev = plt.subplots(1, 2, figsize=(12, 4))
                             iv_labels = [r["name"] for r in valid_ivs]
-                            # Allures
                             allures = [1000.0/r["avg_speed"] if r["avg_speed"] else None for r in valid_ivs]
                             allures_valid = [a for a in allures if a is not None]
                             if allures_valid:
-                                axes_ev[0].plot(range(len(iv_labels)), allures, "o-",
-                                                color="#1f77b4", lw=2, ms=7)
+                                axes_ev[0].plot(range(len(iv_labels)), allures, "o-", color="#1f77b4", lw=2, ms=7)
                                 axes_ev[0].set_xticks(range(len(iv_labels))); axes_ev[0].set_xticklabels(iv_labels, rotation=20)
-                                axes_ev[0].set_ylabel("Allure (s/km)")
-                                axes_ev[0].set_title("Allure moyenne par répétition")
+                                axes_ev[0].set_ylabel("Allure (s/km)"); axes_ev[0].set_title("Allure par répétition")
                                 axes_ev[0].invert_yaxis(); axes_ev[0].grid(alpha=0.3)
-                            # FC moyenne
                             fc_avgs = [r["hr"]["fc_avg"] if r["hr"].get("available") else None for r in valid_ivs]
                             fc_avgs_valid = [f for f in fc_avgs if f is not None]
                             if fc_avgs_valid:
-                                axes_ev[1].plot(range(len(iv_labels)), fc_avgs, "o-",
-                                                color="#d62728", lw=2, ms=7)
+                                axes_ev[1].plot(range(len(iv_labels)), fc_avgs, "o-", color="#d62728", lw=2, ms=7)
                                 axes_ev[1].set_xticks(range(len(iv_labels))); axes_ev[1].set_xticklabels(iv_labels, rotation=20)
-                                axes_ev[1].set_ylabel("FC moyenne (bpm)")
-                                axes_ev[1].set_title("FC moyenne par répétition")
+                                axes_ev[1].set_ylabel("FC moyenne (bpm)"); axes_ev[1].set_title("FC par répétition")
                                 axes_ev[1].grid(alpha=0.3)
-                            fig_ev.tight_layout()
-                            st.pyplot(fig_ev); plt.close(fig_ev)
+                            fig_ev.tight_layout(); st.pyplot(fig_ev); plt.close(fig_ev)
 
-                            # Interprétation automatique
                             if allures_valid and len(allures_valid) >= 2:
                                 trend_allure = allures_valid[-1] - allures_valid[0]
                                 if trend_allure > 15:
-                                    st.warning(f"⚠️ Dégradation d'allure : +{trend_allure:.0f} s/km entre la 1ère et la dernière répétition — fatigue progressive ou dosage excessif.")
+                                    st.warning(f"⚠️ Dégradation d'allure : +{trend_allure:.0f} s/km — fatigue ou dosage excessif.")
                                 elif trend_allure < -5:
-                                    st.success(f"✅ Accélération inter-répétitions : {abs(trend_allure):.0f} s/km de gain — bonne montée en puissance.")
+                                    st.success(f"✅ Accélération : {abs(trend_allure):.0f} s/km de gain.")
                                 else:
-                                    st.success("✅ Allure stable entre les répétitions — excellent contrôle de l'effort.")
-
+                                    st.success("✅ Allure stable — excellent contrôle de l'effort.")
                             if fc_avgs_valid and len(fc_avgs_valid) >= 2:
                                 trend_fc = fc_avgs_valid[-1] - fc_avgs_valid[0]
                                 if trend_fc > 8:
-                                    st.warning(f"⚠️ Dérive de FC inter-répétitions : +{trend_fc:.0f} bpm — accumulation de fatigue cardiovasculaire.")
+                                    st.warning(f"⚠️ Dérive FC inter-répétitions : +{trend_fc:.0f} bpm.")
                                 else:
-                                    st.success(f"✅ FC stable entre les répétitions (+{trend_fc:.1f} bpm) — récupération bien gérée.")
+                                    st.success(f"✅ FC stable entre répétitions (+{trend_fc:.1f} bpm).")
 
-                # ── Recalibration météo ──
                 with st.expander("🌡️ Recalibration conditions météo (simplifié)"):
-                    st.caption("Estime l'équivalent performance dans des conditions idéales.")
                     entr_t  = st.number_input("Température réelle (°C)", value=18.0, step=0.5, key="entr_t")
                     entr_h  = st.number_input("Humidité réelle (%)", value=65.0, step=5.0, key="entr_h")
                     entr_wbgt = wbgt_simplified(entr_t, entr_h)
-                    entr_mult = temp_multiplier(entr_wbgt, sb_opt_temp,
-                                                sb_k_temp_cold, sb_k_temp_hot, 0.10)
-                    st.markdown(f"**WBGT calculé :** {entr_wbgt:.1f}°C | "
-                                f"**Multiplicateur thermique :** {entr_mult:.3f} | "
-                                f"**Pénalité :** +{(entr_mult-1)*100:.1f}%")
+                    entr_mult = temp_multiplier(entr_wbgt, sb_opt_temp, sb_k_temp_cold, sb_k_temp_hot, 0.10)
+                    st.markdown(f"**WBGT :** {entr_wbgt:.1f}°C | **Mult. thermique :** {entr_mult:.3f} | **Pénalité :** +{(entr_mult-1)*100:.1f}%")
                     if dist_m and dur_s > 0:
                         dur_ideal_s = dur_s / entr_mult
                         entr_pace   = 1000.0 / (dist_m / dur_s)
                         ideal_pace  = 1000.0 / (dist_m / dur_ideal_s)
                         col_entr1, col_entr2 = st.columns(2)
-                        col_entr1.metric("Temps réel",   seconds_to_hms(dur_s),
-                                          delta=f"Allure {pace_str(entr_pace)}/km")
-                        col_entr2.metric("Équivalent conditions idéales", seconds_to_hms(dur_ideal_s),
-                                          delta=f"Allure {pace_str(ideal_pace)}/km")
-
+                        col_entr1.metric("Temps réel",   seconds_to_hms(dur_s),      delta=f"Allure {pace_str(entr_pace)}/km")
+                        col_entr2.metric("Équivalent idéal", seconds_to_hms(dur_ideal_s), delta=f"Allure {pace_str(ideal_pace)}/km")
     else:
         st.info("⬆️ Chargez une activité pour commencer l'analyse.")
         st.markdown("""
