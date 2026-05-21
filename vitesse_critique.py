@@ -907,22 +907,26 @@ def analyze_interval(df_int,name):
 # ██████████████████████████████████████████████████████████████
 # ══════════════════════════════════════════════════════════════
 
-def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000):
+def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000, is_trail=True):
     """
-    Analyse le tracé GPX km par km.
-    Retourne pour chaque segment :
-      - sinuosité (ratio dist_réelle / dist_euclidienne à vol d'oiseau)
-      - changements de direction cumulés (°/km) → lacets
-      - pente max absolue + écart-type → terrain irrégulier
-      - tech_score [0-1] = 0.30*norm_sinu + 0.30*norm_grade + 0.25*norm_std + 0.15*norm_dir
-      - label 🟢/🟡/🟠/🔴
-      - multiplicateurs suggérés : k_up_adj, k_down_adj, surface_adj
-    """
-    n = len(points)
-    if n < 10:
-        return [], {"global_score": 0, "label": "Inconnu",
-                    "k_up_adj": 1.0, "k_down_adj": 1.0, "surface_mult_adj": 1.0}
+    Analyse le tracé GPX km par km — VERSION CORRIGÉE v6.1
 
+    Corrections :
+    - Virages < 45° ignorés (ne contribuent pas — route normale)
+    - Virages 45–90° : contribution réduite (×0.3)
+    - Virages > 90° (lacets réels) : contribution pleine
+    - Bonus ×1.5 si pente > 15% ET virage > 90° simultanément
+    - Seuil "technique" relevé à 0.45 (évite faux positifs sur route)
+    - En mode Route (is_trail=False) : retourne toujours score 0, pas d'analyse
+    - Surface : seules les pentes > 10% et l'irrégularité comptent vraiment
+
+    Retourne segments, global_info
+    """
+    if not is_trail or len(points) < 10:
+        return [], {"global_score": 0, "label": "—", "k_up_adj": 1.0,
+                    "k_down_adj": 1.0, "surface_mult_adj": 1.0, "skipped": True}
+
+    n = len(points)
     if dem_elevations is not None and len(dem_elevations) == n:
         elevs = [dem_elevations[i] if dem_elevations[i] is not None else 0.0 for i in range(n)]
     else:
@@ -949,26 +953,38 @@ def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000):
         elev_seg = [elevs[i]  for i in idx_seg]
         dist_seg = [cum[i] - d_start for i in idx_seg]
 
-        # Sinuosité
+        # ── Sinuosité ──────────────────────────────────────────
         d_gps  = dist_seg[-1]
         d_eucl = haversine_m(pts_seg[0].latitude,  pts_seg[0].longitude,
                              pts_seg[-1].latitude, pts_seg[-1].longitude)
         sinuosity = d_gps / max(1.0, d_eucl)
 
-        # Changements de direction cumulés
+        # ── Changements de direction — CORRIGÉS ───────────────
+        # Seulement les vrais lacets (> 45°), avec pondération par angle
         bearings = []
         for i in range(1, len(pts_seg)):
-            b = bearing_deg(pts_seg[i-1].latitude, pts_seg[i-1].longitude,
-                            pts_seg[i].latitude,   pts_seg[i].longitude)
-            bearings.append(b)
-        dir_changes = 0.0
+            dd = dist_seg[i] - dist_seg[i-1]
+            if dd > 2.0:  # ignorer points trop proches (bruit GPS)
+                b = bearing_deg(pts_seg[i-1].latitude, pts_seg[i-1].longitude,
+                                pts_seg[i].latitude,   pts_seg[i].longitude)
+                bearings.append(b)
+
+        real_turns_score = 0.0  # score pondéré des vrais virages
         if len(bearings) >= 2:
             for i in range(1, len(bearings)):
                 delta = abs((bearings[i] - bearings[i-1] + 180) % 360 - 180)
-                dir_changes += delta
-        dir_change_per_km = dir_changes / max(0.001, d_gps / 1000.0)
+                if delta < 45:
+                    pass  # route normale, ignoré
+                elif delta < 90:
+                    real_turns_score += delta * 0.30   # virage modéré
+                elif delta < 135:
+                    real_turns_score += delta * 0.80   # lacet serré
+                else:
+                    real_turns_score += delta * 1.20   # épingle à cheveux
 
-        # Pentes
+        real_turns_per_km = real_turns_score / max(0.001, d_gps / 1000.0)
+
+        # ── Pentes ─────────────────────────────────────────────
         grades = []
         for i in range(1, len(pts_seg)):
             dd = dist_seg[i] - dist_seg[i-1]
@@ -976,70 +992,95 @@ def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000):
                 grades.append((elev_seg[i] - elev_seg[i-1]) / dd * 100.0)
         if not grades:
             grades = [0.0]
-        grade_max  = float(np.max(np.abs(grades)))
+
+        grade_abs  = [abs(g) for g in grades]
+        grade_max  = float(np.max(grade_abs))
         grade_std  = float(np.std(grades))
         grade_mean = float(np.mean(grades))
 
-        # Score technique
-        norm_sinu  = min(1.0, (sinuosity - 1.0) / 0.40)
-        norm_grade = min(1.0, grade_max / 30.0)
-        norm_std   = min(1.0, grade_std / 15.0)
-        norm_dir   = min(1.0, dir_change_per_km / 1800.0)
-        tech_score = (0.30 * norm_sinu + 0.30 * norm_grade +
-                      0.25 * norm_std  + 0.15 * norm_dir)
+        # Seules les pentes > 10% sont vraiment pénalisantes pour la technicité
+        steep_grades = [g for g in grade_abs if g > 10.0]
+        steep_ratio  = len(steep_grades) / max(1, len(grade_abs))  # fraction de pentes raides
 
+        # ── Score technique CORRIGÉ ────────────────────────────
+        # Normalisation empirique ajustée pour éviter faux positifs route
+        norm_sinu  = min(1.0, max(0.0, (sinuosity - 1.05) / 0.35))   # commence à 1.05 (pas 1.0)
+        norm_turns = min(1.0, real_turns_per_km / 900.0)              # 900°/km = lacets serrés réels
+        norm_grade = min(1.0, grade_max / 35.0)                       # 35% = pente extrême trail
+        norm_steep = min(1.0, steep_ratio / 0.40)                     # 40% des pts > 10% = très raide
+        norm_std   = min(1.0, grade_std / 12.0)                       # 12% std = très irrégulier
+
+        # Bonus synergique : lacet + forte pente simultanément = vraiment technique
+        synergy_bonus = 0.0
+        if grade_max > 15.0 and real_turns_per_km > 300.0:
+            synergy_bonus = 0.10  # bonus si vrai lacet en côte raide
+
+        tech_score = (
+            0.20 * norm_sinu   +
+            0.30 * norm_turns  +  # virages corrigés (poids principal)
+            0.20 * norm_grade  +
+            0.15 * norm_steep  +
+            0.15 * norm_std    +
+            synergy_bonus
+        )
+        tech_score = min(1.0, tech_score)
+
+        # Seuil relevé : < 0.30 = non technique (évite faux positifs route)
         if tech_score < 0.25:   label = "🟢 Facile"
-        elif tech_score < 0.50: label = "🟡 Modéré"
-        elif tech_score < 0.75: label = "🟠 Technique"
+        elif tech_score < 0.45: label = "🟡 Modéré"
+        elif tech_score < 0.70: label = "🟠 Technique"
         else:                   label = "🔴 Très technique"
 
-        k_up_adj_seg   = 1.0 + 0.35 * tech_score
-        k_down_adj_seg = 1.0 - 0.20 * tech_score
-        surf_adj_seg   = 1.0 + 0.15 * tech_score
+        # Multiplicateurs suggestions — conservateurs
+        k_up_adj_seg   = 1.0 + 0.30 * max(0, tech_score - 0.25)  # actif seulement si > Facile
+        k_down_adj_seg = 1.0 - 0.15 * max(0, tech_score - 0.25)
+        surf_adj_seg   = 1.0 + 0.12 * max(0, tech_score - 0.25)
 
         segments.append({
-            "km_start":      round(d_start / 1000.0, 1),
-            "km_end":        round(d_end   / 1000.0, 1),
-            "sinuosity":     round(sinuosity, 3),
-            "dir_change_km": round(dir_change_per_km, 0),
-            "grade_max":     round(grade_max, 1),
-            "grade_std":     round(grade_std, 1),
-            "grade_mean":    round(grade_mean, 1),
-            "tech_score":    round(tech_score, 3),
-            "label":         label,
-            "k_up_adj":      round(k_up_adj_seg, 3),
-            "k_down_adj":    round(k_down_adj_seg, 3),
-            "surface_adj":   round(surf_adj_seg, 3),
+            "km_start":       round(d_start / 1000.0, 1),
+            "km_end":         round(d_end   / 1000.0, 1),
+            "sinuosity":      round(sinuosity, 3),
+            "turns_score_km": round(real_turns_per_km, 0),
+            "grade_max":      round(grade_max, 1),
+            "grade_std":      round(grade_std, 1),
+            "grade_mean":     round(grade_mean, 1),
+            "steep_ratio":    round(steep_ratio, 2),
+            "tech_score":     round(tech_score, 3),
+            "label":          label,
+            "k_up_adj":       round(k_up_adj_seg, 3),
+            "k_down_adj":     round(k_down_adj_seg, 3),
+            "surface_adj":    round(surf_adj_seg, 3),
         })
 
     if not segments:
-        return [], {"global_score": 0, "label": "Inconnu",
-                    "k_up_adj": 1.0, "k_down_adj": 1.0, "surface_mult_adj": 1.0}
+        return [], {"global_score": 0, "label": "—", "k_up_adj": 1.0,
+                    "k_down_adj": 1.0, "surface_mult_adj": 1.0}
 
-    global_score  = float(np.mean([s["tech_score"] for s in segments]))
-    max_score     = float(np.max([s["tech_score"] for s in segments]))
-    weighted_score = 0.60 * global_score + 0.40 * max_score
+    global_score   = float(np.mean([s["tech_score"] for s in segments]))
+    max_score      = float(np.max([s["tech_score"] for s in segments]))
+    weighted_score = 0.65 * global_score + 0.35 * max_score  # passage dur compte moins
 
-    if weighted_score < 0.25:   global_label = "🟢 Terrain facile"
-    elif weighted_score < 0.45: global_label = "🟡 Trail modéré"
-    elif weighted_score < 0.65: global_label = "🟠 Trail technique"
+    if weighted_score < 0.25:   global_label = "🟢 Terrain facile / Non technique"
+    elif weighted_score < 0.42: global_label = "🟡 Trail modéré — quelques passages techniques"
+    elif weighted_score < 0.62: global_label = "🟠 Trail technique — rochers, lacets, pentes"
     else:                       global_label = "🔴 Ultra-trail très technique"
 
-    k_up_global   = float(np.median([s["k_up_adj"]   for s in segments]))
-    k_down_global = float(np.median([s["k_down_adj"]  for s in segments]))
-    surf_global   = float(np.median([s["surface_adj"] for s in segments]))
+    k_up_g   = float(np.median([s["k_up_adj"]   for s in segments]))
+    k_down_g = float(np.median([s["k_down_adj"]  for s in segments]))
+    surf_g   = float(np.median([s["surface_adj"] for s in segments]))
 
     global_info = {
         "global_score":      round(weighted_score, 3),
         "label":             global_label,
-        "k_up_adj":          round(k_up_global, 3),
-        "k_down_adj":        round(k_down_global, 3),
-        "surface_mult_adj":  round(surf_global, 3),
-        "pct_technique":     round(sum(1 for s in segments if s["tech_score"] > 0.5) / len(segments) * 100, 1),
+        "k_up_adj":          round(k_up_g, 3),
+        "k_down_adj":        round(k_down_g, 3),
+        "surface_mult_adj":  round(surf_g, 3),
+        "pct_technique":     round(sum(1 for s in segments if s["tech_score"] > 0.45) / len(segments) * 100, 1),
         "sinuosity_mean":    round(float(np.mean([s["sinuosity"] for s in segments])), 3),
         "grade_max_all":     round(float(np.max([s["grade_max"] for s in segments])), 1),
     }
     return segments, global_info
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1132,128 +1173,211 @@ out body geom;"""
 # ══════════════════════════════════════════════════════════════
 
 def generate_pydeck_terrain(points, cum_d_map, checkpoints, df_prediction=None,
-                             tech_segments=None, dem_elevations=None):
+                             tech_segments=None, dem_elevations=None,
+                             osm_surface_data=None,
+                             active_layers=None):
     """
-    Vue 3D relief réel via pydeck TerrainLayer.
-    Tuiles ArcGIS World Elevation 3D (gratuites, sans clé, sans compte).
-    Colorise le tracé par altitude ou allure prédite si disponible.
-    Zones techniques marquées en surbrillance.
+    Vue 3D relief réel via pydeck TerrainLayer (ArcGIS, gratuit, sans clé).
+    Couches activables : relief, surfaces_osm, zones_techniques, allure_predite, checkpoints_layer.
+    Le tracé suit le VRAI relief 3D, pas à plat.
     """
+    if active_layers is None:
+        active_layers = {"relief": True, "surfaces_osm": False,
+                         "zones_techniques": True, "allure_predite": False, "checkpoints_layer": True}
+
     n_pts = len(points)
     step  = max(1, n_pts // 600)
-    lats_a = [points[i].latitude  for i in range(0, n_pts, step)]
-    lons_a = [points[i].longitude for i in range(0, n_pts, step)]
-    dist_a = [cum_d_map[i] / 1000.0 for i in range(0, n_pts, step)]
+    lats_a  = [points[i].latitude  for i in range(0, n_pts, step)]
+    lons_a  = [points[i].longitude for i in range(0, n_pts, step)]
+    dist_a  = [cum_d_map[i] / 1000.0 for i in range(0, n_pts, step)]
+    n_sub   = len(lats_a)
+
     if dem_elevations is not None and len(dem_elevations) == n_pts:
         elevs_a = [dem_elevations[i] if dem_elevations[i] is not None else 0.0
                    for i in range(0, n_pts, step)]
     else:
         elevs_a = [getattr(points[i], "elevation", 0.0) or 0.0
                    for i in range(0, n_pts, step)]
-    center_lat = float(np.mean(lats_a)); center_lon = float(np.mean(lons_a))
-    elev_min = min(elevs_a); elev_max = max(elevs_a)
 
-    def elev_to_color(e):
+    center_lat = float(np.mean(lats_a))
+    center_lon = float(np.mean(lons_a))
+    elev_min   = min(elevs_a)
+    elev_max   = max(elevs_a)
+    span_km    = haversine_m(min(lats_a), min(lons_a), max(lats_a), max(lons_a)) / 1000.0
+    zoom_level = max(10.5, min(13.5, 14.5 - math.log2(max(1, span_km))))
+
+    # ── Palette altitude (bleu→vert→orange→rouge) ──────────────
+    def alt_color(e, alpha=220):
         t = (e - elev_min) / max(1.0, elev_max - elev_min)
         if t < 0.33:
-            r, g, b = int(30 + t*3*120), int(144 + t*3*60), int(255 - t*3*100)
+            tt = t / 0.33
+            r, g, b = int(20 + tt*80), int(100 + tt*120), int(255 - tt*80)
         elif t < 0.66:
-            tt = (t - 0.33) * 3
-            r, g, b = int(150 + tt*99), int(204 - tt*84), int(155 - tt*100)
+            tt = (t - 0.33) / 0.33
+            r, g, b = int(100 + tt*140), int(220 - tt*60), int(175 - tt*120)
         else:
-            tt = (t - 0.66) * 3
-            r, g, b = int(249), int(120 - tt*80), int(55 - tt*40)
-        return [r, g, b, 220]
+            tt = (t - 0.66) / 0.34
+            r, g, b = int(240), int(160 - tt*120), int(55 - tt*40)
+        return [r, g, b, alpha]
 
-    # Couleur par allure prédite si disponible
-    pace_colors = {}
+    # ── Couleurs allure prédite ─────────────────────────────────
+    def pace_to_secs(p):
+        try: parts = str(p).split(":"); return int(parts[0])*60+int(parts[1])
+        except: return 0
+
+    pace_by_km = {}
     if df_prediction is not None and not df_prediction.empty and "Allure (min/km)" in df_prediction.columns:
-        def pace_to_secs(p):
-            try: parts = str(p).split(":"); return int(parts[0])*60+int(parts[1])
-            except: return 0
-        paces = [pace_to_secs(p) for p in df_prediction["Allure (min/km)"].values if pace_to_secs(p)>0]
-        if paces:
-            p_min, p_max = min(paces), max(paces)
+        paces_all = [pace_to_secs(p) for p in df_prediction["Allure (min/km)"].values if pace_to_secs(p)>0]
+        if paces_all:
+            p_min, p_max = min(paces_all), max(paces_all)
             for km_idx, row in df_prediction.iterrows():
                 ps = pace_to_secs(row["Allure (min/km)"])
                 if ps > 0:
                     t = (ps - p_min) / max(1.0, p_max - p_min)
-                    pace_colors[km_idx] = [int(30+t*220), int(200-t*160), int(80-t*60), 230]
+                    pace_by_km[km_idx] = [int(30+t*219), int(200-t*160), int(80-t*60), 230]
 
-    # Segments de tracé colorés
-    seg_len = max(1, len(lats_a) // 40)
+    # ── Couleurs surface OSM ─────────────────────────────────────
+    SURFACE_COLORS = {
+        "asphalt": [120,120,120,200], "paved": [140,140,140,200], "concrete": [160,160,160,200],
+        "compacted": [200,170,100,200], "gravel": [180,140,80,200], "fine_gravel": [190,155,90,200],
+        "unpaved": [160,120,60,200], "ground": [139,90,43,200], "dirt": [130,80,30,200],
+        "grass": [60,160,60,200], "rock": [100,100,80,200], "rocks": [110,105,85,200],
+        "mud": [80,50,20,200], "sand": [220,200,100,200],
+        "snow": [220,235,255,200], "ice": [180,220,255,200],
+        "wood": [139,115,85,200], "unknown": [150,150,150,180],
+    }
+
+    # Construire le tracé par segments pour coloration
+    osm_detail = {}
+    if osm_surface_data and osm_surface_data.get("detail"):
+        for d in osm_surface_data["detail"]:
+            km_key = round(d.get("km", 0))
+            osm_detail[km_key] = d.get("surface", "unknown")
+
+    seg_len = max(1, n_sub // 60)
     path_data = []
-    for si in range(0, len(lats_a) - 1, seg_len):
-        seg_pts = [[lons_a[j], lats_a[j], elevs_a[j] + 5]
-                   for j in range(si, min(si + seg_len + 1, len(lats_a)))]
-        if len(seg_pts) < 2: continue
-        e_mid = elevs_a[min(si + seg_len // 2, len(elevs_a) - 1)]
-        path_data.append({"path": seg_pts, "color": elev_to_color(e_mid)})
+    for si in range(0, n_sub - 1, seg_len):
+        end_i = min(si + seg_len + 1, n_sub)
+        seg_pts = [[lons_a[j], lats_a[j], elevs_a[j] + 3]
+                   for j in range(si, end_i)]
+        if len(seg_pts) < 2:
+            continue
+        mid_i  = (si + end_i) // 2
+        e_mid  = elevs_a[min(mid_i, n_sub-1)]
+        d_mid  = dist_a[min(mid_i, n_sub-1)]
+        km_mid = int(d_mid)
 
-    # Checkpoints
-    cp_color_map = {
+        if active_layers.get("allure_predite") and km_mid in pace_by_km:
+            color = pace_by_km[km_mid]
+        elif active_layers.get("surfaces_osm") and osm_detail:
+            surf = osm_detail.get(km_mid, osm_detail.get(km_mid-1, "unknown"))
+            color = SURFACE_COLORS.get(surf, SURFACE_COLORS["unknown"])
+        else:
+            color = alt_color(e_mid)
+
+        path_data.append({"path": seg_pts, "color": color})
+
+    # ── Zones techniques ─────────────────────────────────────────
+    tech_data = []
+    if active_layers.get("zones_techniques") and tech_segments:
+        for seg in tech_segments:
+            if seg.get("tech_score", 0) > 0.45:
+                d_mid_km = (seg["km_start"] + seg["km_end"]) / 2.0
+                d_mid_m  = d_mid_km * 1000.0
+                seg_lat  = float(np.interp(d_mid_m, cum_d_map, [points[i].latitude  for i in range(n_pts)]))
+                seg_lon  = float(np.interp(d_mid_m, cum_d_map, [points[i].longitude for i in range(n_pts)]))
+                seg_elev = float(np.interp(d_mid_m, cum_d_map, [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
+                ts = seg["tech_score"]
+                tech_data.append({
+                    "position": [seg_lon, seg_lat, seg_elev + 25],
+                    "label":    f"{seg['label']} {seg['km_start']:.0f}-{seg['km_end']:.0f}km",
+                    "score":    round(ts, 2),
+                    "color":    [int(249*min(1,ts*1.3)), int(100*(1-ts)), 30, 210],
+                    "radius":   int(80 + ts*120),
+                })
+
+    # ── Checkpoints ──────────────────────────────────────────────
+    CP_COLORS = {
         "🥤 Ravitaillement": [0,229,255,230], "🏔 Sommet": [255,214,0,230],
         "🔻 Col": [224,64,251,230], "⏱ Point de passage": [64,196,255,230],
         "🏁 Intermédiaire": [180,180,180,200], "⚠️ Point clé": [255,23,68,230],
     }
     cp_data = []
-    for cp in sorted(checkpoints, key=lambda c: c["dist_km"]):
-        cp_elev = float(np.interp(cp["dist_km"]*1000, cum_d_map,
-                                   [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
-        cp_data.append({"position": [cp["lon"], cp["lat"], cp_elev+15],
-                        "label": cp["label"], "dist": cp["dist_km"],
-                        "color": cp_color_map.get(cp.get("type",""), [249,115,22,230])})
+    if active_layers.get("checkpoints_layer"):
+        for cp in sorted(checkpoints, key=lambda c: c["dist_km"]):
+            cp_elev = float(np.interp(cp["dist_km"]*1000, cum_d_map,
+                                       [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
+            cp_data.append({
+                "position": [cp["lon"], cp["lat"], cp_elev + 18],
+                "label":    cp["label"],
+                "dist":     cp["dist_km"],
+                "color":    CP_COLORS.get(cp.get("type",""), [249,115,22,230]),
+            })
 
-    # Zones techniques
-    tech_data = []
-    if tech_segments:
-        for seg in tech_segments:
-            if seg["tech_score"] > 0.5:
-                d_mid_km = (seg["km_start"] + seg["km_end"]) / 2.0
-                seg_lat = float(np.interp(d_mid_km*1000, cum_d_map, [points[i].latitude for i in range(n_pts)]))
-                seg_lon = float(np.interp(d_mid_km*1000, cum_d_map, [points[i].longitude for i in range(n_pts)]))
-                seg_elev = float(np.interp(d_mid_km*1000, cum_d_map,
-                                            [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
-                t = seg["tech_score"]
-                tech_data.append({"position": [seg_lon, seg_lat, seg_elev+20],
-                                   "label": f"{seg['label']} {seg['km_start']:.0f}-{seg['km_end']:.0f}km",
-                                   "score": t, "color": [int(249*t), int(200*(1-t)), 50, 200]})
-
-    terrain_layer = pdk.Layer(
-        "TerrainLayer", data=None,
-        elevation_decoder={"rScaler":6553.6,"gScaler":25.6,"bScaler":0.1,"offset":-10000},
-        texture="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        elevation_data="https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer/tile/{z}/{y}/{x}",
-        bounds=[min(lons_a)-0.05, min(lats_a)-0.05, max(lons_a)+0.05, max(lats_a)+0.05],
-        min_zoom=0, max_zoom=15,
-    )
-    path_layer = pdk.Layer("PathLayer", data=path_data, get_path="path", get_color="color",
-                            get_width=8, width_min_pixels=3, width_max_pixels=12, pickable=True)
-    cp_layer = pdk.Layer("ScatterplotLayer", data=cp_data, get_position="position", get_color="color",
-                          get_radius=80, radius_min_pixels=8, radius_max_pixels=20, pickable=True)
-    tech_layer = pdk.Layer("ScatterplotLayer", data=tech_data, get_position="position", get_color="color",
-                            get_radius=120, radius_min_pixels=10, radius_max_pixels=25, pickable=True)
-    text_layer = pdk.Layer("TextLayer", data=cp_data, get_position="position", get_text="label",
-                            get_size=14, get_color=[255,255,255,230], background=True,
-                            get_background_color=[0,0,0,160], get_pixel_offset=[0,-20], billboard=True)
+    # Départ / Arrivée toujours visibles
     start_end = [
-        {"position":[lons_a[0], lats_a[0], elevs_a[0]+20], "label":"🟢 Départ",  "color":[0,255,136,255]},
-        {"position":[lons_a[-1],lats_a[-1],elevs_a[-1]+20],"label":"🔴 Arrivée", "color":[255,50,50,255]},
+        {"position": [lons_a[0],  lats_a[0],  elevs_a[0]  + 20], "label": "🟢 Départ",  "color": [0,255,100,255]},
+        {"position": [lons_a[-1], lats_a[-1], elevs_a[-1] + 20], "label": "🔴 Arrivée", "color": [255,50,50,255]},
     ]
-    se_layer = pdk.Layer("ScatterplotLayer", data=start_end, get_position="position",
-                          get_color="color", get_radius=150, radius_min_pixels=12, radius_max_pixels=30)
-    span_km = haversine_m(min(lats_a),min(lons_a),max(lats_a),max(lons_a))/1000.0
-    zoom_level = max(10.5, min(13.5, 14.5 - math.log2(max(1, span_km))))
-    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon,
-                                zoom=zoom_level, pitch=52, bearing=0)
+
+    # ── Layers pydeck ────────────────────────────────────────────
+    layers = []
+
+    if active_layers.get("relief"):
+        layers.append(pdk.Layer(
+            "TerrainLayer", data=None,
+            elevation_decoder={"rScaler":6553.6,"gScaler":25.6,"bScaler":0.1,"offset":-10000},
+            texture="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            elevation_data="https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer/tile/{z}/{y}/{x}",
+            bounds=[min(lons_a)-0.05, min(lats_a)-0.05, max(lons_a)+0.05, max(lats_a)+0.05],
+            min_zoom=0, max_zoom=15,
+        ))
+
+    layers.append(pdk.Layer(
+        "PathLayer", data=path_data, get_path="path", get_color="color",
+        get_width=10, width_min_pixels=3, width_max_pixels=14, pickable=True,
+    ))
+
+    layers.append(pdk.Layer(
+        "ScatterplotLayer", data=start_end, get_position="position", get_color="color",
+        get_radius=150, radius_min_pixels=12, radius_max_pixels=30,
+    ))
+
+    if cp_data:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", data=cp_data, get_position="position", get_color="color",
+            get_radius=80, radius_min_pixels=8, radius_max_pixels=20, pickable=True,
+        ))
+        layers.append(pdk.Layer(
+            "TextLayer", data=cp_data, get_position="position", get_text="label",
+            get_size=14, get_color=[255,255,255,230], background=True,
+            get_background_color=[0,0,0,160], get_pixel_offset=[0,-22], billboard=True,
+        ))
+
+    if tech_data:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer", data=tech_data, get_position="position", get_color="color",
+            get_radius="radius", radius_min_pixels=10, radius_max_pixels=28, pickable=True,
+        ))
+        layers.append(pdk.Layer(
+            "TextLayer", data=tech_data, get_position="position", get_text="label",
+            get_size=12, get_color=[255,220,50,230], background=True,
+            get_background_color=[0,0,0,140], get_pixel_offset=[0,-30], billboard=True,
+        ))
+
+    view_state = pdk.ViewState(
+        latitude=center_lat, longitude=center_lon,
+        zoom=zoom_level, pitch=52, bearing=0,
+    )
     deck = pdk.Deck(
-        layers=[terrain_layer, path_layer, se_layer, cp_layer, tech_layer, text_layer],
-        initial_view_state=view_state,
-        tooltip={"html":"<b>{label}</b><br/>Distance: {dist} km",
-                 "style":{"background":"rgba(0,0,0,0.8)","color":"white","fontSize":"12px","padding":"6px"}},
+        layers=layers, initial_view_state=view_state,
+        tooltip={"html": "<b>{label}</b><br/>Dist: {dist} km | Score: {score}",
+                 "style": {"background":"rgba(0,0,0,0.8)","color":"white",
+                            "fontSize":"12px","padding":"6px"}},
         map_style=None,
     )
-    return deck
+    return deck, path_data, cp_data, tech_data
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1592,6 +1716,18 @@ with main_tabs[0]:
         mode=st.radio("Mode d'interface",["🟢 Simple (recommandé)","🔵 Expert (tous les curseurs)"],horizontal=True,key="pred_mode")
     EXPERT="Expert" in mode
 
+    # ── NOUVEAU v6.1 : Sélecteur Route / Trail ──────────────────────────────
+    st.markdown("---")
+    col_rt1, col_rt2 = st.columns([2, 3])
+    with col_rt1:
+        mode_activite = st.radio(
+            "🏷️ Type d'activité",
+            ["🛣️ Route / Piste", "🏔️ Trail / Montagne"],
+            horizontal=True, key="mode_activite",
+            help="Route : masque la technicité, surfaces limitées au revêtu.\nTrail : affiche technicité, surfaces naturelles, 3D relief."
+        )
+    IS_TRAIL = "Trail" in mode_activite
+
     st.markdown("---")
     st.header("1️⃣  Parcours GPX")
     gpx_file=st.file_uploader("📂 Importer le GPX de la course cible",type=["gpx"],key="gpx_main")
@@ -1609,15 +1745,16 @@ with main_tabs[0]:
             c3.metric("D- GPS",f"{ddn_tmp:.0f} m")
             c4.metric("Alt. moy.",f"{avg_alt_tmp:.0f} m")
 
-            # ── NOUVEAU v6 : Détection terrain technique automatique ──────────
-            st.markdown("---")
-            st.subheader("🔬 Analyse terrain technique automatique")
-            with st.spinner("Analyse sinuosité, pentes, variabilité..."):
-                tech_segs, tech_global = detect_technical_terrain(points, dem_elevations)
+            # ── NOUVEAU v6.1 : Détection terrain technique (Trail uniquement) ──
+            if IS_TRAIL:
+              st.markdown("---")
+              st.subheader("🔬 Analyse terrain technique automatique")
+              with st.spinner("Analyse sinuosité, pentes, variabilité..."):
+                tech_segs, tech_global = detect_technical_terrain(points, dem_elevations, is_trail=IS_TRAIL)
                 st.session_state["tech_segs"]   = tech_segs
                 st.session_state["tech_global"] = tech_global
 
-            if tech_global.get("global_score", 0) > 0:
+              if tech_global.get("global_score", 0) > 0:
                 score = tech_global["global_score"]; label = tech_global["label"]
                 pct_tech = tech_global.get("pct_technique", 0)
                 badge_css = ("background:#fee2e2;color:#991b1b" if score > 0.65
@@ -1661,12 +1798,14 @@ with main_tabs[0]:
         if "dem_elevations" in st.session_state:
             dem_elevations=st.session_state["dem_elevations"]
             # Relancer détection terrain avec DEM
-            tech_segs,tech_global=detect_technical_terrain(points,dem_elevations)
+            tech_segs,tech_global=detect_technical_terrain(points,dem_elevations,is_trail=IS_TRAIL)
             st.session_state["tech_segs"]=tech_segs
             st.session_state["tech_global"]=tech_global
 
     # ── NOUVEAU v6 : Surface OSM ────────────────────────────────────────────
-    with st.expander("🌿 Détection surface OSM (Overpass API, gratuit)"):
+    with st.expander("🌿 Détection surface OSM (Overpass API, gratuit)", expanded=False):
+        if not IS_TRAIL:
+            st.info("ℹ️ La détection OSM de surfaces naturelles est principalement utile en mode Trail.")
         st.info("Interroge OpenStreetMap pour détecter automatiquement le type de surface du parcours (rock, grass, mud…).")
         if gpx_file and points and st.button("🔍 Analyser la surface via OSM",key="btn_osm"):
             with st.spinner("Requête Overpass API en cours..."):
@@ -1843,7 +1982,7 @@ with main_tabs[0]:
 
         # ── Suggestion automatique depuis la détection terrain ───────────
         tech_global_ui=st.session_state.get("tech_global",{})
-        if tech_global_ui.get("global_score",0)>0 and terrain_profil=="🏔️ Trail modéré":
+        if IS_TRAIL and tech_global_ui.get("global_score",0)>0 and terrain_profil=="🏔️ Trail modéré":
             adj_up=tech_global_ui.get("k_up_adj",1.0);adj_dn=tech_global_ui.get("k_down_adj",1.0)
             sugg_k_up=round(_d["k_up"]*adj_up,1);sugg_k_dn=round(_d["k_down"]*adj_dn,1)
             st.markdown(f'<div style="background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;padding:6px 12px;font-size:0.82rem;">🤖 <b>Suggestion auto (terrain score {tech_global_ui["global_score"]:.2f})</b> : k_up → <b>{sugg_k_up}</b> · k_down → <b>{sugg_k_dn}</b></div>',unsafe_allow_html=True)
@@ -1853,10 +1992,16 @@ with main_tabs[0]:
                 st.rerun()
 
         st.markdown("##### 🌿 Surface du terrain")
-        surface_sel=st.selectbox("Type de surface",list(SURFACE_OPTIONS.keys()),key="surface_sel",
-                                  help="Coût énergétique additionnel selon la surface.")
-        surface_mult=SURFACE_OPTIONS[surface_sel]
-        # OSM auto : utiliser la valeur détectée
+        # Filtrer surfaces selon Route/Trail
+        if IS_TRAIL:
+            _surf_opts = SURFACE_OPTIONS
+        else:
+            _surf_opts = {k:v for k,v in SURFACE_OPTIONS.items() if any(x in k for x in ["Route","Piste","Gravier","stabilisé","Chemin"])}
+            if not _surf_opts: _surf_opts = {"🏟️ Route / Piste synthétique":1.00,"🪨 Chemin stabilisé / Gravier":1.03}
+        surface_sel=st.selectbox("Type de surface",list(_surf_opts.keys()),key="surface_sel",
+                                  help="Coût énergétique additionnel selon la surface. Route = ×1.00 (référence).")
+        surface_mult=_surf_opts[surface_sel]
+        # OSM auto
         if surface_sel.startswith("🤖") and "osm_surface" in st.session_state:
             surface_mult=st.session_state["osm_surface"].get("surface_mult_osm",1.06)
         st.caption(f"Multiplicateur surface : **×{surface_mult:.3f}** — pénalité **+{(surface_mult-1)*100:.1f}%** sur l'allure de base")
@@ -2121,11 +2266,12 @@ with main_tabs[0]:
                 ax3.axvline(cp_x,color=col_p,lw=1.5,ls="--",alpha=0.7)
                 ax3.annotate(cp["label"],xy=(cp_x,cp_y),xytext=(0,12),textcoords="offset points",ha="center",fontsize=7.5,color=col_p,fontweight="bold",arrowprops=dict(arrowstyle="-",color=col_p,lw=1))
                 ax3.scatter([cp_x],[cp_y],s=60,color=col_p,zorder=5)
-            # Overlay zones techniques sur le profil
-            for seg in st.session_state.get("tech_segs",[]):
-                if seg["tech_score"]>0.5:
-                    color_tech="#ef4444" if seg["tech_score"]>0.75 else "#f97316"
-                    ax3.axvspan(seg["km_start"],seg["km_end"],alpha=0.12,color=color_tech)
+            # Overlay zones techniques sur le profil (Trail only)
+            if IS_TRAIL:
+              for seg in st.session_state.get("tech_segs",[]):
+                if seg.get("tech_score",0)>0.45:
+                    color_tech="#ef4444" if seg["tech_score"]>0.70 else "#f97316"
+                    ax3.axvspan(seg["km_start"],seg["km_end"],alpha=0.12,color=color_tech,label="_nolegend_")
             ax3.scatter([x_km[0]],[y_gps[0]],s=80,color="lime",zorder=6,marker="^",label="Départ")
             ax3.scatter([x_km[-1]],[y_gps[-1]],s=80,color="red",zorder=6,marker="s",label="Arrivée")
             ax3.set_xlabel("Distance (km)");ax3.set_ylabel("Altitude (m)")
@@ -2151,38 +2297,80 @@ with main_tabs[0]:
                         st.dataframe(pd.DataFrame(passage_rows),use_container_width=True,hide_index=True)
 
         # ══════════════════════════════════════════════════════
-        # 🌍 NOUVEAU v6 — VUE 3D RELIEF RÉEL PYDECK
+        # 🌍 NOUVEAU v6.1 — VUE 3D RELIEF RÉEL PYDECK AVEC COUCHES
         # ══════════════════════════════════════════════════════
         st.markdown("---")
-        st.subheader("🌍 Vue 3D relief réel — style Google Earth Pro")
-        st.caption("Relief via ArcGIS World Elevation 3D (gratuit, sans compte, sans clé API). Tracé coloré par altitude ou allure prédite.")
+        st.subheader("🌍 Vue 3D relief réel — style Google Earth")
+        st.caption("ArcGIS World Elevation 3D · Gratuit · Sans compte · Sans clé API · Tracé sur vrai relief 3D")
 
-        col_3dp1,col_3dp2,col_3dp3=st.columns(3)
-        with col_3dp1:show_3d_cp=st.checkbox("Afficher checkpoints 3D",value=True,key="show_3d_cp")
-        with col_3dp2:show_3d_tech=st.checkbox("Afficher zones techniques",value=True,key="show_3d_tech")
-        with col_3dp3:map_height_3d=st.slider("Hauteur carte (px)",400,800,580,50,key="map_height_3d")
+        # ── Toggles de couches ──────────────────────────────────
+        st.markdown("**🎛️ Couches actives**")
+        col_l1,col_l2,col_l3,col_l4,col_l5=st.columns(5)
+        with col_l1: layer_relief     = st.checkbox("🏔 Relief 3D",     value=True,  key="layer_relief")
+        with col_l2: layer_allure     = st.checkbox("⏱ Allure prédite", value=False, key="layer_allure",
+                                                     help="Colorie le tracé par allure km/km — nécessite une prédiction calculée")
+        with col_l3: layer_osm        = st.checkbox("🌿 Surfaces OSM",  value=False, key="layer_osm",
+                                                     help="Colorie par type de surface détecté (nécessite l'analyse OSM)")
+        with col_l4: layer_tech       = st.checkbox("⚠️ Zones tech.",   value=IS_TRAIL, key="layer_tech",
+                                                     help="Surligne les zones techniques (Trail uniquement)")
+        with col_l5: layer_cp         = st.checkbox("📍 Checkpoints",   value=True,  key="layer_cp")
 
-        if st.button("🌍 Générer la vue 3D relief réel",type="primary",key="btn_3d_pydeck"):
+        col_3dh, col_3dp = st.columns([3,1])
+        with col_3dh: map_height_3d = st.slider("Hauteur (px)",400,850,600,25,key="map_height_3d")
+        with col_3dp: map_pitch_3d  = st.slider("Inclinaison (°)",20,75,52,5,key="map_pitch_3d")
+
+        if st.button("🌍 Générer la vue 3D",type="primary",key="btn_3d_pydeck"):
             with st.spinner("Construction vue 3D relief ArcGIS..."):
-                tech_segs_3d=st.session_state.get("tech_segs",[]) if show_3d_tech else []
-                df_pred_3d=st.session_state["res"]["df"] if "res" in st.session_state else None
-                deck=generate_pydeck_terrain(
+                active_layers = {
+                    "relief":           layer_relief,
+                    "allure_predite":   layer_allure,
+                    "surfaces_osm":     layer_osm,
+                    "zones_techniques": layer_tech and IS_TRAIL,
+                    "checkpoints_layer":layer_cp,
+                }
+                tech_segs_3d = st.session_state.get("tech_segs",[]) if IS_TRAIL else []
+                df_pred_3d   = st.session_state["res"]["df"] if "res" in st.session_state else None
+                osm_data_3d  = st.session_state.get("osm_surface") if layer_osm else None
+
+                deck, path_d, cp_d, tech_d = generate_pydeck_terrain(
                     points=points, cum_d_map=cum_d_map,
-                    checkpoints=checkpoints if show_3d_cp else [],
+                    checkpoints=checkpoints if layer_cp else [],
                     df_prediction=df_pred_3d,
                     tech_segments=tech_segs_3d,
-                    dem_elevations=dem_elevations)
-                st.session_state["pydeck_deck"]=deck
+                    dem_elevations=dem_elevations,
+                    osm_surface_data=osm_data_3d,
+                    active_layers=active_layers,
+                )
+                # Patcher le pitch dynamiquement
+                deck.initial_view_state.pitch = map_pitch_3d
+                st.session_state["pydeck_deck"] = deck
+                st.session_state["pydeck_layers_info"] = {
+                    "path_count": len(path_d), "cp_count": len(cp_d),
+                    "tech_count": len(tech_d), "active": active_layers,
+                }
 
         if "pydeck_deck" in st.session_state:
-            st.pydeck_chart(st.session_state["pydeck_deck"],use_container_width=True,height=map_height_3d)
-            st.caption("💡 Clic gauche : rotation · Scroll : zoom · Ctrl+clic : déplacer · Double-clic : zoom sur point")
-            col_leg1,col_leg2=st.columns(2)
-            with col_leg1:
-                st.markdown("**Légende tracé** : 🔵 Bas/rapide → 🟢 → 🟠 → 🔴 Haut/lent")
-            with col_leg2:
-                if show_3d_tech and st.session_state.get("tech_segs"):
-                    st.markdown("**Zones tech.** : 🟢 Facile · 🟡 Modéré · 🟠 Technique · 🔴 Très tech.")
+            st.pydeck_chart(st.session_state["pydeck_deck"],
+                            use_container_width=True, height=map_height_3d)
+            st.caption("💡 Clic gauche + glisser : rotation · Scroll : zoom · Ctrl+glisser : déplacer · Double-clic : zoom")
+
+            # Légendes dynamiques selon couches actives
+            info = st.session_state.get("pydeck_layers_info",{})
+            active = info.get("active",{})
+            leg_cols = st.columns(3)
+            with leg_cols[0]:
+                if active.get("allure_predite"):
+                    st.markdown("**⏱ Allure** : 🟢 Rapide → 🟡 → 🔴 Lent")
+                elif active.get("surfaces_osm"):
+                    st.markdown("**🌿 Surface** : ⬜ Béton · 🟤 Terre · 🟫 Roche · 🟩 Herbe · ⬛ Boue")
+                else:
+                    st.markdown("**🏔 Altitude** : 🔵 Bas → 🟢 → 🟠 → 🔴 Haut")
+            with leg_cols[1]:
+                if active.get("checkpoints_layer"):
+                    st.markdown(f"**📍 Checkpoints** : {info.get('cp_count',0)} marqueurs")
+            with leg_cols[2]:
+                if active.get("zones_techniques") and IS_TRAIL:
+                    st.markdown(f"**⚠️ Zones tech.** : {info.get('tech_count',0)} segments · 🟡→🔴 par score")
 
         # ══════════════════════════════════════════════════════
         # 🎬 ANIMATION 3D CINÉMATIQUE THREE.JS
