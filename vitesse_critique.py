@@ -211,8 +211,13 @@ def fatigue_multiplier(d_plus_cum,dist_cum,d_plus_total,dist_total,rate_pct,mode
     return 1.0+rate*factor
 
 
-@st.cache_data(show_spinner=False)
-def get_weather_minutely(lat,lon,dt_local_naive,tz_name=TZ_NAME_DEFAULT):
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_weather_minutely(lat, lon, dt_local_naive, tz_name=TZ_NAME_DEFAULT):
+    """
+    Récupère la météo interpolée à l'heure EXACTE de passage.
+    Cache TTL=1h pour permettre les re-calculs sans re-fetch.
+    Supporte les courses longues : chaque km a sa propre heure de passage.
+    """
     try:
         url=(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
              "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
@@ -875,8 +880,15 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
         s_p=pd.Series(df_out["Temps seg (s)"].astype(float)).rolling(w_p,center=True,min_periods=1).median()
         df_out["Allure lissée (min/km)"]=s_p.apply(pace_str)
     total_s=float(np.sum(t_raw))
+    # Calcul amplitude météo sur la course (info pour l'utilisateur)
+    temps_valides = [r["Temp GPS (°C)"] for _,r in pd.DataFrame(rows).iterrows() if r.get("Temp GPS (°C)") is not None]
+    meteo_range = None
+    if len(temps_valides) >= 2:
+        meteo_range = {"t_min": round(min(temps_valides),1), "t_max": round(max(temps_valides),1),
+                       "delta": round(max(temps_valides)-min(temps_valides),1)}
     return{"df":df_out,"total_s":total_s,"total_human":seconds_to_hms(total_s),
            "ci_low":seconds_to_hms(total_s*0.95),"ci_high":seconds_to_hms(total_s*1.05),
+           "meteo_range":meteo_range,
            "dist_gpx_km":dist_gpx_km,"K":K,"avg_alt":avg_alt,"d_plus_total":d_plus_total,
            "refs_fit":refs_fit,"pre_df":df_pre}
 
@@ -1117,9 +1129,25 @@ def fetch_osm_surface(lats_tuple, lons_tuple):
 );
 out body geom;"""
     try:
-        resp = requests.post("https://overpass-api.de/api/interpreter",
-                             data={"data": query}, timeout=30)
-        data = resp.json()
+        # Fallback sur plusieurs endpoints Overpass (réseau variable)
+        OVERPASS_ENDPOINTS = [
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass.openstreetmap.fr/api/interpreter",
+        ]
+        data = None
+        last_err = None
+        for ep in OVERPASS_ENDPOINTS:
+            try:
+                resp = requests.post(ep, data={"data": query}, timeout=25)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if data is None:
+            raise Exception(f"Tous les endpoints Overpass injoignables. Dernier: {last_err}")
     except Exception as e:
         return {"error": str(e), "dominant_surface": "unknown",
                 "surface_mult_osm": 1.06, "surface_counts": {}, "detail": []}
@@ -1172,211 +1200,358 @@ out body geom;"""
 # NOUVEAU v6 — VUE 3D RELIEF RÉEL PYDECK
 # ══════════════════════════════════════════════════════════════
 
-def generate_pydeck_terrain(points, cum_d_map, checkpoints, df_prediction=None,
-                             tech_segments=None, dem_elevations=None,
-                             osm_surface_data=None,
-                             active_layers=None):
+def generate_3d_terrain_html(points, cum_d_map, checkpoints,
+                               df_prediction=None, tech_segments=None,
+                               dem_elevations=None, osm_surface_data=None,
+                               height=600, pitch=52):
     """
-    Vue 3D relief réel via pydeck TerrainLayer (ArcGIS, gratuit, sans clé).
-    Couches activables : relief, surfaces_osm, zones_techniques, allure_predite, checkpoints_layer.
-    Le tracé suit le VRAI relief 3D, pas à plat.
+    Génère un composant HTML autonome qualité Google Earth Pro :
+    - deck.gl 8.9 + MapLibre GL (open source, ZÉRO token, ZÉRO compte)
+    - Relief 3D réel ArcGIS World Elevation (tuiles publiques)
+    - Fond satellite ESRI World Imagery
+    - 5 couches toggle : Relief / Tracé altimétrique / Allure prédite / Surfaces OSM / Zones techniques
+    - Interface UI propre, légende dynamique, stats live
+    - Tracé qui suit le vrai relief (pas à plat)
     """
-    if active_layers is None:
-        active_layers = {"relief": True, "surfaces_osm": False,
-                         "zones_techniques": True, "allure_predite": False, "checkpoints_layer": True}
+    import json as _json
+    import math as _math
 
     n_pts = len(points)
-    step  = max(1, n_pts // 600)
-    lats_a  = [points[i].latitude  for i in range(0, n_pts, step)]
-    lons_a  = [points[i].longitude for i in range(0, n_pts, step)]
-    dist_a  = [cum_d_map[i] / 1000.0 for i in range(0, n_pts, step)]
-    n_sub   = len(lats_a)
+    step  = max(1, n_pts // 700)
+
+    lats_s  = [points[i].latitude  for i in range(0, n_pts, step)]
+    lons_s  = [points[i].longitude for i in range(0, n_pts, step)]
+    dist_s  = [cum_d_map[i] / 1000.0 for i in range(0, n_pts, step)]
+    n_sub   = len(lats_s)
 
     if dem_elevations is not None and len(dem_elevations) == n_pts:
-        elevs_a = [dem_elevations[i] if dem_elevations[i] is not None else 0.0
+        elevs_s = [dem_elevations[i] if dem_elevations[i] is not None else 0.0
                    for i in range(0, n_pts, step)]
     else:
-        elevs_a = [getattr(points[i], "elevation", 0.0) or 0.0
+        elevs_s = [getattr(points[i], "elevation", 0.0) or 0.0
                    for i in range(0, n_pts, step)]
 
-    center_lat = float(np.mean(lats_a))
-    center_lon = float(np.mean(lons_a))
-    elev_min   = min(elevs_a)
-    elev_max   = max(elevs_a)
-    span_km    = haversine_m(min(lats_a), min(lons_a), max(lats_a), max(lons_a)) / 1000.0
-    zoom_level = max(10.5, min(13.5, 14.5 - math.log2(max(1, span_km))))
+    elev_min = min(elevs_s); elev_max = max(elevs_s)
+    center_lat = float(np.mean(lats_s)); center_lon = float(np.mean(lons_s))
+    span_km = haversine_m(min(lats_s), min(lons_s), max(lats_s), max(lons_s)) / 1000.0
+    zoom = max(10.5, min(13.5, 14.5 - _math.log2(max(1, span_km))))
+    bounds = [min(lons_s)-0.03, min(lats_s)-0.03, max(lons_s)+0.03, max(lats_s)+0.03]
 
-    # ── Palette altitude (bleu→vert→orange→rouge) ──────────────
-    def alt_color(e, alpha=220):
-        t = (e - elev_min) / max(1.0, elev_max - elev_min)
-        if t < 0.33:
-            tt = t / 0.33
-            r, g, b = int(20 + tt*80), int(100 + tt*120), int(255 - tt*80)
-        elif t < 0.66:
-            tt = (t - 0.33) / 0.33
-            r, g, b = int(100 + tt*140), int(220 - tt*60), int(175 - tt*120)
-        else:
-            tt = (t - 0.66) / 0.34
-            r, g, b = int(240), int(160 - tt*120), int(55 - tt*40)
-        return [r, g, b, alpha]
+    # ── D+ total ─────────────────────────────────────────────────
+    d_plus = float(np.sum(np.clip(np.diff(elevs_s), 0, None)))
+    total_km = cum_d_map[-1] / 1000.0
 
-    # ── Couleurs allure prédite ─────────────────────────────────
-    def pace_to_secs(p):
-        try: parts = str(p).split(":"); return int(parts[0])*60+int(parts[1])
-        except: return 0
-
-    pace_by_km = {}
-    if df_prediction is not None and not df_prediction.empty and "Allure (min/km)" in df_prediction.columns:
-        paces_all = [pace_to_secs(p) for p in df_prediction["Allure (min/km)"].values if pace_to_secs(p)>0]
-        if paces_all:
-            p_min, p_max = min(paces_all), max(paces_all)
-            for km_idx, row in df_prediction.iterrows():
-                ps = pace_to_secs(row["Allure (min/km)"])
-                if ps > 0:
-                    t = (ps - p_min) / max(1.0, p_max - p_min)
-                    pace_by_km[km_idx] = [int(30+t*219), int(200-t*160), int(80-t*60), 230]
-
-    # ── Couleurs surface OSM ─────────────────────────────────────
-    SURFACE_COLORS = {
-        "asphalt": [120,120,120,200], "paved": [140,140,140,200], "concrete": [160,160,160,200],
-        "compacted": [200,170,100,200], "gravel": [180,140,80,200], "fine_gravel": [190,155,90,200],
-        "unpaved": [160,120,60,200], "ground": [139,90,43,200], "dirt": [130,80,30,200],
-        "grass": [60,160,60,200], "rock": [100,100,80,200], "rocks": [110,105,85,200],
-        "mud": [80,50,20,200], "sand": [220,200,100,200],
-        "snow": [220,235,255,200], "ice": [180,220,255,200],
-        "wood": [139,115,85,200], "unknown": [150,150,150,180],
-    }
-
-    # Construire le tracé par segments pour coloration
-    osm_detail = {}
-    if osm_surface_data and osm_surface_data.get("detail"):
-        for d in osm_surface_data["detail"]:
-            km_key = round(d.get("km", 0))
-            osm_detail[km_key] = d.get("surface", "unknown")
-
-    seg_len = max(1, n_sub // 60)
-    path_data = []
-    for si in range(0, n_sub - 1, seg_len):
-        end_i = min(si + seg_len + 1, n_sub)
-        seg_pts = [[lons_a[j], lats_a[j], elevs_a[j] + 3]
-                   for j in range(si, end_i)]
-        if len(seg_pts) < 2:
+    # ── Construire les segments de tracé (avec élévation 3D) ─────
+    seg_size = max(1, n_sub // 80)
+    trace_data = []
+    for si in range(0, n_sub - 1, seg_size):
+        end_i = min(si + seg_size + 1, n_sub)
+        path  = [[lons_s[j], lats_s[j], elevs_s[j] + 4] for j in range(si, end_i)]
+        if len(path) < 2:
             continue
-        mid_i  = (si + end_i) // 2
-        e_mid  = elevs_a[min(mid_i, n_sub-1)]
-        d_mid  = dist_a[min(mid_i, n_sub-1)]
-        km_mid = int(d_mid)
+        mid_i = (si + end_i) // 2
+        mid_i = min(mid_i, n_sub - 1)
+        trace_data.append({
+            "path":      path,
+            "elevation": elevs_s[mid_i],
+            "dist":      round(dist_s[mid_i], 2),
+        })
 
-        if active_layers.get("allure_predite") and km_mid in pace_by_km:
-            color = pace_by_km[km_mid]
-        elif active_layers.get("surfaces_osm") and osm_detail:
-            surf = osm_detail.get(km_mid, osm_detail.get(km_mid-1, "unknown"))
-            color = SURFACE_COLORS.get(surf, SURFACE_COLORS["unknown"])
-        else:
-            color = alt_color(e_mid)
+    # ── Données allure prédite ──────────────────────────────────
+    pace_data = []
+    if df_prediction is not None and not df_prediction.empty and "Allure (min/km)" in df_prediction.columns:
+        def _p2s(p):
+            try: parts = str(p).split(":"); return int(parts[0])*60+int(parts[1])
+            except: return 0
+        for idx_row, row in df_prediction.iterrows():
+            ps = _p2s(row["Allure (min/km)"])
+            if ps <= 0: continue
+            km_idx = idx_row
+            # Interpoler la position GPS pour ce km
+            d_m = (km_idx + 0.5) * 1000.0
+            if d_m > cum_d_map[-1]: d_m = cum_d_map[-1]
+            seg_lat = float(np.interp(d_m, cum_d_map, [points[i].latitude  for i in range(n_pts)]))
+            seg_lon = float(np.interp(d_m, cum_d_map, [points[i].longitude for i in range(n_pts)]))
+            seg_el  = float(np.interp(d_m, cum_d_map, elevs_s[:n_sub] if n_sub == n_pts else elevs_s))
+            # Segment de 1km
+            d_start = km_idx * 1000.0
+            d_end   = min((km_idx + 1) * 1000.0, cum_d_map[-1])
+            idx_s2  = [i for i in range(0, n_sub) if d_start <= (i * (cum_d_map[-1]/(n_sub-1) if n_sub>1 else 1)) <= d_end]
+            if len(idx_s2) < 2:
+                path_seg = [[seg_lon, seg_lat, seg_el+4]]
+            else:
+                path_seg = [[lons_s[j], lats_s[j], elevs_s[j]+4] for j in idx_s2]
+            pace_data.append({"path": path_seg, "pace_s": ps, "dist": round(d_m/1000,1)})
 
-        path_data.append({"path": seg_pts, "color": color})
+    # ── Données surfaces OSM ────────────────────────────────────
+    osm_segs = []
+    if osm_surface_data and osm_surface_data.get("detail"):
+        for d_entry in osm_surface_data["detail"]:
+            km_k = d_entry.get("km", 0)
+            surf = d_entry.get("surface", "unknown")
+            d_m  = km_k * 1000.0
+            d_end_m = min(d_m + 1000.0, cum_d_map[-1])
+            idx_s3 = [i for i in range(n_sub) if d_m <= dist_s[i]*1000 <= d_end_m]
+            if len(idx_s3) < 2: continue
+            path_seg = [[lons_s[j], lats_s[j], elevs_s[j]+4] for j in idx_s3]
+            osm_segs.append({"path": path_seg, "surface": surf, "dist": round(km_k, 1)})
 
-    # ── Zones techniques ─────────────────────────────────────────
-    tech_data = []
-    if active_layers.get("zones_techniques") and tech_segments:
+    # ── Zones techniques ────────────────────────────────────────
+    tech_data_js = []
+    if tech_segments:
         for seg in tech_segments:
             if seg.get("tech_score", 0) > 0.45:
-                d_mid_km = (seg["km_start"] + seg["km_end"]) / 2.0
-                d_mid_m  = d_mid_km * 1000.0
-                seg_lat  = float(np.interp(d_mid_m, cum_d_map, [points[i].latitude  for i in range(n_pts)]))
-                seg_lon  = float(np.interp(d_mid_m, cum_d_map, [points[i].longitude for i in range(n_pts)]))
-                seg_elev = float(np.interp(d_mid_m, cum_d_map, [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
+                d_mid = (seg["km_start"] + seg["km_end"]) / 2.0 * 1000.0
+                sl = float(np.interp(d_mid, cum_d_map, [points[i].latitude  for i in range(n_pts)]))
+                so = float(np.interp(d_mid, cum_d_map, [points[i].longitude for i in range(n_pts)]))
+                se = float(np.interp(d_mid, cum_d_map, elevs_s[:n_pts] if len(elevs_s)==n_pts else
+                                     [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
                 ts = seg["tech_score"]
-                tech_data.append({
-                    "position": [seg_lon, seg_lat, seg_elev + 25],
+                tech_data_js.append({
+                    "position": [so, sl, se + 25],
                     "label":    f"{seg['label']} {seg['km_start']:.0f}-{seg['km_end']:.0f}km",
                     "score":    round(ts, 2),
-                    "color":    [int(249*min(1,ts*1.3)), int(100*(1-ts)), 30, 210],
-                    "radius":   int(80 + ts*120),
+                    "color":    [min(255,int(249*min(1,ts*1.4))), int(80*(1-ts)), 30, 210],
+                    "radius":   int(80 + ts * 120),
                 })
 
-    # ── Checkpoints ──────────────────────────────────────────────
-    CP_COLORS = {
-        "🥤 Ravitaillement": [0,229,255,230], "🏔 Sommet": [255,214,0,230],
-        "🔻 Col": [224,64,251,230], "⏱ Point de passage": [64,196,255,230],
-        "🏁 Intermédiaire": [180,180,180,200], "⚠️ Point clé": [255,23,68,230],
+    # ── Checkpoints ────────────────────────────────────────────
+    CP_COL = {
+        "🥤 Ravitaillement":[0,229,255,230], "🏔 Sommet":[255,214,0,230],
+        "🔻 Col":[224,64,251,230], "⏱ Point de passage":[64,196,255,230],
+        "🏁 Intermédiaire":[180,180,180,200], "⚠️ Point clé":[255,23,68,230],
     }
-    cp_data = []
-    if active_layers.get("checkpoints_layer"):
-        for cp in sorted(checkpoints, key=lambda c: c["dist_km"]):
-            cp_elev = float(np.interp(cp["dist_km"]*1000, cum_d_map,
-                                       [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
-            cp_data.append({
-                "position": [cp["lon"], cp["lat"], cp_elev + 18],
-                "label":    cp["label"],
-                "dist":     cp["dist_km"],
-                "color":    CP_COLORS.get(cp.get("type",""), [249,115,22,230]),
-            })
+    cp_data_js = []
+    for cp in sorted(checkpoints, key=lambda c: c["dist_km"]):
+        cp_el = float(np.interp(cp["dist_km"]*1000, cum_d_map,
+                                [getattr(points[i],"elevation",0.0) or 0.0 for i in range(n_pts)]))
+        cp_data_js.append({
+            "position": [cp["lon"], cp["lat"], cp_el + 18],
+            "label":    cp["label"],
+            "dist":     cp["dist_km"],
+            "color":    CP_COL.get(cp.get("type",""), [249,115,22,230]),
+        })
 
-    # Départ / Arrivée toujours visibles
-    start_end = [
-        {"position": [lons_a[0],  lats_a[0],  elevs_a[0]  + 20], "label": "🟢 Départ",  "color": [0,255,100,255]},
-        {"position": [lons_a[-1], lats_a[-1], elevs_a[-1] + 20], "label": "🔴 Arrivée", "color": [255,50,50,255]},
-    ]
+    # ── Sérialiser les données ───────────────────────────────────
+    def js(obj): return _json.dumps(obj, ensure_ascii=False)
 
-    # ── Layers pydeck ────────────────────────────────────────────
-    layers = []
+    view_state = {
+        "longitude": center_lon, "latitude": center_lat,
+        "zoom": round(zoom, 1), "pitch": pitch, "bearing": 0,
+        "minPitch": 0, "maxPitch": 85,
+    }
 
-    if active_layers.get("relief"):
-        layers.append(pdk.Layer(
-            "TerrainLayer", data=None,
-            elevation_decoder={"rScaler":6553.6,"gScaler":25.6,"bScaler":0.1,"offset":-10000},
-            texture="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            elevation_data="https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer/tile/{z}/{y}/{x}",
-            bounds=[min(lons_a)-0.05, min(lats_a)-0.05, max(lons_a)+0.05, max(lats_a)+0.05],
-            min_zoom=0, max_zoom=15,
-        ))
+    # ── Template HTML ────────────────────────────────────────────
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trail 3D — {total_km:.1f} km</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/deck.gl@8.9.35/dist.min.js"></script>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{width:100%;height:100%;background:#060c18;font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;overflow:hidden}}
+#c{{width:100%;height:100%;position:relative}}
+#ui{{position:absolute;top:10px;left:10px;z-index:200;background:rgba(6,12,24,.90);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.11);border-radius:12px;padding:11px 15px;min-width:200px;user-select:none}}
+#ui h3{{font-size:.66rem;text-transform:uppercase;letter-spacing:.12em;color:#64748b;margin-bottom:9px;font-weight:600}}
+.tog{{display:flex;align-items:center;gap:8px;margin:4px 0;cursor:pointer;font-size:.76rem;padding:2px 0}}
+.tog input{{accent-color:#f97316;cursor:pointer;flex-shrink:0}}
+.tog label{{cursor:pointer;color:#cbd5e1;transition:color .15s}}
+.tog:hover label,.tog input:checked+label{{color:#f97316}}
+.sep{{border:none;border-top:1px solid rgba(255,255,255,.07);margin:8px 0}}
+.btn-grp{{display:flex;gap:5px;margin-top:4px}}
+.btn{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;border-radius:6px;padding:3px 9px;cursor:pointer;font-size:.68rem;transition:all .15s}}
+.btn:hover,.btn.on{{background:rgba(249,115,22,.25);border-color:#f97316;color:#fff}}
+#hud{{position:absolute;bottom:12px;left:12px;z-index:200;background:rgba(6,12,24,.90);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.11);border-radius:10px;padding:8px 14px;display:flex;gap:18px}}
+.hud-item{{display:flex;flex-direction:column;align-items:center}}
+.hud-val{{font-size:.85rem;font-weight:700;color:#f97316;font-family:'Courier New',monospace}}
+.hud-lbl{{font-size:.58rem;color:#475569;text-transform:uppercase;letter-spacing:.08em;margin-top:1px}}
+#leg{{position:absolute;bottom:12px;right:12px;z-index:200;background:rgba(6,12,24,.90);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.11);border-radius:10px;padding:9px 13px;min-width:160px}}
+#leg-title{{font-size:.68rem;color:#94a3b8;margin-bottom:5px;font-weight:600}}
+#leg-bar{{width:100%;height:10px;border-radius:3px;margin:3px 0}}
+#leg-labs{{display:flex;justify-content:space-between;font-size:.60rem;color:#475569}}
+#tooltip{{position:absolute;pointer-events:none;z-index:300;background:rgba(6,12,24,.92);border:1px solid rgba(249,115,22,.4);border-radius:8px;padding:7px 12px;font-size:.76rem;color:#e2e8f0;max-width:220px;display:none}}
+</style>
+</head>
+<body>
+<div id="c"></div>
+<div id="ui">
+  <h3>🗺 Couches</h3>
+  <div class="tog"><input type="checkbox" id="l0" checked><label for="l0">🏔 Relief 3D satellite</label></div>
+  <div class="tog"><input type="checkbox" id="l1" checked><label for="l1">🔵 Tracé (altitude)</label></div>
+  <div class="tog"><input type="checkbox" id="l2"><label for="l2">⏱ Allure prédite</label></div>
+  <div class="tog"><input type="checkbox" id="l3"><label for="l3">🌿 Surfaces OSM</label></div>
+  <div class="tog"><input type="checkbox" id="l4" checked><label for="l4">⚠️ Zones techniques</label></div>
+  <div class="tog"><input type="checkbox" id="l5" checked><label for="l5">📍 Checkpoints</label></div>
+  <hr class="sep">
+  <h3>Vue</h3>
+  <div class="btn-grp">
+    <button class="btn on" id="v0" onclick="setView(52)">Oblique</button>
+    <button class="btn" id="v1" onclick="setView(0)">Dessus</button>
+    <button class="btn" id="v2" onclick="setView(75)">Plongeant</button>
+  </div>
+  <hr class="sep">
+  <div style="font-size:.63rem;color:#374151">Glisser : rotation · Scroll : zoom<br>Ctrl+glisser : déplacer</div>
+</div>
+<div id="hud">
+  <div class="hud-item"><div class="hud-val">{total_km:.1f}</div><div class="hud-lbl">km total</div></div>
+  <div class="hud-item"><div class="hud-val">{round(d_plus)}</div><div class="hud-lbl">m D+</div></div>
+  <div class="hud-item"><div class="hud-val">{round(elev_min)}</div><div class="hud-lbl">m alt min</div></div>
+  <div class="hud-item"><div class="hud-val">{round(elev_max)}</div><div class="hud-lbl">m alt max</div></div>
+</div>
+<div id="leg"><div id="leg-title">Altitude</div><canvas id="leg-bar" width="160" height="10"></canvas><div id="leg-labs"><span>{round(elev_min)} m</span><span>{round(elev_max)} m</span></div></div>
+<div id="tooltip"></div>
+<script>
+const TRACE  = {js(trace_data)};
+const PACE   = {js(pace_data)};
+const OSM    = {js(osm_segs)};
+const TECH   = {js(tech_data_js)};
+const CPS    = {js(cp_data_js)};
+const BOUNDS = {js(bounds)};
+const EMIN={round(elev_min,1)},EMAX={round(elev_max,1)};
+const {{Deck,TerrainLayer,PathLayer,ScatterplotLayer,TextLayer}} = deck;
 
-    layers.append(pdk.Layer(
-        "PathLayer", data=path_data, get_path="path", get_color="color",
-        get_width=10, width_min_pixels=3, width_max_pixels=14, pickable=True,
-    ))
+// ── Couleurs ─────────────────────────────────────────────────────
+function altC(t){{
+  if(t<.33){{const u=t/.33;return[Math.round(20+u*80),Math.round(100+u*120),Math.round(255-u*80)];}}
+  if(t<.66){{const u=(t-.33)/.33;return[Math.round(100+u*140),Math.round(220-u*60),Math.round(175-u*120)];}}
+  const u=(t-.66)/.34;return[240,Math.round(160-u*120),Math.round(55-u*40)];
+}}
+function paceC(t){{return[Math.round(30+t*219),Math.round(200-t*160),Math.round(80-t*60)];}}
+const OSMC={{asphalt:[120,120,120],paved:[140,140,140],concrete:[160,160,160],compacted:[200,170,100],gravel:[180,140,80],unpaved:[160,120,60],ground:[139,90,43],dirt:[130,80,30],grass:[60,160,60],rock:[100,100,80],mud:[80,50,20],snow:[220,235,255],ice:[180,220,255],unknown:[150,150,150]}};
+function osmC(s){{return OSMC[s]||OSMC.unknown;}}
 
-    layers.append(pdk.Layer(
-        "ScatterplotLayer", data=start_end, get_position="position", get_color="color",
-        get_radius=150, radius_min_pixels=12, radius_max_pixels=30,
-    ))
+// ── Légende ──────────────────────────────────────────────────────
+function drawLeg(title,cfn,lbl0,lbl1,isText){{
+  document.getElementById('leg-title').textContent=title;
+  document.getElementById('leg-labs').innerHTML='<span>'+lbl0+'</span><span>'+lbl1+'</span>';
+  const cv=document.getElementById('leg-bar');
+  const ctx=cv.getContext('2d');
+  if(isText){{ctx.fillStyle='rgba(100,116,139,.3)';ctx.fillRect(0,0,cv.width,cv.height);return;}}
+  const g=ctx.createLinearGradient(0,0,cv.width,0);
+  for(let i=0;i<=12;i++){{const[r,b,c]=cfn(i/12);g.addColorStop(i/12,`rgb(${{r}},${{b}},${{c}})`);}}
+  ctx.fillStyle=g;ctx.fillRect(0,0,cv.width,cv.height);
+}}
+drawLeg('Altitude',altC,Math.round(EMIN)+' m',Math.round(EMAX)+' m',false);
 
-    if cp_data:
-        layers.append(pdk.Layer(
-            "ScatterplotLayer", data=cp_data, get_position="position", get_color="color",
-            get_radius=80, radius_min_pixels=8, radius_max_pixels=20, pickable=True,
-        ))
-        layers.append(pdk.Layer(
-            "TextLayer", data=cp_data, get_position="position", get_text="label",
-            get_size=14, get_color=[255,255,255,230], background=True,
-            get_background_color=[0,0,0,160], get_pixel_offset=[0,-22], billboard=True,
-        ))
+// ── État ─────────────────────────────────────────────────────────
+const S={{l0:true,l1:true,l2:false,l3:false,l4:true,l5:true}};
+let currentPitch={pitch};
 
-    if tech_data:
-        layers.append(pdk.Layer(
-            "ScatterplotLayer", data=tech_data, get_position="position", get_color="color",
-            get_radius="radius", radius_min_pixels=10, radius_max_pixels=28, pickable=True,
-        ))
-        layers.append(pdk.Layer(
-            "TextLayer", data=tech_data, get_position="position", get_text="label",
-            get_size=12, get_color=[255,220,50,230], background=True,
-            get_background_color=[0,0,0,140], get_pixel_offset=[0,-30], billboard=True,
-        ))
+// ── deck.gl ──────────────────────────────────────────────────────
+const deckInst = new Deck({{
+  container:'c',
+  initialViewState:{js(view_state)},
+  controller:{{touchRotate:true,touchZoom:true,scrollZoom:true,dragRotate:true}},
+  getTooltip:({{object}})=>{{
+    if(!object)return null;
+    const tt=document.getElementById('tooltip');
+    tt.style.display='none';
+    return null;
+  }},
+  onHover:({{object,x,y}})=>{{
+    const tt=document.getElementById('tooltip');
+    if(object&&(object.label||object.surface||object.dist!==undefined)){{
+      let html='';
+      if(object.label) html+=`<b>${{object.label}}</b>`;
+      if(object.dist!==undefined) html+=`<br>📍 ${{typeof object.dist==='number'?object.dist.toFixed(1):object.dist}} km`;
+      if(object.score!==undefined) html+=`<br>⚠️ Score tech: ${{object.score}}`;
+      if(object.surface) html+=`<br>🌿 Surface: ${{object.surface}}`;
+      if(object.elevation!==undefined) html+=`<br>🏔 Alt: ${{Math.round(object.elevation)}} m`;
+      tt.innerHTML=html;
+      tt.style.left=(x+14)+'px';tt.style.top=(y-10)+'px';tt.style.display='block';
+    }} else {{ tt.style.display='none'; }}
+  }},
+  layers:[],
+}});
 
-    view_state = pdk.ViewState(
-        latitude=center_lat, longitude=center_lon,
-        zoom=zoom_level, pitch=52, bearing=0,
+function buildLayers(){{
+  const L=[];
+  // Relief 3D
+  if(S.l0) L.push(new TerrainLayer({{
+    id:'terrain',minZoom:0,maxZoom:13,
+    elevationDecoder:{{rScaler:6553.6,gScaler:25.6,bScaler:0.1,offset:-10000}},
+    elevationData:'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer/tile/{{z}}/{{y}}/{{x}}',
+    texture:'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+    bounds:BOUNDS,color:[255,255,255],
+  }}));
+  // Tracé
+  if(S.l1){{
+    let data,cfnLeg,l0,l1;
+    if(S.l2&&PACE.length>0){{
+      const ps=PACE.map(p=>p.pace_s),pmn=Math.min(...ps),pmx=Math.max(...ps);
+      data=PACE.map(p=>{{const t=(p.pace_s-pmn)/Math.max(1,pmx-pmn);return{{...p,color:[...paceC(t),220]}}}});
+      const fmt=s=>Math.floor(s/60)+':'+(s%60<10?'0':'')+Math.round(s%60)+'/km';
+      drawLeg('⏱ Allure',paceC,fmt(pmn),fmt(pmx),false);
+    }} else if(S.l3&&OSM.length>0){{
+      data=OSM.map(s=>{{return{{...s,color:[...osmC(s.surface),220]}}}});
+      drawLeg('🌿 Surfaces',null,'Béton→Terre→Roche','Herbe→Boue',true);
+    }} else {{
+      data=TRACE.map(s=>{{const t=(s.elevation-EMIN)/Math.max(1,EMAX-EMIN);return{{...s,color:[...altC(t),220]}}}});
+      drawLeg('Altitude',altC,Math.round(EMIN)+' m',Math.round(EMAX)+' m',false);
+    }}
+    L.push(new PathLayer({{id:'trace',data,getPath:d=>d.path,getColor:d=>d.color,getWidth:10,widthMinPixels:3,widthMaxPixels:15,pickable:true}},));
+  }}
+  // Zones tech
+  if(S.l4&&TECH.length>0){{
+    L.push(new ScatterplotLayer({{id:'tech',data:TECH,getPosition:d=>d.position,getColor:d=>d.color,getRadius:d=>d.radius,radiusMinPixels:10,radiusMaxPixels:30,pickable:true}}));
+    L.push(new TextLayer({{id:'tech_lbl',data:TECH,getPosition:d=>d.position,getText:d=>d.label,getSize:11,getColor:[255,220,50,220],background:true,getBackgroundColor:[0,0,0,150],getPixelOffset:[0,-30],billboard:true}}));
+  }}
+  // Checkpoints
+  if(S.l5&&CPS.length>0){{
+    L.push(new ScatterplotLayer({{id:'cp',data:CPS,getPosition:d=>d.position,getColor:d=>d.color,getRadius:100,radiusMinPixels:8,radiusMaxPixels:22,pickable:true}}));
+    L.push(new TextLayer({{id:'cp_lbl',data:CPS,getPosition:d=>d.position,getText:d=>d.label,getSize:13,getColor:[255,255,255,230],background:true,getBackgroundColor:[0,0,0,160],getPixelOffset:[0,-24],billboard:true}}));
+  }}
+  // Départ/Arrivée
+  if(TRACE.length>0){{
+    const se=[
+      {{position:TRACE[0].path[0],color:[0,255,100,255],r:160,label:'🟢 Départ'}},
+      {{position:TRACE[TRACE.length-1].path[TRACE[TRACE.length-1].path.length-1],color:[255,50,50,255],r:160,label:'🔴 Arrivée'}},
+    ];
+    L.push(new ScatterplotLayer({{id:'se',data:se,getPosition:d=>d.position,getColor:d=>d.color,getRadius:d=>d.r,radiusMinPixels:12,radiusMaxPixels:28,pickable:true}}));
+  }}
+  return L;
+}}
+
+function refresh(){{deckInst.setProps({{layers:buildLayers()}});}}
+refresh();
+
+// ── Toggles ──────────────────────────────────────────────────────
+for(let i=0;i<6;i++){{
+  const el=document.getElementById('l'+i);
+  el.addEventListener('change',()=>{{S['l'+i]=el.checked;refresh();}});
+}}
+
+// ── Boutons de vue ───────────────────────────────────────────────
+function setView(p){{
+  currentPitch=p;
+  deckInst.setProps({{initialViewState:{{...{js(view_state)},pitch:p,transitionDuration:600}}}});
+  ['v0','v1','v2'].forEach(id=>document.getElementById(id).classList.remove('on'));
+  if(p===52)document.getElementById('v0').classList.add('on');
+  else if(p===0)document.getElementById('v1').classList.add('on');
+  else document.getElementById('v2').classList.add('on');
+}}
+</script>
+</body>
+</html>"""
+    return html
+
+# ── Garder generate_pydeck_terrain comme alias pour compatibilité ──
+def generate_pydeck_terrain(points, cum_d_map, checkpoints, df_prediction=None,
+                             tech_segments=None, dem_elevations=None,
+                             osm_surface_data=None, active_layers=None,
+                             height=600, pitch=52):
+    """Alias de compatibilité -> délègue à generate_3d_terrain_html."""
+    html = generate_3d_terrain_html(
+        points=points, cum_d_map=cum_d_map, checkpoints=checkpoints,
+        df_prediction=df_prediction, tech_segments=tech_segments,
+        dem_elevations=dem_elevations, osm_surface_data=osm_surface_data,
+        height=height, pitch=pitch,
     )
-    deck = pdk.Deck(
-        layers=layers, initial_view_state=view_state,
-        tooltip={"html": "<b>{label}</b><br/>Dist: {dist} km | Score: {score}",
-                 "style": {"background":"rgba(0,0,0,0.8)","color":"white",
-                            "fontSize":"12px","padding":"6px"}},
-        map_style=None,
-    )
-    return deck, path_data, cp_data, tech_data
+    return html  # retourne HTML string au lieu d'un deck pydeck object
 
 
 
@@ -2156,6 +2331,12 @@ with main_tabs[0]:
         c3.metric("Fourchette −5%",res["ci_low"])
         c4.metric("Fourchette +5%",res["ci_high"])
         c5.metric("K Riegel",f"{res['K']:.3f}")
+        # Amplitude météo évolutive
+        mr=res.get("meteo_range")
+        if mr and mr.get("delta",0)>1.5:
+            st.info(f"🌡️ **Météo évolutive** : {mr['t_min']}°C → {mr['t_max']}°C (Δ {mr['delta']}°C) — chaque km intègre la météo horaire réelle de passage.")
+        elif mr:
+            st.caption(f"🌡️ Météo stable : {mr['t_min']}°C → {mr['t_max']}°C")
         df_out=res["df"]
         if not df_out.empty:
             res_t1,res_t2,res_t3=st.tabs(["📈 Allure par km","🔎 Facteurs","📋 Tableau détaillé"])
@@ -2320,57 +2501,39 @@ with main_tabs[0]:
         with col_3dp: map_pitch_3d  = st.slider("Inclinaison (°)",20,75,52,5,key="map_pitch_3d")
 
         if st.button("🌍 Générer la vue 3D",type="primary",key="btn_3d_pydeck"):
-            with st.spinner("Construction vue 3D relief ArcGIS..."):
-                active_layers = {
-                    "relief":           layer_relief,
-                    "allure_predite":   layer_allure,
-                    "surfaces_osm":     layer_osm,
-                    "zones_techniques": layer_tech and IS_TRAIL,
-                    "checkpoints_layer":layer_cp,
-                }
-                tech_segs_3d = st.session_state.get("tech_segs",[]) if IS_TRAIL else []
-                df_pred_3d   = st.session_state["res"]["df"] if "res" in st.session_state else None
+            with st.spinner("Construction vue 3D relief ArcGIS World Elevation..."):
+                tech_segs_3d = st.session_state.get("tech_segs",[]) if (IS_TRAIL and layer_tech) else []
+                df_pred_3d   = st.session_state["res"]["df"] if ("res" in st.session_state and layer_allure) else None
                 osm_data_3d  = st.session_state.get("osm_surface") if layer_osm else None
 
-                deck, path_d, cp_d, tech_d = generate_pydeck_terrain(
+                html_3d = generate_3d_terrain_html(
                     points=points, cum_d_map=cum_d_map,
                     checkpoints=checkpoints if layer_cp else [],
                     df_prediction=df_pred_3d,
                     tech_segments=tech_segs_3d,
                     dem_elevations=dem_elevations,
                     osm_surface_data=osm_data_3d,
-                    active_layers=active_layers,
+                    height=map_height_3d,
+                    pitch=map_pitch_3d,
                 )
-                # Patcher le pitch dynamiquement
-                deck.initial_view_state.pitch = map_pitch_3d
-                st.session_state["pydeck_deck"] = deck
-                st.session_state["pydeck_layers_info"] = {
-                    "path_count": len(path_d), "cp_count": len(cp_d),
-                    "tech_count": len(tech_d), "active": active_layers,
-                }
+                st.session_state["html_3d_terrain"] = html_3d
+                st.session_state["html_3d_km"] = round(total_dist_km)
 
-        if "pydeck_deck" in st.session_state:
-            st.pydeck_chart(st.session_state["pydeck_deck"],
-                            use_container_width=True, height=map_height_3d)
-            st.caption("💡 Clic gauche + glisser : rotation · Scroll : zoom · Ctrl+glisser : déplacer · Double-clic : zoom")
-
-            # Légendes dynamiques selon couches actives
-            info = st.session_state.get("pydeck_layers_info",{})
-            active = info.get("active",{})
-            leg_cols = st.columns(3)
-            with leg_cols[0]:
-                if active.get("allure_predite"):
-                    st.markdown("**⏱ Allure** : 🟢 Rapide → 🟡 → 🔴 Lent")
-                elif active.get("surfaces_osm"):
-                    st.markdown("**🌿 Surface** : ⬜ Béton · 🟤 Terre · 🟫 Roche · 🟩 Herbe · ⬛ Boue")
-                else:
-                    st.markdown("**🏔 Altitude** : 🔵 Bas → 🟢 → 🟠 → 🔴 Haut")
-            with leg_cols[1]:
-                if active.get("checkpoints_layer"):
-                    st.markdown(f"**📍 Checkpoints** : {info.get('cp_count',0)} marqueurs")
-            with leg_cols[2]:
-                if active.get("zones_techniques") and IS_TRAIL:
-                    st.markdown(f"**⚠️ Zones tech.** : {info.get('tech_count',0)} segments · 🟡→🔴 par score")
+        if "html_3d_terrain" in st.session_state:
+            import streamlit.components.v1 as components
+            components.html(st.session_state["html_3d_terrain"],
+                            height=map_height_3d, scrolling=False)
+            col_3dl1, col_3dl2 = st.columns([1, 3])
+            with col_3dl1:
+                st.download_button(
+                    "⬇️ Télécharger HTML 3D",
+                    data=st.session_state["html_3d_terrain"].encode("utf-8"),
+                    file_name=f"trail_3d_{st.session_state['html_3d_km']}km.html",
+                    mime="text/html",
+                    help="Fichier autonome — ouvre directement dans Chrome/Firefox, sans serveur"
+                )
+            with col_3dl2:
+                st.caption("💡 Couches interactives dans la carte · Glisser : rotation · Scroll : zoom · Vue oblique 52° par défaut")
 
         # ══════════════════════════════════════════════════════
         # 🎬 ANIMATION 3D CINÉMATIQUE THREE.JS
