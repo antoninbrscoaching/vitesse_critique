@@ -211,32 +211,170 @@ def fatigue_multiplier(d_plus_cum,dist_cum,d_plus_total,dist_total,rate_pct,mode
     return 1.0+rate*factor
 
 
+# ══════════════════════════════════════════════════════════════
+# SYSTÈME MÉTÉO ROBUSTE v7
+# Stratégie par priorité :
+#   1. API Open-Meteo Forecast  (J-0 → J+16)
+#   2. API Open-Meteo Archive   (données passées)
+#   3. API Open-Meteo Historical-Forecast (J-2ans → J+0)
+#   4. Modèle thermique diurne  (TOUJOURS disponible, paramètres manuels)
+# ══════════════════════════════════════════════════════════════
+
+def _diurnal_weather(hour_float, t_base, t_amp, wind_ms, humidity_pct, wind_dir_deg=180.0):
+    """
+    Modèle thermique diurne simple.
+    T_min à 6h, T_max à 14h (cycle sinusoïdal).
+    Le vent peut légèrement augmenter en milieu de journée.
+    """
+    T = t_base + t_amp * math.sin(math.pi * max(0.0, hour_float - 6.0) / 12.0)
+    W = wind_ms * (1.0 + 0.15 * math.sin(math.pi * max(0.0, hour_float - 8.0) / 10.0))
+    return {
+        "temp":      round(float(T), 1),
+        "wind":      round(float(max(0.0, W)), 1),
+        "humidity":  float(humidity_pct),
+        "wind_dir":  float(wind_dir_deg),
+        "source":    "diurnal_model",
+    }
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def get_weather_minutely(lat, lon, dt_local_naive, tz_name=TZ_NAME_DEFAULT):
-    """
-    Récupère la météo interpolée à l'heure EXACTE de passage.
-    Cache TTL=1h pour permettre les re-calculs sans re-fetch.
-    Supporte les courses longues : chaque km a sa propre heure de passage.
-    """
+def _fetch_openmeteo_forecast(lat, lon, tz_name):
+    """Forecast API Open-Meteo (J+0 → J+16)."""
     try:
-        url=(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-             "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
-             f"&timezone={tz_name}")
-        data=requests.get(url,timeout=20).json()
-        if "hourly" not in data:return None
-        times=[datetime.fromisoformat(t) for t in data["hourly"]["time"]]
-        temps=data["hourly"]["temperature_2m"];winds=data["hourly"]["wind_speed_10m"]
-        hums=data["hourly"]["relativehumidity_2m"];wdirs=data["hourly"]["wind_direction_10m"]
-        dt=dt_local_naive
-        for i in range(len(times)-1):
-            if times[i]<=dt<=times[i+1]:
-                r=(dt-times[i]).total_seconds()/max(1.0,(times[i+1]-times[i]).total_seconds())
-                a1,a2=float(wdirs[i])%360,float(wdirs[i+1])%360;da=(a2-a1+540.0)%360.0-180.0
-                return{"temp":temps[i]+r*(temps[i+1]-temps[i]),"wind":winds[i]+r*(winds[i+1]-winds[i]),
-                       "humidity":hums[i]+r*(hums[i+1]-hums[i]),"wind_dir":(a1+r*da)%360.0}
-        idx=min(range(len(times)),key=lambda i:abs(times[i]-dt))
-        return{"temp":float(temps[idx]),"wind":float(winds[idx]),"humidity":float(hums[idx]),"wind_dir":float(wdirs[idx])}
-    except:return None
+        url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+               "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
+               f"&forecast_days=16&timezone={tz_name}")
+        data = requests.get(url, timeout=15).json()
+        if "hourly" not in data: return None
+        return {
+            "times": data["hourly"]["time"],
+            "temps": data["hourly"]["temperature_2m"],
+            "winds": data["hourly"]["wind_speed_10m"],
+            "hums":  data["hourly"]["relativehumidity_2m"],
+            "wdirs": data["hourly"]["wind_direction_10m"],
+        }
+    except: return None
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _fetch_openmeteo_archive(lat, lon, date_str, tz_name):
+    """Archive API Open-Meteo (données passées)."""
+    try:
+        url = (f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}"
+               f"&start_date={date_str}&end_date={date_str}"
+               "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
+               f"&timezone={tz_name}")
+        data = requests.get(url, timeout=15).json()
+        if "hourly" not in data: return None
+        return {
+            "times": data["hourly"]["time"],
+            "temps": data["hourly"]["temperature_2m"],
+            "winds": data["hourly"]["wind_speed_10m"],
+            "hums":  data["hourly"]["relativehumidity_2m"],
+            "wdirs": data["hourly"]["wind_direction_10m"],
+        }
+    except: return None
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _fetch_openmeteo_historical_forecast(lat, lon, date_str, tz_name):
+    """Historical-Forecast API (dernières années, données réanalysées)."""
+    try:
+        url = (f"https://historical-forecast-api.open-meteo.com/v1/forecast"
+               f"?latitude={lat}&longitude={lon}"
+               f"&start_date={date_str}&end_date={date_str}"
+               "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
+               f"&timezone={tz_name}")
+        data = requests.get(url, timeout=15).json()
+        if "hourly" not in data: return None
+        return {
+            "times": data["hourly"]["time"],
+            "temps": data["hourly"]["temperature_2m"],
+            "winds": data["hourly"]["wind_speed_10m"],
+            "hums":  data["hourly"]["relativehumidity_2m"],
+            "wdirs": data["hourly"]["wind_direction_10m"],
+        }
+    except: return None
+
+def _interpolate_meteo(meteo_data, dt_local_naive):
+    """Interpole les données météo à une datetime précise."""
+    if meteo_data is None: return None
+    try:
+        times = [datetime.fromisoformat(t) for t in meteo_data["times"]]
+        temps = meteo_data["temps"]; winds = meteo_data["winds"]
+        hums  = meteo_data["hums"];  wdirs = meteo_data["wdirs"]
+        dt = dt_local_naive
+        for i in range(len(times) - 1):
+            if times[i] <= dt <= times[i+1]:
+                r = (dt - times[i]).total_seconds() / max(1.0, (times[i+1] - times[i]).total_seconds())
+                a1, a2 = float(wdirs[i]) % 360, float(wdirs[i+1]) % 360
+                da = (a2 - a1 + 540.0) % 360.0 - 180.0
+                return {
+                    "temp":     round(temps[i] + r*(temps[i+1]-temps[i]), 1),
+                    "wind":     round(winds[i] + r*(winds[i+1]-winds[i]), 1),
+                    "humidity": round(hums[i]  + r*(hums[i+1]-hums[i]),  1),
+                    "wind_dir": (a1 + r*da) % 360.0,
+                    "source":   "api",
+                }
+        # Extrapolation : point le plus proche
+        idx = min(range(len(times)), key=lambda i: abs(times[i] - dt))
+        return {"temp": float(temps[idx]), "wind": float(winds[idx]),
+                "humidity": float(hums[idx]), "wind_dir": float(wdirs[idx]), "source": "api"}
+    except: return None
+
+# Cache de session pour les données météo de la course
+_METEO_CACHE = {}
+
+def get_weather_minutely(lat, lon, dt_local_naive, tz_name=TZ_NAME_DEFAULT,
+                          # Paramètres fallback (injectés depuis UI)
+                          fallback_temp=12.0, fallback_temp_amp=4.0,
+                          fallback_wind=2.0,  fallback_humidity=60.0,
+                          fallback_wind_dir=180.0):
+    """
+    Météo évolutive à l'heure exacte de passage — 4 niveaux de fallback.
+
+    Priorité :
+      1. Forecast API  (J+0 → J+16)
+      2. Archive API   (données passées)
+      3. Historical-Forecast API
+      4. Modèle thermique diurne (toujours fiable, paramètres saisis)
+
+    Le modèle diurne fait évoluer la température et le vent au fil des heures
+    → l'allure change réellement sur une course longue.
+    """
+    today = datetime.now()
+    diff_days = (dt_local_naive.date() - today.date()).days
+    date_str = dt_local_naive.strftime("%Y-%m-%d")
+
+    # Cache session par (date_str, lat arrondi, lon arrondi) pour éviter 41+ appels API
+    cache_key = f"{date_str}_{round(lat,2)}_{round(lon,2)}"
+
+    # 1. Essayer l'API selon la plage de dates
+    meteo_data = None
+    if cache_key not in _METEO_CACHE:
+        if 0 <= diff_days <= 15:
+            meteo_data = _fetch_openmeteo_forecast(round(lat,3), round(lon,3), tz_name)
+        elif diff_days < 0 and diff_days >= -730:
+            meteo_data = _fetch_openmeteo_archive(round(lat,3), round(lon,3), date_str, tz_name)
+            if meteo_data is None:
+                meteo_data = _fetch_openmeteo_historical_forecast(round(lat,3), round(lon,3), date_str, tz_name)
+        elif diff_days > 15:
+            # Date future lointaine : essayer quand même le forecast + archive de l'an passé
+            meteo_data = _fetch_openmeteo_forecast(round(lat,3), round(lon,3), tz_name)
+            if meteo_data is None:
+                past_date = dt_local_naive.replace(year=dt_local_naive.year - 1)
+                meteo_data = _fetch_openmeteo_archive(
+                    round(lat,3), round(lon,3),
+                    past_date.strftime("%Y-%m-%d"), tz_name)
+        _METEO_CACHE[cache_key] = meteo_data
+
+    meteo_data = _METEO_CACHE.get(cache_key)
+
+    # 2. Interpoler si données API disponibles
+    result = _interpolate_meteo(meteo_data, dt_local_naive)
+    if result: return result
+
+    # 3. Fallback : modèle thermique diurne (TOUJOURS)
+    hour = dt_local_naive.hour + dt_local_naive.minute / 60.0
+    return _diurnal_weather(hour, fallback_temp, fallback_temp_amp,
+                            fallback_wind, fallback_humidity, fallback_wind_dir)
 
 @st.cache_data(show_spinner=False)
 def get_weather_archive_day(lat,lon,date_obj,tz_name=TZ_NAME_DEFAULT):
@@ -740,7 +878,11 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     wind_gate_g1,wind_gate_g2,wind_gate_min,base_cap,extra_per_pct,max_cap,
     apply_fatigue,fatigue_rate,fatigue_mode,apply_ultra,ultra_amp,
     objective_hms,show_smooth_pace,smooth_window_km,dem_elevations,
-    surface_mult=1.0,tz_name=TZ_NAME_DEFAULT):
+    surface_mult=1.0,tz_name=TZ_NAME_DEFAULT,
+    # Paramètres météo fallback (utilisés si API indisponible)
+    meteo_fallback_temp=12.0, meteo_fallback_amp=4.0,
+    meteo_fallback_wind=2.0,  meteo_fallback_humidity=60.0,
+    meteo_fallback_wind_dir=180.0):
 
     if not points or len(points)<2:raise ValueError("GPX invalide ou trop court.")
     if dem_elevations is not None and len(dem_elevations)==len(points):
@@ -809,7 +951,12 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
         lat_s=float(np.interp(d,dists_corr,lats_arr));lon_s=float(np.interp(d,dists_corr,lons_arr))
         lat0=float(np.interp(max(d-seg_len,0),dists_corr,lats_arr));lon0=float(np.interp(max(d-seg_len,0),dists_corr,lons_arr))
         cap=bearing_deg(lat0,lon0,lat_s,lon_s)
-        meteo=get_weather_minutely(lat_s,lon_s,passage_dt,tz_name)
+        meteo=get_weather_minutely(lat_s, lon_s, passage_dt, tz_name,
+                                    fallback_temp=meteo_fallback_temp,
+                                    fallback_temp_amp=meteo_fallback_amp,
+                                    fallback_wind=meteo_fallback_wind,
+                                    fallback_humidity=meteo_fallback_humidity,
+                                    fallback_wind_dir=meteo_fallback_wind_dir)
         temp_raw=meteo["temp"] if meteo else None;wind_raw=meteo["wind"] if meteo else None
         hum_raw=meteo["humidity"] if meteo else None;wdir_raw=meteo.get("wind_dir") if meteo else None
         temp_eff_val=None
@@ -2271,6 +2418,55 @@ with main_tabs[0]:
     with colf2:
         force_temps=st.checkbox("Travailler à partir d'un objectif de temps",value=True)
         temps_objectif=hms_input("Temps objectif","3:45:00",key="temps_objectif_target") if force_temps else None
+
+    # ── Météo évolutive ─────────────────────────────────────────────
+    with st.expander("🌡️ Météo de course — paramètres & fallback", expanded=True):
+        from datetime import date as _date
+        _today = _date.today()
+        _diff = (date_course - _today).days
+        if 0 <= _diff <= 15:
+            st.success(f"✅ **Météo API** disponible (J+{_diff}) — prévisions Open-Meteo chargées automatiquement km par km.")
+        elif _diff < 0 and _diff >= -730:
+            st.info(f"📂 **Météo Archive** disponible ({date_course}) — données historiques Open-Meteo.")
+        else:
+            st.warning(f"⚠️ **Date hors plage API** (J+{_diff}) — le modèle thermique diurne sera utilisé avec tes valeurs ci-dessous.")
+
+        st.caption("Ces valeurs servent de **référence et de fallback** si l'API météo est indisponible. "
+                   "Le modèle fait évoluer la température et le vent au fil des heures de course.")
+
+        mcol1, mcol2, mcol3 = st.columns(3)
+        with mcol1:
+            mf_temp   = st.number_input("🌡 Temp. au départ (°C)",    value=10.0, step=0.5,  key="mf_temp",
+                                         help="Température à l'heure de départ")
+            mf_amp    = st.number_input("📈 Amplitude diurne (°C)",   value=6.0,  step=0.5,  key="mf_amp",
+                                         help="Hausse max entre 6h et 14h. Ex: 6°C → +6°C au pic")
+        with mcol2:
+            mf_wind   = st.number_input("💨 Vent moyen (m/s)",         value=2.5,  step=0.5,  key="mf_wind",
+                                         help="Vitesse moyenne. Augmente légèrement en milieu de journée (+15%)")
+            mf_hum    = st.number_input("💧 Humidité (%)",             value=60.0, step=5.0,  key="mf_hum")
+        with mcol3:
+            mf_wdir   = st.number_input("🧭 Direction vent (° depuis)", value=180.0,step=10.0, key="mf_wdir",
+                                         help="0°=N, 90°=E, 180°=S, 270°=O")
+
+        # Aperçu de l'évolution météo sur la course
+        if temps_objectif:
+            _dur_h = hms_to_seconds(temps_objectif) / 3600.0
+        else:
+            _dur_h = 3.75
+        _h_dep = heure_course.hour + heure_course.minute/60.0
+        _preview = []
+        for _frac in [0, 0.25, 0.5, 0.75, 1.0]:
+            _h = _h_dep + _frac * _dur_h
+            _T = mf_temp + mf_amp * math.sin(math.pi * max(0.0, _h - 6.0) / 12.0)
+            _W = mf_wind * (1.0 + 0.15 * math.sin(math.pi * max(0.0, _h - 8.0) / 10.0))
+            _preview.append(f"**{_h:.0f}h** : {_T:.1f}°C / {_W:.1f}m/s")
+        st.markdown("**Évolution prévue** : " + " · ".join(_preview))
+
+    # Sauvegarder les paramètres météo pour run_prediction
+    meteo_fb = {
+        "temp": mf_temp, "amp": mf_amp,
+        "wind": mf_wind, "humidity": mf_hum, "wind_dir": mf_wdir,
+    }
     st.markdown("---")
 
     with st.expander("🔬 Cross-validation (fiabilité du modèle)"):
@@ -2293,6 +2489,7 @@ with main_tabs[0]:
         elif not any(safe_float(r.get("distance",0))>0 and hms_to_seconds(r.get("temps","0"))>0 for r in refs_raw):
             st.error("⚠️ Renseigne au moins une référence valide.")
         else:
+            _METEO_CACHE.clear()  # vider le cache pour forcer re-fetch avec nouvelles dates
             with st.spinner("Calcul en cours..."):
                 try:
                     res=run_prediction(
@@ -2314,7 +2511,13 @@ with main_tabs[0]:
                         apply_ultra=apply_ultra,ultra_amp=ultra_amp,
                         objective_hms=temps_objectif if force_temps else None,
                         show_smooth_pace=show_smooth_pace,smooth_window_km=smooth_window_km,
-                        dem_elevations=dem_elevations,surface_mult=surface_mult)
+                        dem_elevations=dem_elevations,surface_mult=surface_mult,
+                        # Paramètres météo fallback
+                        meteo_fallback_temp=meteo_fb["temp"],
+                        meteo_fallback_amp=meteo_fb["amp"],
+                        meteo_fallback_wind=meteo_fb["wind"],
+                        meteo_fallback_humidity=meteo_fb["humidity"],
+                        meteo_fallback_wind_dir=meteo_fb["wind_dir"])
                     st.session_state["res"]=res
                     st.session_state["refs_fit_vc"]=res.get("refs_fit",[])
                     st.session_state["K_riegel_vc"]=res.get("K",1.06)
