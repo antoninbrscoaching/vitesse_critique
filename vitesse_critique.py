@@ -1773,10 +1773,10 @@ def generate_pydeck_terrain(points, cum_d_map, checkpoints, df_prediction=None,
 # ══════════════════════════════════════════════════════════════
 TERRAIN_PROFILES = {
     "🛣️ Route / Plat": {
-        "k_up": 12.0, "k_down": 5.0, "down_cap": -0.08,
-        "minetti_weight": 0.60, "elev_smooth_window": 11,
-        "grade_power": 0.85, "base_cap": 0.08,
-        "extra_per_pct": 0.000, "max_cap": 0.18,
+        "k_up": 7.0, "k_down": 3.0, "down_cap": -0.04,
+        "minetti_weight": 0.70, "elev_smooth_window": 15,
+        "grade_power": 0.90, "base_cap": 0.06,
+        "extra_per_pct": 0.000, "max_cap": 0.12,
     },
     # ── Trail modéré calibré sur données historiques ─────────────────────────
     # k_up=22 : montées 8-12% réelles, entre trail modéré(18) et ultra(28)
@@ -2363,7 +2363,7 @@ with main_tabs[0]:
             for k,v in _d.items():st.session_state[f"tp_{k}"]=v
         _d=TERRAIN_PROFILES[terrain_profil]
         _profil_info={
-            "🛣️ Route / Plat":"Route, piste, parcours plat. Modèle Minetti bien calibré. k_up=12.",
+            "🛣️ Route / Plat":"Route, piste, parcours plat. Calibré v7 : k_up=7, pente +1%→+5%, écart allure max ~20s/km sur semi plat.",
             "🏔️ Trail modéré":"✅ Calibré sur historique : Jornet 3:38 / Elazzaoui 3:42-3:46 / Merillas 3:42. k_up=22, surface×1.11, fatigue 8.5%.",
             "⛰️ Ultra-trail montagneux":"D+ moyen > 100m/km. Montées techniques. k_up=28. DEM obligatoire.",
         }
@@ -2443,21 +2443,26 @@ with main_tabs[0]:
 
     with st.expander("💨 Vent"):
         apply_wind=st.checkbox("Appliquer l'effet du vent",value=True)
-        wind_mode="Lissé";wind_smooth_km=5
-        # Recalibrés v7 : cap_head=0.12 (vent face 10m/s = +12%), cap_tail=-0.06 (vent dos = -6%)
-        drag_coeff=0.018;tail_credit=0.40;wind_cap_head=0.12;wind_cap_tail=-0.06;wind_power=1.0
-        wind_gate_g1=2.0;wind_gate_g2=8.0;wind_gate_min=0.25
+        wind_mode="Lissé"
+        # Paramètres vent adaptés Route vs Trail
+        if IS_TRAIL:
+            drag_coeff=0.018; tail_credit=0.40
+            wind_cap_head=0.12; wind_cap_tail=-0.06
+            wind_smooth_km=5   # trail : vent variable par km
+        else:
+            drag_coeff=0.012; tail_credit=0.35
+            wind_cap_head=0.06; wind_cap_tail=-0.03  # route : vent fort mais +6% max
+            wind_smooth_km=9   # route : lisser sur 9 km (changements de direction fréquents)
+        wind_power=1.0; wind_gate_g1=2.0; wind_gate_g2=8.0; wind_gate_min=0.25
         if apply_wind and EXPERT:
             wind_mode=st.selectbox("Mode calcul vent",["Lissé","Global"],key="wmode").split()[0]
-            wind_smooth_km=st.slider("Lissage vent (km)",1,11,5,2)
+            wind_smooth_km=st.slider("Lissage vent (km)",1,15,wind_smooth_km,2)
             c1,c2=st.columns(2)
-            drag_coeff=c1.number_input("Coeff. aérodynamique",value=0.018,step=0.002,format="%.3f",
-                                        help="0.018 = trail (posture penchée) | 0.012 = route")
-            tail_credit=c2.slider("Crédit vent arrière",0.0,0.8,0.40,0.05)
-            wind_cap_head=st.slider("Pénalité max vent face (%)",0.00,0.25,0.12,0.01,
-                                     help="10 m/s en face ≈ +12-15% sur trail")
-            wind_cap_tail=st.slider("Gain max vent dos (%)",-0.12,0.00,-0.06,0.01,
-                                     help="10 m/s dans le dos ≈ -6%")
+            drag_coeff=c1.number_input("Coeff. aérodynamique",value=drag_coeff,step=0.002,format="%.3f",
+                                        help="0.018=trail | 0.012=route")
+            tail_credit=c2.slider("Crédit vent arrière",0.0,0.8,tail_credit,0.05)
+            wind_cap_head=st.slider("Pénalité max vent face (%)",0.00,0.25,wind_cap_head,0.01)
+            wind_cap_tail=st.slider("Gain max vent dos (%)",-0.12,0.00,wind_cap_tail,0.01)
 
     with st.expander("🔋 Fatigue en course"):
         # Fatigue activée par défaut pour le profil trail calibré
