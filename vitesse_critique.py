@@ -2474,11 +2474,15 @@ with main_tabs[0]:
             min_value=3.0,max_value=10.0,value=6.0,step=0.5,key="pace_sens_ref",
             help="6 min/km = défaut neutre. Baisser si tu cours < 4min/km pour éviter les sur-corrections météo.")
         pace_sensitivity_ref=pace_sens_ref_min*60.0
-        # Aperçu à l'allure cible
-        if force_temps and temps_objectif and (dist_forcee if force_dist else 21.0)>0:
-            _allure_s=hms_to_seconds(temps_objectif)/max(dist_forcee if force_dist else 21.0,1.0)
-            _pf=min(1.0,(_allure_s/pace_sensitivity_ref)**0.5)
-            st.info(f"À ~{_allure_s/60:.1f}min/km : impact météo/vent réduit à **{_pf*100:.0f}%** (pace factor={_pf:.2f})")
+        # Aperçu à l'allure cible (utiliser les valeurs de session si dispo)
+        try:
+            _obj_hms = st.session_state.get("temps_objectif_target","")
+            _dist_km = st.session_state.get("dist_km_input", 21.0)
+            if _obj_hms and hms_to_seconds(_obj_hms)>0 and _dist_km>0:
+                _allure_s=hms_to_seconds(_obj_hms)/float(_dist_km)
+                _pf=min(1.0,(_allure_s/pace_sensitivity_ref)**0.5)
+                st.info(f"À ~{_allure_s/60:.1f}min/km : impact météo/vent réduit à **{_pf*100:.0f}%** (pace factor={_pf:.2f})")
+        except Exception: pass
 
     pace_sensitivity_ref=st.session_state.get("pace_sens_ref",6.0)*60.0  # défaut si pas encore défini
     with st.expander("⚡ Stratégie de pacing Ultra"):
