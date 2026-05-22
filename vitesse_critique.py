@@ -906,13 +906,17 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
                            temp_max_penalty,k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down,
                            elev_ref_power,temp_ref_power)
     a,K=fit_loglog(refs_fit)
-    if objective_hms:
-        obj_s=hms_to_seconds(objective_hms);d_km=distance_cible_km
-        a=obj_s/(d_km**K) if d_km>0 else a
-
+    # Estimation initiale de la base (sera raffinée si objectif fixé)
     base_total_s=predict_flat(int(distance_cible_km*1000),a,K)
-    base_s_per_km=base_total_s/max(distance_cible_km,1e-9)
-    base_s_per_km=base_s_per_km*float(surface_mult)
+    base_s_per_km=base_total_s/max(distance_cible_km,1e-9)*float(surface_mult)
+
+    # Si objectif de temps : stocker obj_s pour la recherche itérative finale
+    obj_s_target = hms_to_seconds(objective_hms) if objective_hms else None
+    if obj_s_target and obj_s_target > 0:
+        # Estimation initiale de a à partir de l'objectif (sans facteurs)
+        # Cela donne un point de départ raisonnable pour l'itération
+        a_init = obj_s_target / (distance_cible_km**K)
+        base_s_per_km = (a_init * (distance_cible_km ** K) / max(distance_cible_km,1e-9)) * float(surface_mult)
 
     alt_mult=altitude_vo2_multiplier(avg_alt,altitude_ref_m) if apply_altitude else 1.0
 
@@ -992,9 +996,28 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
 
     if apply_ultra and ultra_amp>0:
         t_raw=apply_ultra_pacing(t_raw,df_pre["d"].values,df_pre["seg_len"].values,total_corr,ultra_amp)
-    if objective_hms:
-        s_obj=hms_to_seconds(objective_hms);s_sum=float(np.sum(t_raw))
-        t_raw=t_raw*(s_obj/s_sum) if s_sum>0 else t_raw
+
+    # ── Ajustement objectif de temps — SANS normalisation uniforme ──────────────
+    # Principe : on ne multiplie PAS tous les km par le même facteur (ce qui écraserait
+    # les variations pente/météo/vent). On recherche par bissection le base_s_per_km
+    # tel que sum(t_raw) = obj_s, en PRÉSERVANT les ratios relatifs entre km.
+    #
+    # t_raw[i] = base_s_per_km * mult_total[i]
+    # On extrait mult_total[i] = t_raw[i] / base_s_per_km_initial
+    # Puis on cherche base_opt tel que sum(base_opt * mult_total[i]) = obj_s
+    # → base_opt = obj_s / sum(mult_total[i])
+    # (C'est une équation linéaire, pas besoin de bissection ici !)
+    if obj_s_target and obj_s_target > 0 and float(np.sum(t_raw)) > 0:
+        # Extraire les multiplicateurs totaux implicites
+        # t_raw = base_s_per_km * mult_total * seg_len/1000
+        seg_lens_km = df_pre["seg_len"].values / 1000.0
+        mult_totaux = t_raw / (base_s_per_km * seg_lens_km + 1e-9)
+        # Base optimale : obj_s = sum(base_opt * mult_totaux * seg_lens_km)
+        sum_weighted_mults = float(np.sum(mult_totaux * seg_lens_km))
+        if sum_weighted_mults > 0:
+            base_opt = obj_s_target / sum_weighted_mults
+            # Recalculer t_raw avec la nouvelle base, en préservant les multiplicateurs
+            t_raw = base_opt * mult_totaux * seg_lens_km
 
     rows=[];cum_t2=0.0
     for i in range(len(df_pre)):
@@ -2422,54 +2445,17 @@ with main_tabs[0]:
         force_temps=st.checkbox("Travailler à partir d'un objectif de temps",value=True)
         temps_objectif=hms_input("Temps objectif","3:45:00",key="temps_objectif_target") if force_temps else None
 
-    # ── Météo évolutive ─────────────────────────────────────────────
-    with st.expander("🌡️ Météo de course — paramètres & fallback", expanded=True):
-        from datetime import date as _date
-        _today = _date.today()
-        _diff = (date_course - _today).days
-        if 0 <= _diff <= 15:
-            st.success(f"✅ **Météo API** disponible (J+{_diff}) — prévisions Open-Meteo chargées automatiquement km par km.")
-        elif _diff < 0 and _diff >= -730:
-            st.info(f"📂 **Météo Archive** disponible ({date_course}) — données historiques Open-Meteo.")
-        else:
-            st.warning(f"⚠️ **Date hors plage API** (J+{_diff}) — le modèle thermique diurne sera utilisé avec tes valeurs ci-dessous.")
+    # ── Info météo (automatique uniquement) ────────────────────────
+    _diff_days_race = (date_course - date.today()).days
+    if 0 <= _diff_days_race <= 15:
+        st.info(f"🌡️ **Météo automatique** — prévisions Open-Meteo km par km (J+{_diff_days_race}).")
+    elif _diff_days_race < 0:
+        st.info(f"🌡️ **Météo automatique** — archives Open-Meteo ({date_course}).")
+    else:
+        st.caption(f"🌡️ Météo : date à J+{_diff_days_race} (hors plage API) — si disponible, archives de l'an passé.")
 
-        st.caption("Ces valeurs servent de **référence et de fallback** si l'API météo est indisponible. "
-                   "Le modèle fait évoluer la température et le vent au fil des heures de course.")
-
-        mcol1, mcol2, mcol3 = st.columns(3)
-        with mcol1:
-            mf_temp   = st.number_input("🌡 Temp. au départ (°C)",    value=10.0, step=0.5,  key="mf_temp",
-                                         help="Température à l'heure de départ")
-            mf_amp    = st.number_input("📈 Amplitude diurne (°C)",   value=6.0,  step=0.5,  key="mf_amp",
-                                         help="Hausse max entre 6h et 14h. Ex: 6°C → +6°C au pic")
-        with mcol2:
-            mf_wind   = st.number_input("💨 Vent moyen (m/s)",         value=2.5,  step=0.5,  key="mf_wind",
-                                         help="Vitesse moyenne. Augmente légèrement en milieu de journée (+15%)")
-            mf_hum    = st.number_input("💧 Humidité (%)",             value=60.0, step=5.0,  key="mf_hum")
-        with mcol3:
-            mf_wdir   = st.number_input("🧭 Direction vent (° depuis)", value=180.0,step=10.0, key="mf_wdir",
-                                         help="0°=N, 90°=E, 180°=S, 270°=O")
-
-        # Aperçu de l'évolution météo sur la course
-        if temps_objectif:
-            _dur_h = hms_to_seconds(temps_objectif) / 3600.0
-        else:
-            _dur_h = 3.75
-        _h_dep = heure_course.hour + heure_course.minute/60.0
-        _preview = []
-        for _frac in [0, 0.25, 0.5, 0.75, 1.0]:
-            _h = _h_dep + _frac * _dur_h
-            _T = mf_temp + mf_amp * math.sin(math.pi * max(0.0, _h - 6.0) / 12.0)
-            _W = mf_wind * (1.0 + 0.15 * math.sin(math.pi * max(0.0, _h - 8.0) / 10.0))
-            _preview.append(f"**{_h:.0f}h** : {_T:.1f}°C / {_W:.1f}m/s")
-        st.markdown("**Évolution prévue** : " + " · ".join(_preview))
-
-    # Sauvegarder les paramètres météo pour run_prediction
-    meteo_fb = {
-        "temp": mf_temp, "amp": mf_amp,
-        "wind": mf_wind, "humidity": mf_hum, "wind_dir": mf_wdir,
-    }
+    # Paramètres météo fallback neutres (pas de saisie manuelle)
+    meteo_fb = {"temp": 12.0, "amp": 0.0, "wind": 0.0, "humidity": 60.0, "wind_dir": 180.0}
     st.markdown("---")
 
     with st.expander("🔬 Cross-validation (fiabilité du modèle)"):
