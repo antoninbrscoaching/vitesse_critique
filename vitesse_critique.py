@@ -989,9 +989,18 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     for _,row in df_pre.iterrows():
         wm=float(row["wind_mult_raw"]);g=float(row["grade"])
         gate=wind_gate(g,wind_gate_g1,wind_gate_g2,wind_gate_min);wm_gated=1.0+gate*(wm-1.0)
-        t_w=float(row["t_no_wind"])*(wm_gated**wind_power);mt=t_w/max(1e-9,float(row["t_flat"]))
-        mt=cap_combined(mt,g,base_cap,extra_per_pct,max_cap)
-        t_raw.append(float(row["t_flat"])*mt);wm_adj_list.append(wm_gated)
+        # Appliquer le vent sur t_no_wind (qui contient déjà pente + temp + fatigue)
+        t_w=float(row["t_no_wind"])*(wm_gated**wind_power)
+        # cap_combined : limiter UNIQUEMENT la composante pente pure
+        # (pas le produit total qui inclut météo+fatigue → aplatirait tout)
+        gm_capped=cap_combined(float(row["grade_mult"]),g,base_cap,extra_per_pct,max_cap)
+        # Reconstruire t_final : remplacer grade_mult par grade_mult_capped
+        gm_raw=float(row["grade_mult"])
+        if gm_raw > 0:
+            t_final=t_w*(gm_capped/gm_raw)
+        else:
+            t_final=t_w
+        t_raw.append(float(t_final));wm_adj_list.append(wm_gated)
     df_pre["wind_mult_adj"]=wm_adj_list;t_raw=np.array(t_raw,dtype=float)
 
     if apply_ultra and ultra_amp>0:
@@ -1052,8 +1061,31 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     if len(temps_valides) >= 2:
         meteo_range = {"t_min": round(min(temps_valides),1), "t_max": round(max(temps_valides),1),
                        "delta": round(max(temps_valides)-min(temps_valides),1)}
+    # Fourchette : basée sur distances officielles proches du GPX
+    # 10km=10000m, semi=21097m, marathon=42195m, 50k=50000m, 100k=100000m
+    _std_dists = {
+        "10 km":    10000,   "Semi":     21097,
+        "Marathon": 42195,   "50 km":    50000,
+        "100 km":   100000,
+    }
+    _gpx_m = dist_gpx_km * 1000.0
+    # Trouver les 2 distances standards encadrantes
+    _below = {k:v for k,v in _std_dists.items() if v <= _gpx_m * 1.05}
+    _above = {k:v for k,v in _std_dists.items() if v >= _gpx_m * 0.95}
+    _ci_ref_low = max(_below.values()) if _below else None
+    _ci_ref_high = min(_above.values()) if _above else None
+    _label_low = next((k for k,v in _std_dists.items() if v == _ci_ref_low), None)
+    _label_high = next((k for k,v in _std_dists.items() if v == _ci_ref_high), None)
+    # Temps projeté sur la distance standard (extrapolation linéaire depuis allure moy)
+    _avg_pace = total_s / max(_gpx_m, 1.0)  # s/m
+    _ci_low_hms  = seconds_to_hms(_avg_pace * _ci_ref_low)  if _ci_ref_low  else seconds_to_hms(total_s*0.97)
+    _ci_high_hms = seconds_to_hms(_avg_pace * _ci_ref_high) if _ci_ref_high else seconds_to_hms(total_s*1.03)
+    _ci_low_label  = _label_low  if _label_low  else "−3%"
+    _ci_high_label = _label_high if _label_high else "+3%"
+
     return{"df":df_out,"total_s":total_s,"total_human":seconds_to_hms(total_s),
-           "ci_low":seconds_to_hms(total_s*0.95),"ci_high":seconds_to_hms(total_s*1.05),
+           "ci_low":_ci_low_hms,"ci_high":_ci_high_hms,
+           "ci_low_label":_ci_low_label,"ci_high_label":_ci_high_label,
            "meteo_range":meteo_range,
            "dist_gpx_km":dist_gpx_km,"K":K,"avg_alt":avg_alt,"d_plus_total":d_plus_total,
            "refs_fit":refs_fit,"pre_df":df_pre}
@@ -2520,8 +2552,12 @@ with main_tabs[0]:
         c1,c2,c3,c4,c5=st.columns(5)
         c1.metric("⏱ Temps prédit",res["total_human"])
         c2.metric("📊 Allure moy.",pace_str(avg_pace_s)+"/km")
-        c3.metric("Fourchette −5%",res["ci_low"])
-        c4.metric("Fourchette +5%",res["ci_high"])
+        _lbl_low  = res.get("ci_low_label",  "Ref. −")
+        _lbl_high = res.get("ci_high_label", "Ref. +")
+        c3.metric(f"📏 {_lbl_low}", res["ci_low"],
+                  help="Temps projeté sur la distance standard inférieure la plus proche")
+        c4.metric(f"📏 {_lbl_high}", res["ci_high"],
+                  help="Temps projeté sur la distance standard supérieure la plus proche")
         c5.metric("K Riegel",f"{res['K']:.3f}")
         # Amplitude météo évolutive
         mr=res.get("meteo_range")
