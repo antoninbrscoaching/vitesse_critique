@@ -874,7 +874,9 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     # Paramètres météo fallback (utilisés si API indisponible)
     meteo_fallback_temp=12.0, meteo_fallback_amp=4.0,
     meteo_fallback_wind=2.0,  meteo_fallback_humidity=60.0,
-    meteo_fallback_wind_dir=180.0):
+    meteo_fallback_wind_dir=180.0,
+    # Pace sensitivity : atténuation conditions selon allure (défaut 360=6min/km)
+    pace_sensitivity_ref=360.0):
 
     if not points or len(points)<2:raise ValueError("GPX invalide ou trop court.")
     if dem_elevations is not None and len(dem_elevations)==len(points):
@@ -913,10 +915,15 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     # Si objectif de temps : stocker obj_s pour la recherche itérative finale
     obj_s_target = hms_to_seconds(objective_hms) if objective_hms else None
     if obj_s_target and obj_s_target > 0:
-        # Estimation initiale de a à partir de l'objectif (sans facteurs)
-        # Cela donne un point de départ raisonnable pour l'itération
         a_init = obj_s_target / (distance_cible_km**K)
         base_s_per_km = (a_init * (distance_cible_km ** K) / max(distance_cible_km,1e-9)) * float(surface_mult)
+
+    # ── Pace sensitivity : facteur d'atténuation des multiplicateurs météo/vent ──
+    # Plus l'allure est rapide, moins les conditions ont d'impact relatif.
+    # pace_sens_factor = sqrt(base_s_per_km / pace_sens_ref_s)
+    # Exemples : 3min/km → ×0.70, 5min/km → ×0.91, 6min/km → ×1.0 (référence)
+    pace_sens_ref_s = float(pace_sensitivity_ref)  # paramètre UI (défaut 360 = 6min/km)
+    pace_sens_factor = min(1.0, math.sqrt(base_s_per_km / max(1.0, pace_sens_ref_s)))
 
     alt_mult=altitude_vo2_multiplier(avg_alt,altitude_ref_m) if apply_altitude else 1.0
 
@@ -958,10 +965,16 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
         temp_eff_val=None
         if temp_raw is not None and hum_raw is not None:temp_eff_val=effective_temp(temp_raw,hum_raw,use_wbgt)
         if temp_eff_val is not None:
-            tm=temp_multiplier(temp_eff_val,opt_temp,cold_quad,hot_quad,temp_max_penalty);t4=t3*(tm**temp_power)
+            tm_raw=temp_multiplier(temp_eff_val,opt_temp,cold_quad,hot_quad,temp_max_penalty)
+            # Atténuation pace-sensitive : coureur rapide = moins sensible aux conditions
+            tm=1.0+(tm_raw-1.0)*pace_sens_factor
+            t4=t3*(tm**temp_power)
         else:tm=1.0;t4=t3
         pace_local=(t4/seg_len)*1000.0 if seg_len>0 else t4
-        head,tail=wind_components(wind_raw,wdir_raw,cap)
+        # Composantes vent atténuées selon pace_sensitivity
+        head_raw,tail_raw=wind_components(wind_raw,wdir_raw,cap)
+        head=head_raw*pace_sens_factor
+        tail=tail_raw*pace_sens_factor
         pre.append({"idx":i,"d":d,"seg_len":seg_len,"grade":grade,"grade_mult":gm,"seg_dp":seg_dp,
                     "cum_dp":cum_dp,"fat_mult":fm,"alt_mult":alt_mult,"temp_raw":temp_raw,
                     "temp_eff":temp_eff_val,"hum":hum_raw,"wind":wind_raw,"wdir":wdir_raw,"cap":cap,
@@ -2454,6 +2467,20 @@ with main_tabs[0]:
             fatigue_rate=st.slider("Ralentissement total fin de course (%)",0.0,30.0,8.5,0.5)
             fatigue_mode=st.selectbox("Type de fatigue",["mixte (recommandé)","distance (plat)","d_plus (montagne)"]).split()[0]
 
+    with st.expander("🎚️ Sensibilité aux conditions selon l'allure", expanded=False):
+        st.caption("Plus tu cours vite, moins la météo et le vent te ralentissent en proportion (temps d'exposition réduit).")
+        pace_sens_ref_min=st.slider(
+            "Allure de référence (min/km) — au-dessus : plein effet · en dessous : effet réduit",
+            min_value=3.0,max_value=10.0,value=6.0,step=0.5,key="pace_sens_ref",
+            help="6 min/km = défaut neutre. Baisser si tu cours < 4min/km pour éviter les sur-corrections météo.")
+        pace_sensitivity_ref=pace_sens_ref_min*60.0
+        # Aperçu à l'allure cible
+        if force_temps and temps_objectif and (dist_forcee if force_dist else 21.0)>0:
+            _allure_s=hms_to_seconds(temps_objectif)/max(dist_forcee if force_dist else 21.0,1.0)
+            _pf=min(1.0,(_allure_s/pace_sensitivity_ref)**0.5)
+            st.info(f"À ~{_allure_s/60:.1f}min/km : impact météo/vent réduit à **{_pf*100:.0f}%** (pace factor={_pf:.2f})")
+
+    pace_sensitivity_ref=st.session_state.get("pace_sens_ref",6.0)*60.0  # défaut si pas encore défini
     with st.expander("⚡ Stratégie de pacing Ultra"):
         apply_ultra=st.checkbox("Activer le pacing ultra",value=False)
         ultra_amp=0.0
@@ -2538,7 +2565,8 @@ with main_tabs[0]:
                         meteo_fallback_amp=meteo_fb["amp"],
                         meteo_fallback_wind=meteo_fb["wind"],
                         meteo_fallback_humidity=meteo_fb["humidity"],
-                        meteo_fallback_wind_dir=meteo_fb["wind_dir"])
+                        meteo_fallback_wind_dir=meteo_fb["wind_dir"],
+                        pace_sensitivity_ref=pace_sensitivity_ref)
                     st.session_state["res"]=res
                     st.session_state["refs_fit_vc"]=res.get("refs_fit",[])
                     st.session_state["K_riegel_vc"]=res.get("K",1.06)
@@ -2552,12 +2580,32 @@ with main_tabs[0]:
         c1,c2,c3,c4,c5=st.columns(5)
         c1.metric("⏱ Temps prédit",res["total_human"])
         c2.metric("📊 Allure moy.",pace_str(avg_pace_s)+"/km")
-        _lbl_low  = res.get("ci_low_label",  "Ref. −")
-        _lbl_high = res.get("ci_high_label", "Ref. +")
-        c3.metric(f"📏 {_lbl_low}", res["ci_low"],
-                  help="Temps projeté sur la distance standard inférieure la plus proche")
-        c4.metric(f"📏 {_lbl_high}", res["ci_high"],
-                  help="Temps projeté sur la distance standard supérieure la plus proche")
+        # Fourchette avec curseur décalage manuel
+        _std_dists={"10 km":10000,"Semi":21097,"Marathon":42195,"50 km":50000,"100 km":100000}
+        _gpx_m=res["dist_gpx_km"]*1000.0
+        _avg_pace_s=res["total_s"]/_gpx_m if _gpx_m>0 else 0
+        # Sélection distance de référence
+        ci_col1,ci_col2,ci_col3=st.columns([2,1,1])
+        with ci_col1:
+            _dist_ref_opts={"Distance GPX":_gpx_m}
+            _dist_ref_opts.update({k:v for k,v in _std_dists.items()})
+            _ref_sel=st.selectbox("📏 Distance de référence",list(_dist_ref_opts.keys()),
+                                   key="ci_dist_ref",index=0,
+                                   help="Projeter le temps sur cette distance à allure identique")
+        with ci_col2:
+            _delta_low=st.slider("Borne basse (%)",-10,0,-2,1,key="ci_delta_low",
+                                  help="Décalage négatif : objectif ambitieux")
+        with ci_col3:
+            _delta_high=st.slider("Borne haute (%)",0,10,2,1,key="ci_delta_high",
+                                   help="Décalage positif : objectif conservateur")
+        _ref_m=_dist_ref_opts[_ref_sel]
+        _t_ref=_avg_pace_s*_ref_m
+        _t_low=_t_ref*(1+_delta_low/100.0)
+        _t_high=_t_ref*(1+_delta_high/100.0)
+        _lbl_low=f"{_ref_sel} {_delta_low:+d}%"
+        _lbl_high=f"{_ref_sel} {_delta_high:+d}%"
+        c3.metric(f"📏 {_lbl_low}",seconds_to_hms(_t_low))
+        c4.metric(f"📏 {_lbl_high}",seconds_to_hms(_t_high))
         c5.metric("K Riegel",f"{res['K']:.3f}")
         # Amplitude météo évolutive
         mr=res.get("meteo_range")
