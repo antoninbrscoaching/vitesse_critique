@@ -2058,7 +2058,8 @@ with main_tabs[0]:
                 help="% de ralentissement cumulé à 100% du parcours. Ex : 18% → fin de course 18% plus lent que le rythme de base.")
             fatigue_mode=st.selectbox("Type de fatigue",["mixte (recommandé)","distance (plat)","d_plus (montagne)"]).split()[0]
             if fatigue_rate>0:
-                st.caption(f"📊 Modèle : stable jusqu'à **{fatigue_threshold}%** de la course (~{fatigue_threshold/100*tot_tmp/1000:.1f} km si GPX chargé), puis dégradation exponentielle jusqu'à **+{fatigue_rate:.0f}%** à l'arrivée.")
+                _tot_km_hint = f"~{fatigue_threshold/100*tot_tmp/1000:.1f} km" if (gpx_file and points) else "distance GPX non chargée"
+                st.caption(f"📊 Modèle : stable jusqu'à **{fatigue_threshold}%** de la course ({_tot_km_hint}), puis dégradation exponentielle jusqu'à **+{fatigue_rate:.0f}%** à l'arrivée.")
 
     with st.expander("🎚️ Sensibilité aux conditions selon l'allure",expanded=False):
         st.caption("Plus tu cours vite, moins la météo et le vent te ralentissent en proportion (temps d'exposition réduit).")
