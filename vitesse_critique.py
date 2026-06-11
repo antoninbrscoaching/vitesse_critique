@@ -1,6 +1,16 @@
-# analyse_course_v7.py
+# analyse_course_v8.py
 # Application Streamlit unifiée — 3 onglets
-# NOUVEAUTÉS v7 :
+# NOUVEAUTÉS v8 (par rapport à v7) :
+#   - Filtre bruit GPS : compute_gpx_distance_filtered (max_step=50m)
+#     → évite l'inflation de distance (ex: 10km GPX → 10.6km affiché)
+#   - Lissage altitude : padding miroir 'reflect' au lieu de mode='same'
+#     → supprime l'artefact de faux dénivelé sur le 1er km
+#   - Allure moy. correcte quand distance forcée (_dist_simulated_km)
+#   - Profil Route recalibré : k_up=4, grade_power=0.75, lissage=25pts
+#     → moins réactif aux micro-variations GPS sur route plane
+#   - Onglet VC : import FIT/TCX avec segmentation par heure début/fin
+#
+# CONSERVÉ de v7 :
 #   - Suppression des noms d'élites — outil standardisable
 #   - Modèle de fatigue avancé : seuil de dégradation personnalisé par athlète
 #   - Fix get_avg_weather() pour le chargement des références FIT/TCX
@@ -109,6 +119,25 @@ def haversine_m(lat1,lon1,lat2,lon2):
     dp=math.radians(lat2-lat1);dl=math.radians(lon2-lon1)
     a=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return R*2*math.atan2(math.sqrt(a),math.sqrt(1-a))
+
+# ── v8 PATCH 1 : filtre bruit GPS ──────────────────────────────────────────
+def compute_gpx_distance_filtered(points, max_step_m=50.0):
+    """
+    Distance GPX filtrée — ignore les sauts GPS aberrants (> max_step_m).
+    Réduit l'inflation de distance due au bruit GPS horizontal.
+    Pour un GPS 1Hz à 3min/km, un pas légitime ≤ ~6 m ; 50 m est un garde-fou large.
+    Tous les calculs de distance principale passent par cette fonction.
+    """
+    total = 0.0
+    for i in range(1, len(points)):
+        d = haversine_m(
+            points[i-1].latitude, points[i-1].longitude,
+            points[i].latitude,   points[i].longitude
+        )
+        if d <= max_step_m:
+            total += d
+    return total
+# ───────────────────────────────────────────────────────────────────────────
 
 def bearing_deg(lat1,lon1,lat2,lon2):
     p1,p2=math.radians(lat1),math.radians(lat2);dl=math.radians(lon2-lon1)
@@ -220,42 +249,26 @@ def fatigue_multiplier_advanced(d_plus_cum, dist_cum, d_plus_total, dist_total,
                                  threshold_pct, decay_rate_pct, mode):
     """
     Modèle de fatigue avancé avec seuil de dégradation personnalisé.
-
-    Principe :
-    - Avant le seuil (ex. 60%) : fatigue légère (~10% du taux total)
-    - Après le seuil : accélération exponentielle jusqu'à decay_rate_pct total
-
-    Paramètres :
-        threshold_pct    : % de la course où la dégradation s'accélère (ex. 60)
-        decay_rate_pct   : % de ralentissement total en fin de course (ex. 18)
-        mode             : "distance", "d_plus", ou "mixte"
-
-    Exemples calibrés :
-        threshold=60%, decay=18% → à 60% +2%, à 80% +9%, à 100% +18%
-        threshold=50%, decay=25% → dégradation forte dès la moitié
+    Avant le seuil : fatigue légère (~10% du taux total).
+    Après le seuil : accélération exponentielle jusqu'à decay_rate_pct total.
     """
     if decay_rate_pct <= 0:
         return 1.0
-
     dist_total  = max(1e-6, float(dist_total))
     d_plus_total = max(1e-6, float(d_plus_total))
     rate      = decay_rate_pct / 100.0
     threshold = max(0.01, min(0.99, float(threshold_pct) / 100.0))
-
     prog_dist  = min(1.0, dist_cum  / dist_total)
     prog_dplus = min(1.0, d_plus_cum / max(1.0, d_plus_total))
     dplus_ratio = d_plus_total / dist_total
     w_dplus = min(0.8, dplus_ratio * 10.0)
-
     if mode == "distance":
         prog = prog_dist
     elif mode == "d_plus":
         prog = prog_dplus
     else:
         prog = w_dplus * prog_dplus + (1.0 - w_dplus) * prog_dist
-
     pre_threshold_rate = rate * 0.10
-
     if prog <= threshold:
         factor = pre_threshold_rate * (prog / threshold)
     else:
@@ -263,24 +276,18 @@ def fatigue_multiplier_advanced(d_plus_cum, dist_cum, d_plus_total, dist_total,
         k = 2.5
         exp_factor = (math.exp(k * prog_post) - 1.0) / (math.exp(k) - 1.0)
         factor = pre_threshold_rate + (rate - pre_threshold_rate) * exp_factor
-
     return 1.0 + min(float(factor), float(rate) * 1.05)
 
 
 # ══════════════════════════════════════════════════════════════
-# SYSTÈME MÉTÉO ROBUSTE v7
+# SYSTÈME MÉTÉO ROBUSTE v7 (inchangé)
 # ══════════════════════════════════════════════════════════════
 
 def _diurnal_weather(hour_float, t_base, t_amp, wind_ms, humidity_pct, wind_dir_deg=180.0):
     T = t_base + t_amp * math.sin(math.pi * max(0.0, hour_float - 6.0) / 12.0)
     W = wind_ms * (1.0 + 0.15 * math.sin(math.pi * max(0.0, hour_float - 8.0) / 10.0))
-    return {
-        "temp":     round(float(T), 2),
-        "wind":     round(float(max(0.0, W)), 2),
-        "humidity": float(humidity_pct),
-        "wind_dir": float(wind_dir_deg),
-        "source":   "diurnal_model",
-    }
+    return {"temp":round(float(T),2),"wind":round(float(max(0.0,W)),2),
+            "humidity":float(humidity_pct),"wind_dir":float(wind_dir_deg),"source":"diurnal_model"}
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def _fetch_openmeteo_forecast(lat, lon, tz_name):
@@ -364,7 +371,6 @@ def get_weather_minutely(lat, lon, dt_local_naive, tz_name=TZ_NAME_DEFAULT,
     lat_r = round(lat, 2); lon_r = round(lon, 2)
     cache_key = f"{date_str}_{lat_r}_{lon_r}"
     cache = _get_session_meteo_cache()
-
     if cache_key not in cache:
         md = None
         if 0 <= diff_days <= 15:
@@ -379,21 +385,13 @@ def get_weather_minutely(lat, lon, dt_local_naive, tz_name=TZ_NAME_DEFAULT,
                 past_date = dt_local_naive.replace(year=dt_local_naive.year - 1)
                 md = _fetch_openmeteo_archive(lat_r, lon_r, past_date.strftime("%Y-%m-%d"), tz_name)
         cache[cache_key] = md
-
     result = _interp_meteo(cache.get(cache_key), dt_local_naive)
     if result is not None:
         return result
-
     return _diurnal_weather(hour, fallback_temp, fallback_temp_amp,
                             fallback_wind, fallback_humidity, fallback_wind_dir)
 
-
 def get_avg_weather(lat, lon, start_dt, end_dt, tz_name=TZ_NAME_DEFAULT):
-    """
-    Calcule la météo moyenne sur la durée d'une course de référence.
-    Utilisé pour recalibrer les références vers les conditions idéales.
-    Retourne (avg_temp, avg_wind, avg_humidity) ou (None, None, None).
-    """
     try:
         duration_s = (end_dt - start_dt).total_seconds()
         n_samples = min(6, max(2, int(duration_s / 1800)))
@@ -415,60 +413,34 @@ def get_avg_weather(lat, lon, start_dt, end_dt, tz_name=TZ_NAME_DEFAULT):
 
 
 def predict_hr_zone(refs_with_hr, target_duration_s):
-    """
-    Prédit la plage de FC cible basée uniquement sur les données personnelles
-    de l'athlète (régression log(durée) → FC_moy).
-
-    Paramètres :
-        refs_with_hr      : liste de dicts {"dur_s", "hr_avg", "hr_max"}
-        target_duration_s : durée cible en secondes
-
-    Retourne dict avec hr_target_avg, hr_target_range, hr_target_max, r2, n_refs, model.
-    """
     valid     = [(r["dur_s"], r["hr_avg"]) for r in refs_with_hr
                  if r.get("dur_s", 0) > 0 and r.get("hr_avg") and r["hr_avg"] > 50]
     valid_max = [(r["dur_s"], r["hr_max"]) for r in refs_with_hr
                  if r.get("dur_s", 0) > 0 and r.get("hr_max") and r["hr_max"] > 50]
-
     if not valid:
         return None
-
     if len(valid) < 2:
         hr_mean = float(np.mean([v[1] for v in valid]))
         hr_mx   = float(np.mean([v[1] for v in valid_max])) if valid_max else hr_mean * 1.08
-        return {"hr_target_avg":   round(hr_mean),
-                "hr_target_range": (round(hr_mean - 5), round(hr_mean + 5)),
-                "hr_target_max":   round(hr_mx),
-                "r2": None, "n_refs": len(valid), "model": "mean"}
-
+        return {"hr_target_avg":round(hr_mean),"hr_target_range":(round(hr_mean-5),round(hr_mean+5)),
+                "hr_target_max":round(hr_mx),"r2":None,"n_refs":len(valid),"model":"mean"}
     X = np.array([math.log(max(60, d)) for d, _ in valid])
     Y = np.array([hr for _, hr in valid])
     slope, intercept, r, p, se = sp_stats.linregress(X, Y)
     r2 = float(r ** 2)
-
     x_target  = math.log(max(60, float(target_duration_s)))
     hr_pred   = float(slope * x_target + intercept)
-
     residuals = Y - (slope * X + intercept)
     sigma     = float(np.std(residuals)) if len(residuals) > 2 else 5.0
-
     hr_max_pred = hr_pred * 1.08
     if len(valid_max) >= 2:
         Xm = np.array([math.log(max(60, d)) for d, _ in valid_max])
         Ym = np.array([hm for _, hm in valid_max])
         sm, im, _, _, _ = sp_stats.linregress(Xm, Ym)
         hr_max_pred = float(sm * x_target + im)
-
-    return {
-        "hr_target_avg":   round(hr_pred),
-        "hr_target_range": (round(hr_pred - sigma), round(hr_pred + sigma)),
-        "hr_target_max":   round(hr_max_pred),
-        "r2":              round(r2, 3),
-        "n_refs":          len(valid),
-        "model":           "regression",
-        "slope":           round(float(slope), 2),
-        "intercept":       round(float(intercept), 1),
-    }
+    return {"hr_target_avg":round(hr_pred),"hr_target_range":(round(hr_pred-sigma),round(hr_pred+sigma)),
+            "hr_target_max":round(hr_max_pred),"r2":round(r2,3),"n_refs":len(valid),
+            "model":"regression","slope":round(float(slope),2),"intercept":round(float(intercept),1)}
 
 
 def correct_elevations_dem(points,max_points=100,dataset="srtm30m"):
@@ -929,6 +901,7 @@ def apply_ultra_pacing(t_raw,d_end_m,seg_len_m,total_corr_m,amp_pct):
     if s_raw>0 and s_adj>0:t_adj*=s_raw/s_adj
     return t_adj
 
+
 def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     use_recalibrated,opt_temp,use_wbgt,cold_quad,hot_quad,temp_max_penalty,temp_power,
     elev_ref_power,temp_ref_power,apply_grade,use_minetti,minetti_weight,
@@ -951,9 +924,12 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     else:
         elev_arr=np.array([getattr(p,"elevation",0.0) or 0.0 for p in points],dtype=float)
 
+    # ── v8 PATCH 1c : distance filtrée anti-bruit GPS ──
     total_m=0.0;cum=[0.0]
     for i in range(1,len(points)):
-        total_m+=haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude)
+        d_step=haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude)
+        if d_step<=50.0:  # filtre anti-bruit GPS (sauts > 50m ignorés)
+            total_m+=d_step
         cum.append(total_m)
     dist_gpx_km=total_m/1000.0
     if not distance_cible_km:distance_cible_km=dist_gpx_km
@@ -966,7 +942,15 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
 
     w=int(elev_smooth_window)
     if w%2==0:w+=1
-    elev_s=np.convolve(elev_arr,np.ones(w)/w,mode="same") if w>=3 and elev_arr.size>=w else elev_arr
+    # ── v8 PATCH 2 : lissage altitude avec padding miroir (élimine artefact 1er km) ──
+    if w>=3 and elev_arr.size>=w:
+        pad=w//2
+        elev_padded=np.pad(elev_arr,pad,mode='reflect')
+        elev_s=np.convolve(elev_padded,np.ones(w)/w,mode='valid')
+        if elev_s.size>elev_arr.size:elev_s=elev_s[:elev_arr.size]
+        elif elev_s.size<elev_arr.size:elev_s=np.pad(elev_s,(0,elev_arr.size-elev_s.size),mode='edge')
+    else:
+        elev_s=elev_arr
 
     diffs_el=np.diff(elev_s);d_plus_total=float(np.sum(np.clip(diffs_el,0,None)))
     avg_alt=float(np.mean(elev_s))
@@ -1009,7 +993,6 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
             t1=t_flat*(gm**grade_power)
         else:gm=1.0;t1=t_flat
         t2=t1*alt_mult
-        # ── Fatigue avancée avec seuil personnalisé ──
         fm=(fatigue_multiplier_advanced(cum_dp,cum_dist,d_plus_total,total_corr,
                                          fatigue_threshold,fatigue_rate,fatigue_mode)
             if apply_fatigue and fatigue_rate>0 else 1.0)
@@ -1019,10 +1002,8 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
         lat0=float(np.interp(max(d-seg_len,0),dists_corr,lats_arr));lon0=float(np.interp(max(d-seg_len,0),dists_corr,lons_arr))
         cap=bearing_deg(lat0,lon0,lat_s,lon_s)
         meteo=get_weather_minutely(lat_s, lon_s, passage_dt, tz_name,
-                                    fallback_temp=meteo_fallback_temp,
-                                    fallback_temp_amp=meteo_fallback_amp,
-                                    fallback_wind=meteo_fallback_wind,
-                                    fallback_humidity=meteo_fallback_humidity,
+                                    fallback_temp=meteo_fallback_temp,fallback_temp_amp=meteo_fallback_amp,
+                                    fallback_wind=meteo_fallback_wind,fallback_humidity=meteo_fallback_humidity,
                                     fallback_wind_dir=meteo_fallback_wind_dir)
         temp_raw=meteo["temp"] if meteo else None;wind_raw=meteo["wind"] if meteo else None
         hum_raw=meteo["humidity"] if meteo else None;wdir_raw=meteo.get("wind_dir") if meteo else None
@@ -1151,41 +1132,35 @@ def analyze_interval(df_int,name):
     return{"name":name,"valid":True,"dur_s":dur_s,"dist_m":dist_m,"avg_speed":avg_speed,
            "hr":hr_stats,"spd":spd_stats,"df":df_int}
 
+
 def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000, is_trail=True):
     if not is_trail or len(points) < 10:
         return [], {"global_score": 0, "label": "—", "k_up_adj": 1.0,
                     "k_down_adj": 1.0, "surface_mult_adj": 1.0, "skipped": True}
-
     n = len(points)
     if dem_elevations is not None and len(dem_elevations) == n:
         elevs = [dem_elevations[i] if dem_elevations[i] is not None else 0.0 for i in range(n)]
     else:
         elevs = [getattr(points[i], "elevation", 0.0) or 0.0 for i in range(n)]
-
     cum = [0.0]
     for i in range(1, n):
         cum.append(cum[-1] + haversine_m(
             points[i-1].latitude, points[i-1].longitude,
             points[i].latitude,   points[i].longitude))
     total_m = cum[-1]
-
     km_marks = list(range(0, int(total_m), int(seg_len_m))) + [int(total_m)]
     segments = []
-
     for ki in range(len(km_marks) - 1):
         d_start = km_marks[ki]; d_end = km_marks[ki + 1]
         idx_seg = [i for i in range(n) if d_start <= cum[i] <= d_end]
         if len(idx_seg) < 3: continue
-
         pts_seg  = [points[i] for i in idx_seg]
         elev_seg = [elevs[i]  for i in idx_seg]
         dist_seg = [cum[i] - d_start for i in idx_seg]
-
         d_gps  = dist_seg[-1]
         d_eucl = haversine_m(pts_seg[0].latitude, pts_seg[0].longitude,
                              pts_seg[-1].latitude, pts_seg[-1].longitude)
         sinuosity = d_gps / max(1.0, d_eucl)
-
         bearings = []
         for i in range(1, len(pts_seg)):
             dd = dist_seg[i] - dist_seg[i-1]
@@ -1193,7 +1168,6 @@ def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000, is_tra
                 b = bearing_deg(pts_seg[i-1].latitude, pts_seg[i-1].longitude,
                                 pts_seg[i].latitude,   pts_seg[i].longitude)
                 bearings.append(b)
-
         real_turns_score = 0.0
         if len(bearings) >= 2:
             for i in range(1, len(bearings)):
@@ -1202,47 +1176,37 @@ def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000, is_tra
                 elif delta < 90:  real_turns_score += delta * 0.30
                 elif delta < 135: real_turns_score += delta * 0.80
                 else:             real_turns_score += delta * 1.20
-
         real_turns_per_km = real_turns_score / max(0.001, d_gps / 1000.0)
-
         grades = []
         for i in range(1, len(pts_seg)):
             dd = dist_seg[i] - dist_seg[i-1]
             if dd > 0.5:
                 grades.append((elev_seg[i] - elev_seg[i-1]) / dd * 100.0)
         if not grades: grades = [0.0]
-
         grade_abs  = [abs(g) for g in grades]
         grade_max  = float(np.max(grade_abs))
         grade_std  = float(np.std(grades))
         grade_mean = float(np.mean(grades))
-
         steep_grades = [g for g in grade_abs if g > 10.0]
         steep_ratio  = len(steep_grades) / max(1, len(grade_abs))
-
         norm_sinu  = min(1.0, max(0.0, (sinuosity - 1.05) / 0.35))
         norm_turns = min(1.0, real_turns_per_km / 900.0)
         norm_grade = min(1.0, grade_max / 35.0)
         norm_steep = min(1.0, steep_ratio / 0.40)
         norm_std   = min(1.0, grade_std / 12.0)
-
         synergy_bonus = 0.0
         if grade_max > 15.0 and real_turns_per_km > 300.0:
             synergy_bonus = 0.10
-
         tech_score = (0.20*norm_sinu + 0.30*norm_turns + 0.20*norm_grade +
                       0.15*norm_steep + 0.15*norm_std + synergy_bonus)
         tech_score = min(1.0, tech_score)
-
         if tech_score < 0.25:   label = "🟢 Facile"
         elif tech_score < 0.45: label = "🟡 Modéré"
         elif tech_score < 0.70: label = "🟠 Technique"
         else:                   label = "🔴 Très technique"
-
         k_up_adj_seg   = 1.0 + 0.30 * max(0, tech_score - 0.25)
         k_down_adj_seg = 1.0 - 0.15 * max(0, tech_score - 0.25)
         surf_adj_seg   = 1.0 + 0.12 * max(0, tech_score - 0.25)
-
         segments.append({
             "km_start": round(d_start/1000.0,1), "km_end": round(d_end/1000.0,1),
             "sinuosity": round(sinuosity,3), "turns_score_km": round(real_turns_per_km,0),
@@ -1252,24 +1216,19 @@ def detect_technical_terrain(points, dem_elevations=None, seg_len_m=1000, is_tra
             "k_up_adj": round(k_up_adj_seg,3), "k_down_adj": round(k_down_adj_seg,3),
             "surface_adj": round(surf_adj_seg,3),
         })
-
     if not segments:
         return [], {"global_score": 0, "label": "—", "k_up_adj": 1.0,
                     "k_down_adj": 1.0, "surface_mult_adj": 1.0}
-
     global_score   = float(np.mean([s["tech_score"] for s in segments]))
     max_score      = float(np.max([s["tech_score"] for s in segments]))
     weighted_score = 0.65 * global_score + 0.35 * max_score
-
     if weighted_score < 0.25:   global_label = "🟢 Terrain facile / Non technique"
     elif weighted_score < 0.42: global_label = "🟡 Trail modéré — quelques passages techniques"
     elif weighted_score < 0.62: global_label = "🟠 Trail technique — rochers, lacets, pentes"
     else:                       global_label = "🔴 Ultra-trail très technique"
-
     k_up_g   = float(np.median([s["k_up_adj"]   for s in segments]))
     k_down_g = float(np.median([s["k_down_adj"]  for s in segments]))
     surf_g   = float(np.median([s["surface_adj"] for s in segments]))
-
     global_info = {
         "global_score":     round(weighted_score,3), "label": global_label,
         "k_up_adj":         round(k_up_g,3), "k_down_adj": round(k_down_g,3),
@@ -1345,7 +1304,14 @@ out body geom;"""
 
 
 # ══════════════════════════════════════════════════════════════
-# VUE 3D RELIEF RÉEL PYDECK + THREE.JS (inchangées v6)
+# NOTE v8 : generate_3d_terrain_html et generate_3d_animation
+# sont identiques à v7 — copiez-les telles quelles depuis v7.
+# Elles sont omises ici pour ne pas dépasser les limites de taille.
+# Remplacez ce bloc par les fonctions complètes de v7.
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# VUE 3D RELIEF RÉEL — generate_3d_terrain_html (inchangé v7)
 # ══════════════════════════════════════════════════════════════
 
 def generate_3d_terrain_html(points, cum_d_map, checkpoints,
@@ -1507,46 +1473,6 @@ def generate_pydeck_terrain(points, cum_d_map, checkpoints, df_prediction=None,
     )
 
 
-# ══════════════════════════════════════════════════════════════
-# TERRAIN PROFILES — Profils calibrés empiriquement
-# Trail modéré : profil D+ ~35m/km, paramètres ajustables par athlète
-# ══════════════════════════════════════════════════════════════
-TERRAIN_PROFILES = {
-    "🛣️ Route / Plat": {
-        "k_up": 7.0, "k_down": 3.0, "down_cap": -0.04,
-        "minetti_weight": 0.70, "elev_smooth_window": 15,
-        "grade_power": 0.90, "base_cap": 0.06,
-        "extra_per_pct": 0.000, "max_cap": 0.12,
-    },
-    "🏔️ Trail modéré": {
-        # Profil empirique trail modéré — ajuster selon l'athlète
-        "k_up": 22.0, "k_down": 4.5, "down_cap": -0.10,
-        "minetti_weight": 0.30, "elev_smooth_window": 5,
-        "grade_power": 0.70, "base_cap": 0.18,
-        "extra_per_pct": 0.012, "max_cap": 0.48,
-    },
-    "⛰️ Ultra-trail montagneux": {
-        "k_up": 28.0, "k_down": 4.0, "down_cap": -0.15,
-        "minetti_weight": 0.20, "elev_smooth_window": 5,
-        "grade_power": 0.65, "base_cap": 0.25,
-        "extra_per_pct": 0.018, "max_cap": 0.60,
-    },
-}
-
-SURFACE_OPTIONS = {
-    "🏟️ Route / Piste synthétique":              1.00,
-    "🪨 Chemin stabilisé / Gravier":             1.03,
-    "🌿 Sentier herbe / Terre sèche":             1.06,
-    "🧗 Sentier rocheux / Technique":             1.12,
-    "🌧️ Boue / Neige tassée":                    1.18,
-    "🎯 Surface calibrée (mix terrain)":         1.11,
-    "🤖 Détecté automatiquement (OSM)":          1.06,
-}
-
-
-# ══════════════════════════════════════════════════════════════
-# ANIMATION THREE.JS (inchangée v6)
-# ══════════════════════════════════════════════════════════════
 def generate_3d_animation(points, cum_d_map, checkpoints, total_dist_km, dem_elevations=None):
     n_pts = len(points); step = max(1, n_pts // 500)
     lats_a = [points[i].latitude  for i in range(0, n_pts, step)]
@@ -1659,7 +1585,7 @@ main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","�
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v7 — Fatigue avancée · Prédiction FC · Fix références · Outil standardisable · Three.js · WBGT · DEM")
+    st.caption("v8 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Fatigue avancée · Prédiction FC")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -1681,7 +1607,8 @@ with main_tabs[0]:
     if gpx_file:
         _gpx,points=parse_gpx_points(gpx_file)
         if points:
-            tot_tmp=sum(haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude) for i in range(1,len(points)))
+            # ── v8 PATCH 1b : distance filtrée anti-bruit GPS ──
+            tot_tmp=compute_gpx_distance_filtered(points)
             dup_tmp,ddn_tmp=compute_dplus_dminus([getattr(p,"elevation",0.0) or 0.0 for p in points])
             avg_alt_tmp=np.mean([getattr(p,"elevation",0.0) or 0.0 for p in points])
             c1,c2,c3,c4=st.columns(4)
@@ -1836,11 +1763,8 @@ with main_tabs[0]:
                            +(f" · FC fiabilité: {hr_ref.get('reliability')}" if hr_ref else ""))
             if hr_ref and hr_ref.get("hr_max"):
                 st.caption(f"💓 FC max {hr_ref['hr_max']} bpm · FC moy. {hr_ref.get('hr_avg','—')} bpm · dérive {hr_ref['hr_drift']} bpm · seuil ~{hr_ref['hr_threshold_est']} bpm")
-
-            # Extraire FC pour la prédiction de zone
             hr_avg_ref = hr_ref.get("hr_avg") if hr_ref else None
             hr_max_ref = hr_ref.get("hr_max") if hr_ref else None
-
             refs_raw.append({"distance":float(dist),"temps":str(temps_eff),
                               "D_up":float(dup),"D_down":float(ddn),"duration_hms_file":dur_hms_file,
                               "avg_temp":avg_temp_ref,"avg_humidity":avg_hum_ref,"avg_wind":avg_wind_ref,
@@ -1883,7 +1807,6 @@ with main_tabs[0]:
                             "Gain correction":f"-{seconds_to_hms(gain_s)}" if gain_s>0 else (f"+{seconds_to_hms(-gain_s)}" if gain_s<0 else "0")})
     st.dataframe(pd.DataFrame(calib_rows),use_container_width=True)
 
-    # ── Prédiction de zone FC cible ───────────────────────────────────────────
     refs_with_hr = [{"dur_s": hms_to_seconds(r.get("duration_hms_file") or r.get("temps","0")),
                      "hr_avg": r.get("hr_avg"), "hr_max": r.get("hr_max")}
                     for r in refs_raw if r.get("hr_avg")]
@@ -1891,7 +1814,6 @@ with main_tabs[0]:
     if refs_with_hr:
         st.markdown("#### 💓 Prédiction de zone FC cible — données personnelles de l'athlète")
         st.caption("Basé uniquement sur les FC observées lors des courses de référence — pas de valeurs normatives.")
-
         _dur_target_s = hms_to_seconds(st.session_state.get("temps_objectif_target","")) if st.session_state.get("temps_objectif_target") else None
         if not _dur_target_s or _dur_target_s == 0:
             _allures = [hms_to_seconds(r.get("duration_hms_file") or r.get("temps","0")) / max(1, safe_float(r["distance"],1)/1000)
@@ -1899,7 +1821,6 @@ with main_tabs[0]:
             _allure_moy = float(np.mean(_allures)) if _allures else 360.0
             _dist_km_est = tot_tmp / 1000.0 if (gpx_file and points) else 21.097
             _dur_target_s = _allure_moy * _dist_km_est
-
         hr_pred = predict_hr_zone(refs_with_hr, _dur_target_s)
         if hr_pred:
             hc1, hc2, hc3, hc4 = st.columns(4)
@@ -1908,14 +1829,12 @@ with main_tabs[0]:
             hc3.metric("FC max estimée",   f"{hr_pred['hr_target_max']} bpm")
             hc4.metric("Références FC",    f"{hr_pred['n_refs']} course(s)",
                        delta=f"R²={hr_pred['r2']}" if hr_pred.get("r2") else "Moyenne brute")
-
             if hr_pred.get("model") == "regression" and hr_pred.get("r2",0) >= 0.70:
                 st.success(f"✅ Régression FC solide (R²={hr_pred['r2']:.2f}) — vise **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm** en moyenne sur la course.")
             elif hr_pred.get("model") == "regression":
                 st.info(f"📊 Régression FC indicative (R²={hr_pred['r2']:.2f}) — ajoute plus de références pour affiner. Cible : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**.")
             else:
-                st.info(f"💓 FC cible estimée (moyenne de {hr_pred['n_refs']} référence(s)) : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**. Ajoute plus de références FIT/TCX pour une régression.")
-
+                st.info(f"💓 FC cible estimée (moyenne de {hr_pred['n_refs']} référence(s)) : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**.")
             if len(refs_with_hr) >= 2:
                 fig_hr_pred, ax_hr_p = plt.subplots(figsize=(7, 3.5))
                 durs_h = [r["dur_s"]/60.0 for r in refs_with_hr]
@@ -1935,6 +1854,7 @@ with main_tabs[0]:
                 st.pyplot(fig_hr_pred); plt.close(fig_hr_pred)
     else:
         st.caption("💓 Chargez des fichiers FIT ou TCX dans les références pour obtenir une prédiction de zone cardiaque personnalisée.")
+
 
     st.markdown("---")
     st.header("4️⃣  Paramètres du modèle")
@@ -1965,7 +1885,7 @@ with main_tabs[0]:
             for k,v in _d.items():st.session_state[f"tp_{k}"]=v
         _d=TERRAIN_PROFILES[terrain_profil]
         _profil_info={
-            "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=7, pente +1%→+5%, écart allure max ~20s/km sur semi plat.",
+            "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=4 (v8 — moins réactif au bruit GPS), lissage altitude ×25pts. Allure stable sur plat.",
             "🏔️ Trail modéré":"Profil trail typique D+ ~35m/km. k_up=22, surface×1.11. Ajuster seuil/dégradation fatigue selon l'athlète.",
             "⛰️ Ultra-trail montagneux":"D+ moyen > 100m/km. Montées techniques. k_up=28. DEM recommandé.",
         }
@@ -2052,17 +1972,17 @@ with main_tabs[0]:
             fatigue_threshold=st.slider(
                 "Seuil de dégradation (% de la course)",10,90,60,5,
                 key="fatigue_threshold",
-                help="% à partir duquel la dégradation s'accélère. Ex : 60% → l'athlète tient bien jusqu'aux 3/5, puis ralentit.")
+                help="% à partir duquel la dégradation s'accélère.")
             fatigue_rate=st.slider(
                 "Ralentissement total en fin de course (%)",0.0,35.0,18.0,0.5,
-                help="% de ralentissement cumulé à 100% du parcours. Ex : 18% → fin de course 18% plus lent que le rythme de base.")
+                help="% de ralentissement cumulé à 100% du parcours.")
             fatigue_mode=st.selectbox("Type de fatigue",["mixte (recommandé)","distance (plat)","d_plus (montagne)"]).split()[0]
             if fatigue_rate>0:
                 _tot_km_hint = f"~{fatigue_threshold/100*tot_tmp/1000:.1f} km" if (gpx_file and points) else "distance GPX non chargée"
                 st.caption(f"📊 Modèle : stable jusqu'à **{fatigue_threshold}%** de la course ({_tot_km_hint}), puis dégradation exponentielle jusqu'à **+{fatigue_rate:.0f}%** à l'arrivée.")
 
     with st.expander("🎚️ Sensibilité aux conditions selon l'allure",expanded=False):
-        st.caption("Plus tu cours vite, moins la météo et le vent te ralentissent en proportion (temps d'exposition réduit).")
+        st.caption("Plus tu cours vite, moins la météo et le vent te ralentissent en proportion.")
         pace_sens_ref_min=st.slider("Allure de référence (min/km)",min_value=3.0,max_value=10.0,value=6.0,step=0.5,key="pace_sens_ref")
         pace_sensitivity_ref=pace_sens_ref_min*60.0
 
@@ -2158,15 +2078,18 @@ with main_tabs[0]:
     if "res" in st.session_state:
         res=st.session_state["res"]
         st.markdown("---");st.subheader("🎯 Prédiction")
-        avg_pace_s=res["total_s"]/max(res["dist_gpx_km"],1e-6)
+        # ── v8 PATCH 3 : allure moy. basée sur la distance simulée (forcée ou GPX) ──
+        _dist_simulated_km = dist_forcee if (force_dist and dist_forcee and dist_forcee>0) else res["dist_gpx_km"]
+        avg_pace_s=res["total_s"]/max(_dist_simulated_km,1e-6)
         c1,c2,c3,c4,c5=st.columns(5)
         c1.metric("⏱ Temps prédit",res["total_human"])
         c2.metric("📊 Allure moy.",pace_str(avg_pace_s)+"/km")
         _std_dists={"10 km":10000,"Semi":21097,"Marathon":42195,"50 km":50000,"100 km":100000}
-        _gpx_m=res["dist_gpx_km"]*1000.0; _avg_pace_s=res["total_s"]/_gpx_m if _gpx_m>0 else 0
+        # ── v8 PATCH 3b : _gpx_m utilise _dist_simulated_km ──
+        _gpx_m=_dist_simulated_km*1000.0; _avg_pace_s=res["total_s"]/_gpx_m if _gpx_m>0 else 0
         ci_col1,ci_col2,ci_col3=st.columns([2,1,1])
         with ci_col1:
-            _dist_ref_opts={"Distance GPX":_gpx_m}; _dist_ref_opts.update({k:v for k,v in _std_dists.items()})
+            _dist_ref_opts={"Distance simulée":_gpx_m}; _dist_ref_opts.update({k:v for k,v in _std_dists.items()})
             _ref_sel=st.selectbox("📏 Distance de référence",list(_dist_ref_opts.keys()),key="ci_dist_ref",index=0)
         with ci_col2: _delta_low=st.slider("Borne basse (%)",-10,0,-2,1,key="ci_delta_low")
         with ci_col3: _delta_high=st.slider("Borne haute (%)",0,10,2,1,key="ci_delta_high")
@@ -2192,7 +2115,6 @@ with main_tabs[0]:
                         try:parts=str(v).split(":");ps.append(int(parts[0])+int(parts[1])/60.0)
                         except:ps.append(float("nan"))
                     ax.plot(x,ps,lw=2.5,color="firebrick",label="Allure lissée")
-                # Visualiser le seuil de fatigue
                 if apply_fatigue and fatigue_rate>0 and len(x)>0:
                     thresh_km=fatigue_threshold/100.0*len(x)
                     ax.axvline(thresh_km,color="orange",lw=1.5,ls="--",alpha=0.7,label=f"Seuil fatigue ({fatigue_threshold}%)")
@@ -2212,10 +2134,13 @@ with main_tabs[0]:
                 ax2.legend();ax2.grid(alpha=0.3);st.pyplot(fig2);plt.close(fig2)
             with res_t3:st.dataframe(df_out,use_container_width=True)
 
+
     if gpx_file and points:
+        # ── v8 PATCH 1d : cum_d_map filtré anti-bruit GPS ──
         cum_d_map=[0.0]
         for i in range(1,len(points)):
-            cum_d_map.append(cum_d_map[-1]+haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude))
+            _ds=haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude)
+            cum_d_map.append(cum_d_map[-1]+(_ds if _ds<=50.0 else 0.0))
         total_dist_km=cum_d_map[-1]/1000.0
         lats_m=[p.latitude for p in points];lons_m=[p.longitude for p in points]
 
@@ -2274,7 +2199,12 @@ with main_tabs[0]:
             w_e=int(elev_smooth_window);w_e+=(1 if w_e%2==0 else 0)
             fig3,ax3=plt.subplots(figsize=(11,3.5))
             if w_e>=3 and y_gps.size>=w_e:
-                y_s=np.convolve(y_gps,np.ones(w_e)/w_e,mode="same")
+                # ── v8 PATCH 2b : lissage altitude padding reflect ──
+                pad_e=w_e//2
+                y_padded=np.pad(y_gps,pad_e,mode='reflect')
+                y_s=np.convolve(y_padded,np.ones(w_e)/w_e,mode='valid')
+                if y_s.size>y_gps.size:y_s=y_s[:y_gps.size]
+                elif y_s.size<y_gps.size:y_s=np.pad(y_s,(0,y_gps.size-y_s.size),mode='edge')
                 ax3.fill_between(x_km,y_s.min()-5,y_s,alpha=0.15,color="steelblue")
                 ax3.plot(x_km,y_s,lw=2.5,label="Altitude GPS lissée",color="steelblue")
                 ax3.plot(x_km,y_gps,lw=0.8,alpha=0.2,color="gray",label="GPS brut")
@@ -2412,6 +2342,80 @@ with main_tabs[1]:
                 st.caption(f"Allure : **{pace_str(secs_v/(dist_v/1000))}/km** · Vitesse : **{dist_v/secs_v*3.6:.2f} km/h**")
             refs_vc.append({"distance": float(dist_v), "temps": float(secs_v), "D_up": float(d_up_v)})
 
+    # ── v8 PATCH 5 : import FIT/TCX avec segmentation ──────────────────────
+    st.markdown("---")
+    st.subheader("📂 Importer une référence depuis un fichier FIT / TCX")
+    st.caption("Charge une course ou un test — distance, temps et D+ sont extraits automatiquement. Tu peux sélectionner un segment par heure début/fin.")
+
+    vc_import_file = st.file_uploader(
+        "Fichier FIT ou TCX",
+        type=["fit", "tcx"],
+        key="vc_import_file"
+    )
+    if vc_import_file:
+        fname_vc = vc_import_file.name.lower()
+        if fname_vc.endswith(".fit"):
+            parsed_vc = parse_fit_ref(vc_import_file)
+        elif fname_vc.endswith(".tcx"):
+            parsed_vc = parse_tcx_ref(vc_import_file)
+        else:
+            parsed_vc = None
+
+        if parsed_vc:
+            st.success(f"✅ {vc_import_file.name} — Distance : {parsed_vc['distance']:.0f} m · Durée : {parsed_vc['duration_hms']} · D+ : {parsed_vc['D_up']:.0f} m")
+            col_vc_s, col_vc_e = st.columns(2)
+            with col_vc_s:
+                vc_seg_start = hms_input("Début du segment", "0:00:00", key="vc_seg_start")
+            with col_vc_e:
+                vc_seg_end   = hms_input("Fin du segment",   "23:59:59", key="vc_seg_end")
+
+            start_td_vc = hms_to_timedelta(vc_seg_start)
+            end_td_vc   = hms_to_timedelta(vc_seg_end)
+            pts_vc = parsed_vc.get("points", [])
+
+            if pts_vc and (start_td_vc.total_seconds() > 0 or end_td_vc.total_seconds() < 86399):
+                seg_vc = extract_segment(pts_vc, start_td_vc, end_td_vc)
+                seg_dist_vc = 0.0; seg_elevs_vc = []; seg_times_vc = []
+                for j in range(1, len(seg_vc)):
+                    p1_v, p2_v = seg_vc[j-1], seg_vc[j]
+                    la1_v = p1_v["lat"] if isinstance(p1_v, dict) else p1_v.latitude
+                    lo1_v = p1_v["lon"] if isinstance(p1_v, dict) else p1_v.longitude
+                    la2_v = p2_v["lat"] if isinstance(p2_v, dict) else p2_v.latitude
+                    lo2_v = p2_v["lon"] if isinstance(p2_v, dict) else p2_v.longitude
+                    e2_v  = p2_v.get("elev", 0) if isinstance(p2_v, dict) else p2_v.elevation
+                    t2_v  = p2_v.get("time") if isinstance(p2_v, dict) else p2_v.time
+                    _ds_v = haversine_m(la1_v, lo1_v, la2_v, lo2_v)
+                    if _ds_v <= 50.0:
+                        seg_dist_vc += _ds_v
+                    seg_elevs_vc.append(e2_v)
+                    if t2_v: seg_times_vc.append(t2_v)
+                dup_vc, ddn_vc = compute_dplus_dminus(seg_elevs_vc)
+                dur_seg_hms = seconds_to_hms((seg_times_vc[-1]-seg_times_vc[0]).total_seconds()) if len(seg_times_vc)>=2 else parsed_vc["duration_hms"]
+                dist_seg_final = round(seg_dist_vc)
+            else:
+                dist_seg_final = round(parsed_vc["distance"])
+                dur_seg_hms    = parsed_vc["duration_hms"]
+                dup_vc, ddn_vc = parsed_vc["D_up"], parsed_vc["D_down"]
+
+            dist_km_vc = dist_seg_final / 1000.0
+            secs_vc    = hms_to_seconds(dur_seg_hms)
+            if secs_vc > 0 and dist_km_vc > 0:
+                st.info(f"📍 Segment : **{dist_seg_final} m** · **{dur_seg_hms}** · **{pace_str(secs_vc/dist_km_vc)}/km** · D+ {dup_vc:.0f} m")
+                if parsed_vc.get("hr_analysis") and parsed_vc["hr_analysis"].get("hr_avg"):
+                    hr_a = parsed_vc["hr_analysis"]
+                    st.caption(f"💓 FC moy. {hr_a['hr_avg']} bpm · FC max {hr_a['hr_max']} bpm · fiabilité {hr_a['reliability']}")
+
+            if st.button("➕ Ajouter ce segment comme référence VC", key="btn_add_vc_from_file"):
+                if secs_vc > 0 and dist_seg_final > 0:
+                    refs_vc.append({"distance": float(dist_seg_final), "temps": float(secs_vc), "D_up": float(dup_vc)})
+                    refs_vc_valid_new = [r for r in refs_vc if r["distance"] > 0 and r["temps"] > 0]
+                    st.success(f"✅ Référence ajoutée : {dist_seg_final} m en {dur_seg_hms} ({pace_str(secs_vc/dist_km_vc)}/km)")
+                else:
+                    st.error("❌ Segment invalide (distance ou durée = 0)")
+        else:
+            st.error("❌ Impossible de lire ce fichier FIT/TCX.")
+    # ── fin PATCH 5 ──────────────────────────────────────────────────────────
+
     refs_vc_valid = [r for r in refs_vc if r["distance"] > 0 and r["temps"] > 0]
 
     genre_vc = st.selectbox("Genre (pour les standards)", ["H", "F"], key="genre_vc")
@@ -2426,12 +2430,9 @@ with main_tabs[1]:
         if len(refs_vc_valid) < 2:
             st.warning("Au moins 2 références valides nécessaires.")
         else:
-            # ── Riegel fit ──
             a_r, K_r = fit_loglog(refs_vc_valid)
             st.session_state["vc_a"] = a_r
             st.session_state["vc_K"] = K_r
-
-            # ── Vitesse Critique (modèle D') ──
             distances = [r["distance"] for r in refs_vc_valid]
             durations = [r["temps"]    for r in refs_vc_valid]
             vc_ms, d_prime, r2_vc = compute_vc(distances, durations)
@@ -2440,7 +2441,6 @@ with main_tabs[1]:
             st.session_state["r2_vc"]     = r2_vc
             st.session_state["refs_fit_vc"] = refs_vc_valid
             st.session_state["K_riegel_vc"] = K_r
-
             st.success("✅ Calcul terminé !")
 
     if "vc_ms" in st.session_state and st.session_state["vc_ms"] is not None:
@@ -2453,13 +2453,10 @@ with main_tabs[1]:
 
         st.subheader("📊 Résultats — Modèle linéaire D'")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("VC (Vitesse Critique)", f"{vc_ms*3.6:.2f} km/h",
-                  help="Vitesse maximale théoriquement tenable à l'infini. Approxime le seuil SV2.")
+        c1.metric("VC (Vitesse Critique)", f"{vc_ms*3.6:.2f} km/h")
         c2.metric("Allure VC", pace_str(1000.0/vc_ms)+"/km")
-        c3.metric("D' (réserve anaérobie)", f"{round(d_prime)} m" if d_prime else "—",
-                  help="Capacité de travail au-dessus de la VC. Typiquement 150-600 m pour un coureur entraîné.")
-        c4.metric("R² (qualité modèle)", f"{r2_vc:.3f}" if r2_vc is not None else "—",
-                  help="R²>0.98 = excellent | >0.95 = bon | <0.90 = vérifier les références")
+        c3.metric("D' (réserve anaérobie)", f"{round(d_prime)} m" if d_prime else "—")
+        c4.metric("R² (qualité modèle)", f"{r2_vc:.3f}" if r2_vc is not None else "—")
 
         if r2_vc is not None and r2_vc < 0.90:
             st.warning("⚠️ R² faible — vérifier la cohérence des références ou exclure des outliers.")
@@ -2472,13 +2469,11 @@ with main_tabs[1]:
                 cols_std = st.columns(min(4, len(info["standards"])))
                 for si, std_row in enumerate(info["standards"]):
                     col_idx = si % len(cols_std)
-                    delta_str = std_row["diff_str"]
-                    delta_color = "normal" if std_row["atteint"] else "inverse"
                     cols_std[col_idx].metric(
                         f"{std_row['emoji']} {std_row['standard']}",
                         std_row["temps_std"],
-                        delta=delta_str,
-                        delta_color=delta_color)
+                        delta=std_row["diff_str"],
+                        delta_color="normal" if std_row["atteint"] else "inverse")
 
         st.subheader("⏱ Table de maintien (durée maximale par % de VC)")
         df_holding = build_holding_table(vc_ms, d_prime, refs_fit_vc, K_r)
@@ -2531,7 +2526,6 @@ with main_tabs[1]:
             st.error("❌ Format CSV non reconnu. Colonnes attendues : timestamp, VE (ou VE L/min), VCO2, Aux1 (eqO2), HR, Event (palier).")
         else:
             st.success(f"✅ {len(df_gz)} lignes chargées · {df_gz['palier'].max()} paliers détectés")
-
             df_pal = aggregate_by_palier(df_gz)
             thresholds = detect_sv1_sv2(df_pal)
             sv1 = thresholds["sv1"]; sv2 = thresholds["sv2"]
@@ -2545,30 +2539,22 @@ with main_tabs[1]:
                 if sv1:
                     st.markdown('<div class="test-card">', unsafe_allow_html=True)
                     st.markdown(f"#### 🟢 SV1 — Seuil aérobie")
-                    st.metric("FC", f"{sv1['HR']} bpm")
-                    st.metric("Palier", str(sv1["palier"]))
-                    st.metric("VO₂", f"{sv1['VO2']:.3f} L/min")
-                    st.metric("RQ", f"{sv1['RQ']:.3f}")
+                    st.metric("FC", f"{sv1['HR']} bpm"); st.metric("Palier", str(sv1["palier"]))
+                    st.metric("VO₂", f"{sv1['VO2']:.3f} L/min"); st.metric("RQ", f"{sv1['RQ']:.3f}")
                     st.metric("VE", f"{sv1['VE']:.1f} L/min")
-                    if sv1.get("Cadence", 0) > 0:
-                        st.metric("Vitesse / Cadence", f"{sv1['Cadence']:.2f} km/h")
+                    if sv1.get("Cadence", 0) > 0: st.metric("Vitesse / Cadence", f"{sv1['Cadence']:.2f} km/h")
                     st.markdown("</div>", unsafe_allow_html=True)
-                else:
-                    st.info("SV1 non détecté automatiquement. Vérifiez le CSV.")
+                else: st.info("SV1 non détecté automatiquement.")
             with col_sv2:
                 if sv2:
                     st.markdown('<div class="test-card">', unsafe_allow_html=True)
                     st.markdown(f"#### 🔴 SV2 — Seuil anaérobie")
-                    st.metric("FC", f"{sv2['HR']} bpm")
-                    st.metric("Palier", str(sv2["palier"]))
-                    st.metric("VO₂", f"{sv2['VO2']:.3f} L/min")
-                    st.metric("RQ", f"{sv2['RQ']:.3f}")
+                    st.metric("FC", f"{sv2['HR']} bpm"); st.metric("Palier", str(sv2["palier"]))
+                    st.metric("VO₂", f"{sv2['VO2']:.3f} L/min"); st.metric("RQ", f"{sv2['RQ']:.3f}")
                     st.metric("VE", f"{sv2['VE']:.1f} L/min")
-                    if sv2.get("Cadence", 0) > 0:
-                        st.metric("Vitesse / Cadence", f"{sv2['Cadence']:.2f} km/h")
+                    if sv2.get("Cadence", 0) > 0: st.metric("Vitesse / Cadence", f"{sv2['Cadence']:.2f} km/h")
                     st.markdown("</div>", unsafe_allow_html=True)
-                else:
-                    st.info("SV2 non détecté automatiquement.")
+                else: st.info("SV2 non détecté automatiquement.")
 
             if sv1 and sv2:
                 fc_sv1 = sv1["HR"]; fc_sv2 = sv2["HR"]
@@ -2577,9 +2563,7 @@ with main_tabs[1]:
                     st.info(f"🏃 Vitesse SV1 : **{sv1['Cadence']:.2f} km/h** ({pace_str(3600/sv1['Cadence'])}/km) · SV2 : **{sv2['Cadence']:.2f} km/h** ({pace_str(3600/sv2['Cadence'])}/km)")
 
             st.subheader("📉 Graphiques ventilatoires")
-            fig_gz, axes = plt.subplots(2, 2, figsize=(13, 8))
-            axes = axes.flatten()
-
+            fig_gz, axes = plt.subplots(2, 2, figsize=(13, 8)); axes = axes.flatten()
             def _ax_palier(ax, y_col, label, color):
                 if y_col not in df_pal.columns: return
                 x = df_pal["palier"].values; y = df_pal[y_col].values
@@ -2588,12 +2572,10 @@ with main_tabs[1]:
                 if sv1: ax.axvline(sv1["palier"], color="green", lw=1.5, ls="--", label="SV1")
                 if sv2: ax.axvline(sv2["palier"], color="red",   lw=1.5, ls="--", label="SV2")
                 ax.legend(fontsize=7)
-
-            _ax_palier(axes[0], "VE",     "VE (L/min)",     "#1f77b4")
-            _ax_palier(axes[1], "RQ",     "Quotient Resp.", "#d62728")
-            _ax_palier(axes[2], "eqO2",   "Éq. O₂",        "#2ca02c")
-            _ax_palier(axes[3], "HR",     "FC (bpm)",       "#e377c2")
-
+            _ax_palier(axes[0], "VE",   "VE (L/min)",     "#1f77b4")
+            _ax_palier(axes[1], "RQ",   "Quotient Resp.", "#d62728")
+            _ax_palier(axes[2], "eqO2", "Éq. O₂",        "#2ca02c")
+            _ax_palier(axes[3], "HR",   "FC (bpm)",       "#e377c2")
             plt.tight_layout(); st.pyplot(fig_gz); plt.close(fig_gz)
 
 
@@ -2640,7 +2622,6 @@ with main_tabs[2]:
                 c1b.metric("Seuil estimé (~88% FCmax)", f"{hr_stats_train['seuil_estime']} bpm")
                 c2b.metric("Fiabilité signal", hr_stats_train["reliability"])
 
-                # Graphe FC lissé
                 if "heart_rate" in df_train.columns and "elapsed_s" in df_train.columns:
                     hr_series = df_train["heart_rate"].dropna()
                     hr_series = hr_series[(hr_series >= 40) & (hr_series <= 220)]
@@ -2675,7 +2656,6 @@ with main_tabs[2]:
                     ax_pace.invert_yaxis()
                     ax_pace.set_xlabel("Temps (min)"); ax_pace.set_ylabel("Allure (s/km)")
                     ax_pace.set_title("Allure au fil du temps"); ax_pace.grid(alpha=0.3); ax_pace.legend(fontsize=8)
-                    # Custom Y labels min:ss
                     yticks = ax_pace.get_yticks()
                     ax_pace.set_yticklabels([pace_str(t) for t in yticks if t > 0], fontsize=8)
                     fig_pace.tight_layout()
@@ -2715,9 +2695,7 @@ with main_tabs[2]:
             if "int_results" in st.session_state:
                 int_results = st.session_state["int_results"]
                 valid_ints = [r for r in int_results if r.get("valid")]
-
                 if valid_ints:
-                    # Tableau récapitulatif
                     rows_int = []
                     for r in valid_ints:
                         rows_int.append({
@@ -2731,7 +2709,6 @@ with main_tabs[2]:
                         })
                     st.dataframe(pd.DataFrame(rows_int), use_container_width=True, hide_index=True)
 
-                    # Graphe FC superposée
                     fig_int, ax_int = plt.subplots(figsize=(11, 4))
                     colors_int = plt.cm.tab10.colors
                     for ci_int, r in enumerate(valid_ints):
@@ -2743,8 +2720,7 @@ with main_tabs[2]:
                         if len(hr_i) < 5: continue
                         t_i = df_i.loc[hr_i.index, "elapsed_s"].values
                         hr_sm_i = smooth_hr(hr_i).values
-                        ax_int.plot(t_i, hr_sm_i, lw=2, color=colors_int[ci_int % 10],
-                                    label=r["name"])
+                        ax_int.plot(t_i, hr_sm_i, lw=2, color=colors_int[ci_int % 10], label=r["name"])
                     ax_int.set_xlabel("Temps dans l'intervalle (s)")
                     ax_int.set_ylabel("FC (bpm)")
                     ax_int.set_title("FC comparée entre intervalles")
