@@ -2348,7 +2348,7 @@ with main_tabs[1]:
         st.session_state.n_refs_vc = 3
     cvc1, cvc2 = st.columns(2)
     with cvc1:
-        if st.button("➕ Ajouter", key="btn_add_vc") and st.session_state.n_refs_vc < 8:
+        if st.button("➕ Ajouter une référence", key="btn_add_vc") and st.session_state.n_refs_vc < 12:
             st.session_state.n_refs_vc += 1
     with cvc2:
         if st.button("➖ Retirer", key="btn_rm_vc") and st.session_state.n_refs_vc > 1:
@@ -2360,97 +2360,96 @@ with main_tabs[1]:
     refs_vc = []
     for i in range(1, st.session_state.n_refs_vc + 1):
         with st.expander(f"📌 Référence {i}", expanded=(i <= 3)):
-            c1, c2, c3 = st.columns([2, 2, 2])
-            with c1:
-                preset = st.selectbox("Distance", list(DIST_PRESETS.keys()),
-                                       key=f"vc_preset_{i}", index=0)
-                if DIST_PRESETS[preset] > 0:
-                    dist_v = float(DIST_PRESETS[preset])
-                else:
-                    dist_v = c1.number_input("Distance (m)", value=float(st.session_state.get(f"vc_dist_{i}", 5000)),
-                                              min_value=100.0, key=f"vc_dist_{i}")
-            with c2:
-                t_v = hms_input("Temps", default="0:20:00", key=f"vc_temps_{i}")
-            with c3:
-                d_up_v = st.number_input("D+ (m, facultatif)", value=0.0, step=10.0, key=f"vc_dup_{i}")
-            secs_v = hms_to_seconds(t_v)
-            if dist_v > 0 and secs_v > 0:
-                st.caption(f"Allure : **{pace_str(secs_v/(dist_v/1000))}/km** · Vitesse : **{dist_v/secs_v*3.6:.2f} km/h**")
-            refs_vc.append({"distance": float(dist_v), "temps": float(secs_v), "D_up": float(d_up_v)})
 
-    # ── v8 PATCH 5 : import FIT/TCX avec segmentation ──────────────────────
-    st.markdown("---")
-    st.subheader("📂 Importer une référence depuis un fichier FIT / TCX")
-    st.caption("Charge une course ou un test — distance, temps et D+ sont extraits automatiquement. Tu peux sélectionner un segment par heure début/fin.")
+            use_file_vc = st.checkbox("📂 Importer depuis un fichier FIT/TCX",
+                                      key=f"vc_use_file_{i}")
 
-    vc_import_file = st.file_uploader(
-        "Fichier FIT ou TCX",
-        type=["fit", "tcx"],
-        key="vc_import_file"
-    )
-    if vc_import_file:
-        fname_vc = vc_import_file.name.lower()
-        if fname_vc.endswith(".fit"):
-            parsed_vc = parse_fit_ref(vc_import_file)
-        elif fname_vc.endswith(".tcx"):
-            parsed_vc = parse_tcx_ref(vc_import_file)
-        else:
-            parsed_vc = None
+            dist_v = 5000.0
+            secs_v = 0.0
+            d_up_v = 0.0
+            hr_ref_vc = None
 
-        if parsed_vc:
-            st.success(f"✅ {vc_import_file.name} — Distance : {parsed_vc['distance']:.0f} m · Durée : {parsed_vc['duration_hms']} · D+ : {parsed_vc['D_up']:.0f} m")
-            col_vc_s, col_vc_e = st.columns(2)
-            with col_vc_s:
-                vc_seg_start = hms_input("Début du segment", "0:00:00", key="vc_seg_start")
-            with col_vc_e:
-                vc_seg_end   = hms_input("Fin du segment",   "23:59:59", key="vc_seg_end")
+            if use_file_vc:
+                file_vc_i = st.file_uploader(
+                    "Fichier FIT ou TCX",
+                    type=["fit", "tcx"],
+                    key=f"vc_file_{i}"
+                )
+                if file_vc_i:
+                    fname_vc_i = file_vc_i.name.lower()
+                    if fname_vc_i.endswith(".fit"):
+                        parsed_vc_i = parse_fit_ref(file_vc_i)
+                    elif fname_vc_i.endswith(".tcx"):
+                        parsed_vc_i = parse_tcx_ref(file_vc_i)
+                    else:
+                        parsed_vc_i = None
 
-            start_td_vc = hms_to_timedelta(vc_seg_start)
-            end_td_vc   = hms_to_timedelta(vc_seg_end)
-            pts_vc = parsed_vc.get("points", [])
-
-            if pts_vc and (start_td_vc.total_seconds() > 0 or end_td_vc.total_seconds() < 86399):
-                seg_vc = extract_segment(pts_vc, start_td_vc, end_td_vc)
-                seg_dist_vc = 0.0; seg_elevs_vc = []; seg_times_vc = []
-                for j in range(1, len(seg_vc)):
-                    p1_v, p2_v = seg_vc[j-1], seg_vc[j]
-                    la1_v = p1_v["lat"] if isinstance(p1_v, dict) else p1_v.latitude
-                    lo1_v = p1_v["lon"] if isinstance(p1_v, dict) else p1_v.longitude
-                    la2_v = p2_v["lat"] if isinstance(p2_v, dict) else p2_v.latitude
-                    lo2_v = p2_v["lon"] if isinstance(p2_v, dict) else p2_v.longitude
-                    e2_v  = p2_v.get("elev", 0) if isinstance(p2_v, dict) else p2_v.elevation
-                    t2_v  = p2_v.get("time") if isinstance(p2_v, dict) else p2_v.time
-                    _ds_v = haversine_m(la1_v, lo1_v, la2_v, lo2_v)
-                    if _ds_v <= 50.0:
-                        seg_dist_vc += _ds_v
-                    seg_elevs_vc.append(e2_v)
-                    if t2_v: seg_times_vc.append(t2_v)
-                dup_vc, ddn_vc = compute_dplus_dminus(seg_elevs_vc)
-                dur_seg_hms = seconds_to_hms((seg_times_vc[-1]-seg_times_vc[0]).total_seconds()) if len(seg_times_vc)>=2 else parsed_vc["duration_hms"]
-                dist_seg_final = round(seg_dist_vc)
+                    if parsed_vc_i:
+                        st.success(f"✅ {file_vc_i.name} — {parsed_vc_i['distance']:.0f} m · {parsed_vc_i['duration_hms']} · D+ {parsed_vc_i['D_up']:.0f} m")
+                        col_vs, col_ve = st.columns(2)
+                        with col_vs:
+                            vc_sh = hms_input("Début segment", "0:00:00", key=f"vc_seg_start_{i}")
+                        with col_ve:
+                            vc_eh = hms_input("Fin segment",   "23:59:59", key=f"vc_seg_end_{i}")
+                        start_td_i = hms_to_timedelta(vc_sh)
+                        end_td_i   = hms_to_timedelta(vc_eh)
+                        pts_i = parsed_vc_i.get("points", [])
+                        if pts_i and (start_td_i.total_seconds() > 0 or end_td_i.total_seconds() < 86399):
+                            seg_i = extract_segment(pts_i, start_td_i, end_td_i)
+                            seg_dist_i = 0.0; seg_elevs_i = []; seg_times_i = []
+                            for j in range(1, len(seg_i)):
+                                p1v, p2v = seg_i[j-1], seg_i[j]
+                                la1 = p1v["lat"] if isinstance(p1v, dict) else p1v.latitude
+                                lo1 = p1v["lon"] if isinstance(p1v, dict) else p1v.longitude
+                                la2 = p2v["lat"] if isinstance(p2v, dict) else p2v.latitude
+                                lo2 = p2v["lon"] if isinstance(p2v, dict) else p2v.longitude
+                                e2  = p2v.get("elev", 0) if isinstance(p2v, dict) else p2v.elevation
+                                t2  = p2v.get("time") if isinstance(p2v, dict) else p2v.time
+                                _ds = haversine_m(la1, lo1, la2, lo2)
+                                if _ds <= 50.0:
+                                    seg_dist_i += _ds
+                                seg_elevs_i.append(e2)
+                                if t2: seg_times_i.append(t2)
+                            d_up_v, _ = compute_dplus_dminus(seg_elevs_i)
+                            dur_i = seconds_to_hms((seg_times_i[-1]-seg_times_i[0]).total_seconds()) if len(seg_times_i)>=2 else parsed_vc_i["duration_hms"]
+                            dist_v = float(round(seg_dist_i))
+                        else:
+                            dist_v = float(parsed_vc_i["distance"])
+                            dur_i  = parsed_vc_i["duration_hms"]
+                            d_up_v = float(parsed_vc_i["D_up"])
+                        secs_v = float(hms_to_seconds(dur_i))
+                        hr_ref_vc = parsed_vc_i.get("hr_analysis")
+                        if secs_v > 0 and dist_v > 0:
+                            st.caption(f"📍 **{dist_v:.0f} m** · **{dur_i}** · **{pace_str(secs_v/(dist_v/1000))}/km** · D+ {d_up_v:.0f} m")
+                        if hr_ref_vc and hr_ref_vc.get("hr_avg"):
+                            st.caption(f"💓 FC moy. {hr_ref_vc['hr_avg']} bpm · FC max {hr_ref_vc['hr_max']} bpm · fiabilité {hr_ref_vc['reliability']}")
+                    else:
+                        st.error("❌ Impossible de lire ce fichier FIT/TCX.")
             else:
-                dist_seg_final = round(parsed_vc["distance"])
-                dur_seg_hms    = parsed_vc["duration_hms"]
-                dup_vc, ddn_vc = parsed_vc["D_up"], parsed_vc["D_down"]
+                c1, c2, c3 = st.columns([2, 2, 2])
+                with c1:
+                    preset = st.selectbox("Distance", list(DIST_PRESETS.keys()),
+                                           key=f"vc_preset_{i}", index=0)
+                    if DIST_PRESETS[preset] > 0:
+                        dist_v = float(DIST_PRESETS[preset])
+                    else:
+                        dist_v = st.number_input("Distance (m)",
+                                                  value=float(st.session_state.get(f"vc_dist_{i}", 5000)),
+                                                  min_value=100.0, key=f"vc_dist_{i}")
+                with c2:
+                    t_v = hms_input("Temps", default="0:20:00", key=f"vc_temps_{i}")
+                with c3:
+                    d_up_v = st.number_input("D+ (m)", value=0.0, step=10.0, key=f"vc_dup_{i}")
+                secs_v = float(hms_to_seconds(t_v))
+                if dist_v > 0 and secs_v > 0:
+                    st.caption(f"Allure : **{pace_str(secs_v/(dist_v/1000))}/km** · Vitesse : **{dist_v/secs_v*3.6:.2f} km/h**")
 
-            dist_km_vc = dist_seg_final / 1000.0
-            secs_vc    = hms_to_seconds(dur_seg_hms)
-            if secs_vc > 0 and dist_km_vc > 0:
-                st.info(f"📍 Segment : **{dist_seg_final} m** · **{dur_seg_hms}** · **{pace_str(secs_vc/dist_km_vc)}/km** · D+ {dup_vc:.0f} m")
-                if parsed_vc.get("hr_analysis") and parsed_vc["hr_analysis"].get("hr_avg"):
-                    hr_a = parsed_vc["hr_analysis"]
-                    st.caption(f"💓 FC moy. {hr_a['hr_avg']} bpm · FC max {hr_a['hr_max']} bpm · fiabilité {hr_a['reliability']}")
-
-            if st.button("➕ Ajouter ce segment comme référence VC", key="btn_add_vc_from_file"):
-                if secs_vc > 0 and dist_seg_final > 0:
-                    refs_vc.append({"distance": float(dist_seg_final), "temps": float(secs_vc), "D_up": float(dup_vc)})
-                    refs_vc_valid_new = [r for r in refs_vc if r["distance"] > 0 and r["temps"] > 0]
-                    st.success(f"✅ Référence ajoutée : {dist_seg_final} m en {dur_seg_hms} ({pace_str(secs_vc/dist_km_vc)}/km)")
-                else:
-                    st.error("❌ Segment invalide (distance ou durée = 0)")
-        else:
-            st.error("❌ Impossible de lire ce fichier FIT/TCX.")
-    # ── fin PATCH 5 ──────────────────────────────────────────────────────────
+            refs_vc.append({
+                "distance": float(dist_v),
+                "temps":    float(secs_v),
+                "D_up":     float(d_up_v),
+                "hr_analysis": hr_ref_vc,
+            })
 
     refs_vc_valid = [r for r in refs_vc if r["distance"] > 0 and r["temps"] > 0]
 
