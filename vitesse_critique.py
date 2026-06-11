@@ -1567,6 +1567,42 @@ function rst(){playing=false;frac=0;drawn=-1;cumDP=0;lcp=-1;lastSI=-1;segs.forEa
 
 
 # ══════════════════════════════════════════════════════════════
+# TERRAIN PROFILES — v8 PATCH 4 : Route recalibrée
+# ══════════════════════════════════════════════════════════════
+TERRAIN_PROFILES = {
+    "🛣️ Route / Plat": {
+        # v8 : k_up 7→4, grade_power 0.90→0.75, lissage 15→25
+        # Moins réactif aux micro-variations GPS sur route plane
+        "k_up": 4.0, "k_down": 2.5, "down_cap": -0.03,
+        "minetti_weight": 0.80, "elev_smooth_window": 25,
+        "grade_power": 0.75, "base_cap": 0.04,
+        "extra_per_pct": 0.000, "max_cap": 0.08,
+    },
+    "🏔️ Trail modéré": {
+        "k_up": 22.0, "k_down": 4.5, "down_cap": -0.10,
+        "minetti_weight": 0.30, "elev_smooth_window": 5,
+        "grade_power": 0.70, "base_cap": 0.18,
+        "extra_per_pct": 0.012, "max_cap": 0.48,
+    },
+    "⛰️ Ultra-trail montagneux": {
+        "k_up": 28.0, "k_down": 4.0, "down_cap": -0.15,
+        "minetti_weight": 0.20, "elev_smooth_window": 5,
+        "grade_power": 0.65, "base_cap": 0.25,
+        "extra_per_pct": 0.018, "max_cap": 0.60,
+    },
+}
+
+SURFACE_OPTIONS = {
+    "🏟️ Route / Piste synthétique":              1.00,
+    "🪨 Chemin stabilisé / Gravier":             1.03,
+    "🌿 Sentier herbe / Terre sèche":             1.06,
+    "🧗 Sentier rocheux / Technique":             1.12,
+    "🌧️ Boue / Neige tassée":                    1.18,
+    "🎯 Surface calibrée (mix terrain)":         1.11,
+    "🤖 Détecté automatiquement (OSM)":          1.06,
+}
+
+# ══════════════════════════════════════════════════════════════
 # UI PRINCIPALE
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
