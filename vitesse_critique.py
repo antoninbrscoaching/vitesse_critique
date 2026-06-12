@@ -990,16 +990,66 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     lons_arr=np.array([p.longitude for p in points],dtype=float)
     dt_dep=datetime.combine(date_course,heure_course)
 
+    # ── Pré-calcul par km : D+ réel + multiplicateur de pente pondéré ──
+    #
+    # CORRECTION PHYSIQUE FONDAMENTALE :
+    # La vitesse dépend de la pente INSTANTANÉE, pas de la pente nette du km.
+    # 80m D+ sur 400m à 20% + 600m plat ≠ 80m D+ sur 1000m à 8% en termes de vitesse.
+    # Le modèle calcule donc :
+    #   - seg_dp : D+ réel par cumul des diffs entre points GPX (pas diff extrémités)
+    #   - grade_mult : moyenne pondérée des multiplicateurs Minetti/heuristique
+    #                  calculés point par point, pondérés par la longueur de chaque micro-segment
+    #
+    _km_bounds = [0.0] + list(km_marks)
+    _seg_dplus_arr = []
+    _seg_grade_mult_arr = []
+    _seg_grade_nette_arr = []
+    for _ki in range(len(_km_bounds)-1):
+        _d0, _d1 = _km_bounds[_ki], _km_bounds[_ki+1]
+        _mask = (dists_corr[:-1] >= _d0) & (dists_corr[:-1] < _d1)
+        if _mask.sum() < 1:
+            _seg_dplus_arr.append(0.0)
+            _seg_grade_mult_arr.append(1.0)
+            _seg_grade_nette_arr.append(0.0)
+            continue
+        _idx = np.where(_mask)[0]
+        _idx_end = min(_idx[-1]+2, len(elev_s))
+        _elev_seg = elev_s[_idx[0]:_idx_end]
+        _dist_seg = dists_corr[_idx[0]:_idx_end]
+        # D+ réel
+        _seg_dplus_arr.append(float(np.sum(np.clip(np.diff(_elev_seg),0,None))))
+        # Multiplicateur de pente pondéré point à point
+        _total_w = 0.0; _weighted_mult = 0.0; _weighted_grade = 0.0
+        for _j in range(len(_elev_seg)-1):
+            _dd = float(_dist_seg[_j+1] - _dist_seg[_j]) if _j+1<len(_dist_seg) else 1.0
+            if _dd <= 0: continue
+            _g_pt = (_elev_seg[_j+1]-_elev_seg[_j])/_dd*100.0
+            _m_pt = combined_grade_multiplier(_g_pt,use_minetti,minetti_weight,
+                                               k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down)
+            _weighted_mult  += _m_pt * _dd
+            _weighted_grade += _g_pt * _dd
+            _total_w += _dd
+        if _total_w > 0:
+            _seg_grade_mult_arr.append(_weighted_mult / _total_w)
+            _seg_grade_nette_arr.append(_weighted_grade / _total_w)
+        else:
+            _seg_grade_mult_arr.append(1.0)
+            _seg_grade_nette_arr.append(0.0)
+
     pre=[];cum_t=cum_dp=cum_dist=0.0
     for i,d in enumerate(km_marks):
         seg_len=1000.0
         if i==len(km_marks)-1 and last>1e-6:seg_len=d-(km_marks[-2] if len(km_marks)>=2 else 0)
+        # Pente nette du km (pour affichage et cap_combined)
         e_cur=float(np.interp(d,dists_corr,elev_s))
         e_prv=float(np.interp(max(d-seg_len,0),dists_corr,elev_s)) if i>0 else e_cur
-        grade=(e_cur-e_prv)/max(1e-6,seg_len)*100.0;seg_dp=max(0.0,e_cur-e_prv)
+        grade=(e_cur-e_prv)/max(1e-6,seg_len)*100.0
+        # D+ et multiplicateur pente : valeurs pré-calculées point par point
+        seg_dp=_seg_dplus_arr[i] if i<len(_seg_dplus_arr) else max(0.0,e_cur-e_prv)
         cum_dp+=seg_dp;cum_dist+=seg_len;t_flat=base_s_per_km*(seg_len/1000.0)
         if apply_grade:
-            gm=combined_grade_multiplier(grade,use_minetti,minetti_weight,k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down)
+            # Multiplicateur pondéré point par point (pré-calculé)
+            gm=_seg_grade_mult_arr[i] if i<len(_seg_grade_mult_arr) else combined_grade_multiplier(grade,use_minetti,minetti_weight,k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down)
             t1=t_flat*(gm**grade_power)
         else:gm=1.0;t1=t_flat
         t2=t1*alt_mult
