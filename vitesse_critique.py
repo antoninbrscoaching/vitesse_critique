@@ -121,22 +121,29 @@ def haversine_m(lat1,lon1,lat2,lon2):
     return R*2*math.atan2(math.sqrt(a),math.sqrt(1-a))
 
 # ── v8 PATCH 1 : filtre bruit GPS ──────────────────────────────────────────
-def compute_gpx_distance_filtered(points, max_step_m=50.0):
+def compute_gpx_distance_filtered(points, max_step_m=None):
     """
-    Distance GPX filtrée — ignore les sauts GPS aberrants (> max_step_m).
-    Réduit l'inflation de distance due au bruit GPS horizontal.
-    Pour un GPS 1Hz à 3min/km, un pas légitime ≤ ~6 m ; 50 m est un garde-fou large.
-    Tous les calculs de distance principale passent par cette fonction.
+    Distance GPX filtrée — ignore les sauts GPS aberrants.
+    Le seuil est adaptatif : max(100m, médiane_des_pas × 10).
+    - Trace activité 1Hz dense (médiane ~5m)  → seuil ~100m
+    - Parcours course peu dense (médiane ~30m) → seuil ~300m
+    Cela évite de couper les GPX de parcours où les pas légitimes
+    peuvent dépasser 200m (ex : UTSJ 137km avec seuil fixe 50m = 78km).
     """
-    total = 0.0
+    import statistics as _stats
+    steps = []
     for i in range(1, len(points)):
         d = haversine_m(
             points[i-1].latitude, points[i-1].longitude,
             points[i].latitude,   points[i].longitude
         )
-        if d <= max_step_m:
-            total += d
-    return total
+        steps.append(d)
+    if not steps:
+        return 0.0
+    if max_step_m is None:
+        med = _stats.median(steps)
+        max_step_m = max(100.0, min(2000.0, med * 10))
+    return sum(s for s in steps if s <= max_step_m)
 # ───────────────────────────────────────────────────────────────────────────
 
 def bearing_deg(lat1,lon1,lat2,lon2):
@@ -924,11 +931,14 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     else:
         elev_arr=np.array([getattr(p,"elevation",0.0) or 0.0 for p in points],dtype=float)
 
-    # ── v8 PATCH 1c : distance filtrée anti-bruit GPS ──
+    # ── v8 PATCH 1c : distance filtrée anti-bruit GPS (seuil adaptatif) ──
+    import statistics as _stats_rp
+    _all_steps_rp = [haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude) for i in range(1,len(points))]
+    _med_rp = _stats_rp.median(_all_steps_rp) if _all_steps_rp else 5.0
+    _max_step_rp = max(100.0, min(2000.0, _med_rp * 10))
     total_m=0.0;cum=[0.0]
-    for i in range(1,len(points)):
-        d_step=haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude)
-        if d_step<=50.0:  # filtre anti-bruit GPS (sauts > 50m ignorés)
+    for d_step in _all_steps_rp:
+        if d_step<=_max_step_rp:
             total_m+=d_step
         cum.append(total_m)
     dist_gpx_km=total_m/1000.0
@@ -1643,8 +1653,8 @@ with main_tabs[0]:
     if gpx_file:
         _gpx,points=parse_gpx_points(gpx_file)
         if points:
-            # ── v8 PATCH 1b : distance filtrée anti-bruit GPS ──
-            tot_tmp=compute_gpx_distance_filtered(points)
+            # ── v8 PATCH 1b : distance filtrée anti-bruit GPS (seuil adaptatif) ──
+            tot_tmp=compute_gpx_distance_filtered(points)  # seuil = médiane×10
             dup_tmp,ddn_tmp=compute_dplus_dminus([getattr(p,"elevation",0.0) or 0.0 for p in points])
             avg_alt_tmp=np.mean([getattr(p,"elevation",0.0) or 0.0 for p in points])
             c1,c2,c3,c4=st.columns(4)
@@ -2036,7 +2046,7 @@ with main_tabs[0]:
     st.header("5️⃣  Paramètres de la course cible")
     c1,c2=st.columns(2)
     date_course=c1.date_input("📅 Date de course",value=date.today())
-    heure_course=c2.time_input("⏰ Heure de départ",value=time(9,0))
+    heure_course=c2.time_input("⏰ Heure de départ",value=time(9,0),step=60)  # step=60s → saisie HH:MM:SS possible
     colf1,colf2=st.columns(2)
     with colf1:
         force_dist=st.checkbox("Forcer la distance",value=False)
@@ -2172,11 +2182,14 @@ with main_tabs[0]:
 
 
     if gpx_file and points:
-        # ── v8 PATCH 1d : cum_d_map filtré anti-bruit GPS ──
+        # ── v8 PATCH 1d : cum_d_map filtré anti-bruit GPS (seuil adaptatif) ──
+        import statistics as _stats_cm
+        _steps_cm=[haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude) for i in range(1,len(points))]
+        _med_cm=_stats_cm.median(_steps_cm) if _steps_cm else 5.0
+        _max_step_cm=max(100.0,min(2000.0,_med_cm*10))
         cum_d_map=[0.0]
-        for i in range(1,len(points)):
-            _ds=haversine_m(points[i-1].latitude,points[i-1].longitude,points[i].latitude,points[i].longitude)
-            cum_d_map.append(cum_d_map[-1]+(_ds if _ds<=50.0 else 0.0))
+        for _ds in _steps_cm:
+            cum_d_map.append(cum_d_map[-1]+(_ds if _ds<=_max_step_cm else 0.0))
         total_dist_km=cum_d_map[-1]/1000.0
         lats_m=[p.latitude for p in points];lons_m=[p.longitude for p in points]
 
@@ -2406,7 +2419,7 @@ with main_tabs[1]:
                                 e2  = p2v.get("elev", 0) if isinstance(p2v, dict) else p2v.elevation
                                 t2  = p2v.get("time") if isinstance(p2v, dict) else p2v.time
                                 _ds = haversine_m(la1, lo1, la2, lo2)
-                                if _ds <= 50.0:
+                                if _ds <= _max_step_vc:
                                     seg_dist_i += _ds
                                 seg_elevs_i.append(e2)
                                 if t2: seg_times_i.append(t2)
