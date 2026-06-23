@@ -2459,6 +2459,18 @@ with main_tabs[1]:
                         pts_i = parsed_vc_i.get("points", [])
                         if pts_i and (start_td_i.total_seconds() > 0 or end_td_i.total_seconds() < 86399):
                             seg_i = extract_segment(pts_i, start_td_i, end_td_i)
+                            # ── fix : seuil adaptatif anti-bruit GPS (médiane × 10), même logique que v8 PATCH 1 ──
+                            import statistics as _stats_vc
+                            _steps_vc_pre = []
+                            for _k in range(1, len(seg_i)):
+                                _p1k, _p2k = seg_i[_k-1], seg_i[_k]
+                                _la1k = _p1k["lat"] if isinstance(_p1k, dict) else _p1k.latitude
+                                _lo1k = _p1k["lon"] if isinstance(_p1k, dict) else _p1k.longitude
+                                _la2k = _p2k["lat"] if isinstance(_p2k, dict) else _p2k.latitude
+                                _lo2k = _p2k["lon"] if isinstance(_p2k, dict) else _p2k.longitude
+                                _steps_vc_pre.append(haversine_m(_la1k, _lo1k, _la2k, _lo2k))
+                            _med_vc = _stats_vc.median(_steps_vc_pre) if _steps_vc_pre else 5.0
+                            _max_step_vc = max(100.0, min(2000.0, _med_vc * 10))
                             seg_dist_i = 0.0; seg_elevs_i = []; seg_times_i = []
                             for j in range(1, len(seg_i)):
                                 p1v, p2v = seg_i[j-1], seg_i[j]
