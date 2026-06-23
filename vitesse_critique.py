@@ -1,5 +1,24 @@
 # analyse_course_v8.py
 # Application Streamlit unifiée — 3 onglets
+# NOUVEAUTÉS v8.1 (calibration empirique) :
+#   - Courbe de pente en montée recalibrée par profil sur 1245 segments coureurs
+#     (top10 réel de 12 ultra-trails : TDS, UTMB, OCC, Templiers, Sainte-Lyon,
+#     Saint-Jacques, Trans Gran Canaria, Transvulcania, Chianti, MCC, EcoTrail,
+#     Nantes-Montaigu). g0_up=5.0 pour tous les profils trail (au lieu de 3.0) ;
+#     k_up et max_cap (=max_up) recalibrés par type de course.
+#   - Nouveau profil "🏞️ Trail roulant / peu technique" (R²=0.918, le mieux
+#     identifié des 3 clusters) pour les ultra-trails à faible D+/km.
+#   - Seuil de fatigue (fatigue_threshold/fatigue_rate) rendu dépendant du
+#     profil de terrain : dégradation continue dès les premiers km pour les
+#     ultras roulants/montagneux, "plateau puis chute à 60%" conservé pour le
+#     profil technique moyen (seul cas où l'hypothèse d'origine est confirmée).
+#   - cold_quad 0.0015→0.0003 (le froid a un effet quasi nul sur l'allure
+#     élite) ; hot_quad 0.0020→0.0055 (la chaleur pénalise ~3x plus que prévu).
+#   - Cap descente -6% (max_down) validé tel quel par la donnée — inchangé.
+#   - Vent : non recalibré (aucune donnée de direction de vent fiable trouvée
+#     pour les 12 courses de référence).
+#   Voir calibration_facteurs_v8.md pour la méthodologie complète.
+#
 # NOUVEAUTÉS v8 (par rapport à v7) :
 #   - Filtre bruit GPS : compute_gpx_distance_filtered (max_step=50m)
 #     → évite l'inflation de distance (ex: 10km GPX → 10.6km affiché)
@@ -184,7 +203,8 @@ def grade_multiplier_heuristic(grade_pct,k_up,k_down,down_cap,g0_up,g0_down,max_
         if g>=0:
             g_eff=math.tanh(g/g0u)*g0u;mult=1.0+float(k_up)*g_eff
         else:
-            g_eff=math.tanh((-g)/g0d)*g0d;bonus=min(float(k_down)*g_eff,abs(float(down_cap)));mult=1.0-bonus
+            g_eff=math.tanh((-g)/g0d)*g0d;bonus=min(float(k_down)*g_eff,abs(float(down_cap)))
+            mult=1.0-bonus
         mult=min(mult,1.0+float(max_up));mult=max(mult,1.0+float(max_down))
         return max(0.01,float(mult))
     except:return 1.0
@@ -894,7 +914,7 @@ def prepare_refs(refs_input,use_recalibrated,opt_temp,use_wbgt,cold_quad,hot_qua
             secs=recalibrate_ref_to_ideal(ref={**r,"temps":raw_t},opt_temp=opt_temp,use_wbgt=use_wbgt,
                 cold_quad=cold_quad,hot_quad=hot_quad,temp_max_penalty=temp_max_penalty,
                 k_up=k_up,k_down=k_down,down_cap=down_cap,g0_up=g0_up,g0_down=g0_down,
-                max_up=max_up,max_down=max_down,elev_ref_power=elev_ref_power,temp_ref_power=temp_ref_power)
+                max_up=max_up,max_down=max_down,elev_ref_power=elev_ref_power,temp_ref_power=temp_ref_power) if use_recalibrated else float(t_brut)
         else:secs=float(hms_to_seconds(raw_t))
         out.append({"distance":float(d),"temps":float(secs)})
     return out
@@ -1627,10 +1647,16 @@ function rst(){playing=false;frac=0;drawn=-1;cumDP=0;lcp=-1;lastSI=-1;segs.forEa
 
 
 # ══════════════════════════════════════════════════════════════
-# TERRAIN PROFILES — v8 PATCH 4 : Route recalibrée
+# TERRAIN PROFILES — v8.1 : k_up/g0_up/max_cap/fatigue recalibrés
+# sur 1245 segments coureurs (top10 réel, 12 ultra-trails). Voir
+# calibration_facteurs_v8.md pour la méthodologie et les limites.
+# k_down/down_cap/minetti_weight/elev_smooth_window/grade_power/
+# base_cap/extra_per_pct NON recalibrés (non identifiables de façon
+# fiable à la résolution checkpoint) — valeurs v8 d'origine conservées.
 # ══════════════════════════════════════════════════════════════
 TERRAIN_PROFILES = {
     "🛣️ Route / Plat": {
+        # Inchangé — pas de course route pure dans le jeu de calibration v8.1.
         # v8 : k_up 7→4, grade_power 0.90→0.75, lissage 15→25
         # Moins réactif aux micro-variations GPS sur route plane
         "k_up": 4.0, "k_down": 2.5, "down_cap": -0.03,
@@ -1638,17 +1664,32 @@ TERRAIN_PROFILES = {
         "grade_power": 0.75, "base_cap": 0.04,
         "extra_per_pct": 0.000, "max_cap": 0.08,
     },
-    "🏔️ Trail modéré": {
-        "k_up": 22.0, "k_down": 4.5, "down_cap": -0.10,
+    "🏞️ Trail roulant / peu technique": {
+        # v8.1 NOUVEAU — calibré sur Sainte-Lyon, Nantes-Montaigu, EcoTrail
+        # (D+/km < 30). R²=0.918, le cluster le mieux identifié des 3.
+        "k_up": 19.5, "g0_up": 5.0, "k_down": 4.5, "down_cap": -0.10,
         "minetti_weight": 0.30, "elev_smooth_window": 5,
         "grade_power": 0.70, "base_cap": 0.18,
-        "extra_per_pct": 0.012, "max_cap": 0.48,
+        "extra_per_pct": 0.012, "max_cap": 0.15,
+        "fatigue_threshold": 5, "fatigue_rate": 18,
+    },
+    "🏔️ Trail modéré": {
+        # v8.1 — calibré sur Templiers, Chianti, Saint-Jacques
+        # (D+/km 40-50, technique mais pas haute montagne). R²=0.747.
+        "k_up": 10.7, "g0_up": 5.0, "k_down": 4.5, "down_cap": -0.10,
+        "minetti_weight": 0.30, "elev_smooth_window": 5,
+        "grade_power": 0.70, "base_cap": 0.18,
+        "extra_per_pct": 0.012, "max_cap": 0.67,
+        "fatigue_threshold": 60, "fatigue_rate": 16,
     },
     "⛰️ Ultra-trail montagneux": {
-        "k_up": 28.0, "k_down": 4.0, "down_cap": -0.15,
+        # v8.1 — calibré sur TDS, UTMB, OCC, Trans Gran Canaria,
+        # Transvulcania, MCC (D+/km 53-63). R²=0.604.
+        "k_up": 13.2, "g0_up": 5.0, "k_down": 4.0, "down_cap": -0.15,
         "minetti_weight": 0.20, "elev_smooth_window": 5,
         "grade_power": 0.65, "base_cap": 0.25,
-        "extra_per_pct": 0.018, "max_cap": 0.60,
+        "extra_per_pct": 0.018, "max_cap": 0.79,
+        "fatigue_threshold": 5, "fatigue_rate": 18,
     },
 }
 
@@ -1881,7 +1922,7 @@ with main_tabs[0]:
     st.subheader("📋 Résumé de la recalibration")
     _k_up_prev=st.session_state.get("k_up_val",22.0);_k_down_prev=st.session_state.get("k_down_val",4.5)
     _g0u_prev=st.session_state.get("g0_up_val",3.0);_g0d_prev=st.session_state.get("g0_down_val",2.5)
-    calib_rows=[];cold_quad=0.0015;hot_quad=0.0020;temp_max_penalty=0.20
+    calib_rows=[];cold_quad=0.0003;hot_quad=0.0055;temp_max_penalty=0.20
     for r in refs_raw:
         t_brut=hms_to_seconds(r.get("duration_hms_file") or r.get("temps",""))
         dist_km_r=safe_float(r.get("distance",1.0))/1000.0
@@ -1956,11 +1997,14 @@ with main_tabs[0]:
     st.header("4️⃣  Paramètres du modèle")
 
     with st.expander("🌡️ Température & Humidité",expanded=False):
-        cold_quad=0.0015; hot_quad=0.0020; temp_max_penalty=0.20; temp_power=1.0
+        # v8.1 — calibré sur 1245 segments coureurs (top10) de 12 ultra-trails réels :
+        # le froid a un effet quasi nul sur l'allure élite (0.0015→0.0003),
+        # la chaleur pénalise ~3x plus que l'estimation initiale (0.0020→0.0055)
+        cold_quad=0.0003; hot_quad=0.0055; temp_max_penalty=0.20; temp_power=1.0
         if EXPERT:
             c1,c2=st.columns(2)
-            cold_quad=c1.number_input("Sensibilité froid",value=0.0015,step=0.0002,format="%.4f")
-            hot_quad=c2.number_input("Sensibilité chaleur",value=0.0020,step=0.0002,format="%.4f")
+            cold_quad=c1.number_input("Sensibilité froid",value=0.0003,step=0.0002,format="%.4f")
+            hot_quad=c2.number_input("Sensibilité chaleur",value=0.0055,step=0.0002,format="%.4f")
             temp_max_penalty=st.slider("Pénalité max température (%)",0.00,0.30,0.20,0.01)
             temp_power=st.slider("Damping température (puissance)",0.2,1.2,1.0,0.05)
 
@@ -1982,8 +2026,9 @@ with main_tabs[0]:
         _d=TERRAIN_PROFILES[terrain_profil]
         _profil_info={
             "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=4 (v8 — moins réactif au bruit GPS), lissage altitude ×25pts. Allure stable sur plat.",
-            "🏔️ Trail modéré":"Profil trail typique D+ ~35m/km. k_up=22, surface×1.11. Ajuster seuil/dégradation fatigue selon l'athlète.",
-            "⛰️ Ultra-trail montagneux":"D+ moyen > 100m/km. Montées techniques. k_up=28. DEM recommandé.",
+            "🏞️ Trail roulant / peu technique":"v8.1 — Ultra-trail à faible D+/km (<30 m/km), type Sainte-Lyon/Nantes-Montaigu/EcoTrail. k_up=19.5 mais plafond bas (max_cap=0.15) : la pente sature vite car les côtes y sont rares. Fatigue continue dès le début (seuil 5%).",
+            "🏔️ Trail modéré":"v8.1 — Profil technique moyen calibré sur Templiers/Chianti/St-Jacques (D+ ~40-50m/km). k_up=10.7, plafond 67%. Seuil de fatigue à 60% confirmé par la donnée réelle (seul profil où l'hypothèse plateau-puis-chute tient).",
+            "⛰️ Ultra-trail montagneux":"v8.1 — Calibré sur TDS/UTMB/OCC/TransGC/Transvulcania/MCC (D+ ~55-65m/km). k_up=13.2, plafond le plus élevé (79%) sur les pentes très raides. Fatigue continue dès le début (seuil 5%). DEM recommandé.",
         }
         st.info(_profil_info.get(terrain_profil,""))
 
@@ -2036,8 +2081,8 @@ with main_tabs[0]:
         with col_r3b:
             extra_per_pct=st.slider("Extra par % de pente",0.000,0.030,float(st.session_state.get("tp_extra_per_pct",_d["extra_per_pct"])),0.001,format="%.3f",key="tp_extra_per_pct")
         with col_r3c:
-            max_cap=st.slider("Plafond absolu (%)",0.05,0.80,float(st.session_state.get("tp_max_cap",_d["max_cap"])),0.01,key="tp_max_cap")
-        g0_up=3.0;g0_down=2.5;max_up=float(max_cap);max_down=-0.06
+            max_cap=st.slider("Plafond absolu (%)",0.05,0.90,float(st.session_state.get("tp_max_cap",_d["max_cap"])),0.01,key="tp_max_cap")
+        g0_up=float(_d.get("g0_up",3.0));g0_down=2.5;max_up=float(max_cap);max_down=-0.06
         st.session_state["k_up_val"]=k_up;st.session_state["k_down_val"]=k_down
         st.session_state["g0_up_val"]=g0_up;st.session_state["g0_down_val"]=g0_down
         _terrain_colors={"🛣️ Route / Plat":"#0C447C","🏔️ Trail modéré":"#3B6D11","⛰️ Ultra-trail montagneux":"#993C1D"}
@@ -2065,12 +2110,19 @@ with main_tabs[0]:
         apply_fatigue=st.checkbox("Activer la fatigue",value=True)
         fatigue_threshold=60.0;fatigue_rate=0.0;fatigue_mode="mixte"
         if apply_fatigue:
+            # v8.1 — seuil/taux par défaut dépendants du profil terrain (calibrés sur
+            # 1245 segments coureurs réels) : dégradation continue dès le début pour
+            # les profils roulant/montagneux, plateau-puis-chute à 60% conservé pour
+            # le profil technique moyen (seul cas confirmé par la donnée réelle).
             fatigue_threshold=st.slider(
-                "Seuil de dégradation (% de la course)",10,90,60,5,
-                key="fatigue_threshold",
+                "Seuil de dégradation (% de la course)",5,90,
+                int(st.session_state.get("tp_fatigue_threshold",_d.get("fatigue_threshold",60))),5,
+                key="tp_fatigue_threshold",
                 help="% à partir duquel la dégradation s'accélère.")
             fatigue_rate=st.slider(
-                "Ralentissement total en fin de course (%)",0.0,35.0,18.0,0.5,
+                "Ralentissement total en fin de course (%)",0.0,35.0,
+                float(st.session_state.get("tp_fatigue_rate",_d.get("fatigue_rate",18.0))),0.5,
+                key="tp_fatigue_rate",
                 help="% de ralentissement cumulé à 100% du parcours.")
             fatigue_mode=st.selectbox("Type de fatigue",["mixte (recommandé)","distance (plat)","d_plus (montagne)"]).split()[0]
             if fatigue_rate>0:
@@ -2155,7 +2207,7 @@ with main_tabs[0]:
                         wind_gate_g1=wind_gate_g1,wind_gate_g2=wind_gate_g2,wind_gate_min=wind_gate_min,
                         base_cap=base_cap,extra_per_pct=extra_per_pct,max_cap=max_cap,
                         apply_fatigue=apply_fatigue,fatigue_rate=fatigue_rate,
-                        fatigue_threshold=float(st.session_state.get("fatigue_threshold",60.0)),
+                        fatigue_threshold=float(st.session_state.get("tp_fatigue_threshold",60.0)),
                         fatigue_mode=fatigue_mode,
                         apply_ultra=apply_ultra,ultra_amp=ultra_amp,
                         objective_hms=temps_objectif if force_temps else None,
