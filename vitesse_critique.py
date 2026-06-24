@@ -40,6 +40,7 @@
 
 import streamlit as st
 import math
+import re
 import gpxpy
 from fitparse import FitFile
 try:
@@ -1704,6 +1705,266 @@ SURFACE_OPTIONS = {
 }
 
 # ══════════════════════════════════════════════════════════════
+# ONGLET 4 — ANALYSE DE COHORTE
+# Centralise plusieurs coureurs (splits Strava ou Live-trail) sur une même
+# course, les compare entre eux, et les confronte à l'algorithme de prédiction
+# (réutilise directement elev_factor_global / fatigue_multiplier_advanced /
+# temp_multiplier / TERRAIN_PROFILES déjà définis plus haut — aucune
+# duplication de logique de calibration).
+# ══════════════════════════════════════════════════════════════
+
+COHORT_PALETTE = ["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#db2777","#0891b2","#65a30d"]
+
+_DIST_RE = re.compile(r"^(\d+[.,]?\d*)\s*km$")
+_ELEV_CUM_RE = re.compile(r"^(\d+)\s*m\+$")
+_TIME_CUM_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})$")
+_CLOCK_RE = re.compile(r"^\w+\.\s+\d{1,2}:\d{2}")
+_RANK_RE = re.compile(r"^\d+$")
+_BONUS_RE = re.compile(r"^\(\+\d+\)$")
+_SPEED_RE = re.compile(r"^\d+[.,]\d*\s*km/h$")
+_ALT_LBL_RE = re.compile(r"^Altitude$", re.I)
+_ALT_VAL_RE = re.compile(r"^\d+\s*m$")
+_REST_RE = re.compile(r"^Temps de repos", re.I)
+_SECTION_RE = re.compile(r"^Temps de section", re.I)
+_DERNIER_RE = re.compile(r"^Depuis dernier pt", re.I)
+_VITESSE_EFFORT_RE = re.compile(r"^Vitesse effort$", re.I)
+_MIXED_ELEV_RE = re.compile(r"^\d+\s*m[+-].*\d+\s*m[+-]")
+_PARTIAL_ELEV_RE = re.compile(r"^\d+\s*m[+-]")
+_HEADER_RE = re.compile(r"^(POINT DE PASSAGE|CLASSEMENT|PASSAGE|TEMPS|VITESSE|DÉNIVELÉ)", re.I)
+_PACE_SPLIT_RE = re.compile(r"^(\d+):(\d{2})/km$")
+
+def _itra_parse_dist(l):
+    m = _DIST_RE.match(l)
+    return float(m.group(1).replace(",", ".")) if m else None
+
+def parse_splits_strava(raw):
+    """Parse les splits Strava collés (format avec allure/km OU avec dist+temps)."""
+    out = []
+    for line in raw.strip().split("\n"):
+        parts = [p for p in re.split(r"\t+", line.strip()) if p != ""]
+        if len(parts) < 3:
+            continue
+        try:
+            km = int(parts[0])
+        except ValueError:
+            continue
+        m = _PACE_SPLIT_RE.match(parts[1]) if len(parts) > 1 else None
+        if m:
+            secs = int(m.group(1)) * 60 + int(m.group(2))
+            elev_str = parts[3] if len(parts) > 3 else "0"
+            elev_digits = re.sub(r"[^\-\d]", "", elev_str)
+            elev = int(elev_digits) if elev_digits else 0
+            hr_str = parts[4] if len(parts) > 4 else ""
+            hr_digits = re.sub(r"[^\d]", "", hr_str)
+            hr = int(hr_digits) if hr_digits else None
+            out.append({"km": km, "dist": 1.0, "secs": secs, "elev": elev, "hr": hr})
+        else:
+            if len(parts) < 4:
+                continue
+            t_parts = (parts[2] if len(parts) > 2 else "0:00").split(":")
+            try:
+                secs = int(t_parts[0]) * 60 + int(t_parts[1])
+            except (ValueError, IndexError):
+                secs = 0
+            elev_str = parts[4] if len(parts) > 4 else "0"
+            elev_digits = re.sub(r"[^\-\d]", "", elev_str)
+            elev = int(elev_digits) if elev_digits else 0
+            hr_str = parts[5] if len(parts) > 5 else ""
+            hr_digits = re.sub(r"[^\d]", "", hr_str)
+            hr = int(hr_digits) if hr_digits else None
+            dist_str = (parts[1] if len(parts) > 1 else "1,00km").replace(",", ".")
+            dist_m = re.match(r"[\d.]+", dist_str)
+            dist = float(dist_m.group(0)) if dist_m else 1.0
+            out.append({"km": km, "dist": dist, "secs": secs, "elev": elev, "hr": hr})
+    return out
+
+def parse_itra(raw):
+    """Parse une page de résultats Live-trail/ITRA collée (checkpoints + temps cumulés)."""
+    raw_lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
+    cleaned = []
+    n = len(raw_lines)
+    i = 0
+    while i < n:
+        l = raw_lines[i]
+        if _REST_RE.match(l) or _SECTION_RE.match(l) or _DERNIER_RE.match(l) or _VITESSE_EFFORT_RE.match(l):
+            i += 2
+            continue
+        if (_HEADER_RE.match(l) or _CLOCK_RE.match(l) or _RANK_RE.match(l) or _BONUS_RE.match(l) or
+                _SPEED_RE.match(l) or _ALT_LBL_RE.match(l) or _ALT_VAL_RE.match(l) or
+                _MIXED_ELEV_RE.match(l) or _PARTIAL_ELEV_RE.match(l)):
+            i += 1
+            continue
+        cleaned.append(l)
+        i += 1
+
+    dist_pos = [k for k in range(len(cleaned)) if _itra_parse_dist(cleaned[k]) is not None]
+    if len(dist_pos) < 2:
+        return {"cps": [], "splits": []}
+
+    first_val = _itra_parse_dist(cleaned[dist_pos[0]])
+    i0 = 1 if first_val > 0.5 else 0
+
+    def _is_text_line(l):
+        return _itra_parse_dist(l) is None and not _TIME_CUM_RE.match(l) and not _ELEV_CUM_RE.match(l)
+
+    cp_dist_positions = []
+    for k in range(i0, len(dist_pos)):
+        pos = dist_pos[k]
+        nxt = dist_pos[k + 1] if k + 1 < len(dist_pos) else None
+        if nxt is not None and nxt == pos + 1:
+            continue
+        if pos + 1 < len(cleaned) and _is_text_line(cleaned[pos + 1]):
+            cp_dist_positions.append(pos)
+
+    cps = []
+    for bi, pos in enumerate(cp_dist_positions):
+        cum_dist = _itra_parse_dist(cleaned[pos])
+        name = None
+        elev = None
+        all_times = []
+        for k in range(pos + 1, min(len(cleaned), pos + 20)):
+            l = cleaned[k]
+            if _itra_parse_dist(l) is not None:
+                break
+            tm = _TIME_CUM_RE.match(l)
+            if tm:
+                all_times.append(int(tm.group(1)) * 3600 + int(tm.group(2)) * 60 + int(tm.group(3)))
+                continue
+            em = _ELEV_CUM_RE.match(l)
+            if em and elev is None:
+                elev = int(em.group(1))
+                continue
+            if not name:
+                name = l
+        cum_secs = all_times[0] if all_times else None
+        cps.append({"name": name or f"CP {bi + 1}", "cumDist": cum_dist, "cumSecs": cum_secs, "elev": elev if elev is not None else 0})
+
+    cps = [cp for cp in cps if cp["cumSecs"] is not None]
+    if len(cps) < 2:
+        return {"cps": [], "splits": []}
+
+    splits = []
+    for i in range(1, len(cps)):
+        seg_dist = round((cps[i]["cumDist"] - cps[i - 1]["cumDist"]) * 100) / 100
+        seg_secs = cps[i]["cumSecs"] - cps[i - 1]["cumSecs"]
+        seg_elev = cps[i]["elev"] - cps[i - 1]["elev"]
+        if seg_dist > 0 and seg_secs > 0:
+            splits.append({"km": i, "dist": seg_dist, "secs": seg_secs, "elev": seg_elev, "hr": None})
+
+    return {"cps": cps, "splits": splits}
+
+def get_time_at_km(athlete, target_km):
+    cum_km = 0.0; cum_secs = 0.0
+    for sp in athlete["splits"]:
+        nxt = cum_km + sp["dist"]
+        if nxt >= target_km:
+            return cum_secs + ((target_km - cum_km) / sp["dist"]) * sp["secs"]
+        cum_km = nxt; cum_secs += sp["secs"]
+    return cum_secs
+
+def plot_cohort_pace_chart(athletes_list, checkpoints_list):
+    fig, ax = plt.subplots(figsize=(11, 4))
+    for a in athletes_list:
+        x = [sp["km"] for sp in a["splits"]]
+        y = [sp["secs"] / sp["dist"] for sp in a["splits"]]
+        ax.plot(x, y, color=a["color"], lw=2, ls="--" if a.get("dashed") else "-", label=a["name"])
+    for cp in checkpoints_list:
+        ax.axvline(cp["km"], color="#f59e0b", lw=1, ls=":", alpha=0.6)
+    ax.invert_yaxis()
+    ax.set_xlabel("Kilomètre"); ax.set_ylabel("Allure")
+    yticks = ax.get_yticks()
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([pace_str(t) for t in yticks if t > 0])
+    ax.set_title("Allure km par km"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+def plot_cohort_cp_chart(athletes_list, checkpoints_list):
+    fig, ax = plt.subplots(figsize=(11, 4))
+    x = list(range(len(checkpoints_list)))
+    labels = [f"{cp['name']}\nkm {cp['km']:.1f}" for cp in checkpoints_list]
+    for a in athletes_list:
+        y = [get_time_at_km(a, cp["km"]) / 60.0 for cp in checkpoints_list]
+        ax.plot(x, y, color=a["color"], lw=2, marker="o", ms=5, ls="--" if a.get("dashed") else "-", label=a["name"])
+    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=8)
+    yticks = ax.get_yticks()
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{int(t // 60)}h{int(round(t % 60)):02d}" for t in yticks])
+    ax.set_ylabel("Temps cumulé"); ax.set_title("Temps de passage aux checkpoints")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+def fetch_daily_weather(lat, lon, date_obj):
+    """Météo journalière (tmax/tmin/précip/vent) — endpoint Open-Meteo distinct
+    du système météo horaire v7/v8 (get_weather_minutely), adapté au besoin
+    d'un résumé jour de course unique pour la cohorte."""
+    try:
+        today = date.today()
+        diff = (date_obj - today).days
+        if -1 <= diff <= 15:
+            url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+                   "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
+                   f"&timezone=Europe%2FParis&start_date={date_obj}&end_date={date_obj}")
+            is_past = False
+        else:
+            past = date_obj.replace(year=date_obj.year - 1)
+            url = (f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}"
+                   "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
+                   f"&timezone=Europe%2FParis&start_date={past}&end_date={past}")
+            is_past = True
+        r = requests.get(url, timeout=12)
+        d = r.json()
+        daily = d.get("daily", {})
+        def _first(key):
+            v = daily.get(key)
+            return v[0] if v else None
+        return {"tmax": _first("temperature_2m_max"), "tmin": _first("temperature_2m_min"),
+                "precip": _first("precipitation_sum"), "wind": _first("windspeed_10m_max"), "isPast": is_past}
+    except Exception:
+        return None
+
+def build_prediction_cohort(athlete, profile_key, apply_fatigue, apply_temp, temp_c, mode, manual_pace_sec_km):
+    """Prédit l'allure segment par segment pour un athlète de la cohorte, en
+    réutilisant directement elev_factor_global/fatigue_multiplier_advanced/
+    temp_multiplier et le profil terrain calibré v8.1 sélectionné. D+/D- estimé
+    à partir du dénivelé NET par segment (sp['elev']) — pas du détail GPX.
+    mode='cale' : l'allure de base est recalée pour que le temps total prédit
+    égale le temps réel (compare la RÉPARTITION). mode='manuel' : allure libre."""
+    profile = TERRAIN_PROFILES[profile_key]
+    g0_up = profile.get("g0_up", 3.0)
+    g0_down = 2.5
+    max_down = -0.06
+    fatigue_threshold = profile.get("fatigue_threshold", 60)
+    fatigue_rate = profile.get("fatigue_rate", 18.0)
+
+    total_km = athlete["totalKm"]
+    d_plus_total = sum(sp["elev"] for sp in athlete["splits"] if sp["elev"] > 0)
+
+    cum_dist = 0.0; cum_dplus = 0.0
+    raw = []
+    for sp in athlete["splits"]:
+        d_up = max(0.0, sp["elev"]); d_down = max(0.0, -sp["elev"])
+        gm = elev_factor_global(d_up, d_down, sp["dist"] * 1000.0, profile["k_up"], profile["k_down"],
+                                 profile["down_cap"], g0_up, g0_down, profile["max_cap"], max_down)
+        cum_dist += sp["dist"]; cum_dplus += d_up
+        fm = fatigue_multiplier_advanced(cum_dplus, cum_dist, d_plus_total, total_km,
+                                          fatigue_threshold, fatigue_rate, "mixte") if apply_fatigue else 1.0
+        tm = temp_multiplier(temp_c, 10.0, 0.0003, 0.0055, 0.20) if (apply_temp and temp_c is not None) else 1.0
+        raw.append({"km": sp["km"], "dist": sp["dist"], "elev": sp["elev"], "gm": gm, "fm": fm, "tm": tm, "mult": gm * fm * tm})
+
+    weighted = sum(r["dist"] * r["mult"] for r in raw)
+    if mode == "manuel" and manual_pace_sec_km and manual_pace_sec_km > 0:
+        base_pace = manual_pace_sec_km
+    else:
+        base_pace = athlete["totalSecs"] / max(1e-6, weighted)
+
+    splits = [{**r, "secs": base_pace * r["dist"] * r["mult"], "hr": None} for r in raw]
+    total_secs = sum(s["secs"] for s in splits)
+    return {"splits": splits, "totalSecs": total_secs, "totalKm": total_km, "basePaceSecKm": base_pace}
+
+
+# ══════════════════════════════════════════════════════════════
 # UI PRINCIPALE
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
@@ -1715,7 +1976,7 @@ with st.sidebar:
     sb_k_temp_cold=st.number_input("Sensibilité froid",value=0.0012,step=0.0002,format="%.4f",key="sb_ktc")
     st.caption("Ces paramètres n'affectent que les onglets 🧪 et ⚙️")
 
-main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","⚙️ Analyse entraînement"])
+main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","⚙️ Analyse entraînement","👥 Analyse de cohorte"])
 
 # ══════════════════════════════════════════════════════════════
 # ONGLET 0 — PRÉDICTION DE COURSE
@@ -2896,3 +3157,315 @@ with main_tabs[2]:
                                data=csv_train,
                                file_name=f"seance_{train_file.name.split('.')[0]}.csv",
                                mime="text/csv")
+
+
+# ══════════════════════════════════════════════════════════════
+# ONGLET 3 — ANALYSE DE COHORTE
+# ══════════════════════════════════════════════════════════════
+with main_tabs[3]:
+    st.title("👥 Analyse de cohorte")
+    st.caption("Centralise les splits de plusieurs coureurs sur une même course (Strava ou Live-trail), compare-les entre eux, et confronte-les à l'algorithme de prédiction calibré v8.1.")
+
+    if "cohort_course" not in st.session_state:
+        st.session_state["cohort_course"] = {"name": "", "date": date.today(), "dist": 0.0, "lat": 0.0, "lon": 0.0}
+    if "cohort_athletes" not in st.session_state:
+        st.session_state["cohort_athletes"] = []
+    if "cohort_checkpoints" not in st.session_state:
+        st.session_state["cohort_checkpoints"] = []
+    if "cohort_weather" not in st.session_state:
+        st.session_state["cohort_weather"] = None
+    if "cohort_athlete_id_counter" not in st.session_state:
+        st.session_state["cohort_athlete_id_counter"] = 0
+    if "cohort_cp_id_counter" not in st.session_state:
+        st.session_state["cohort_cp_id_counter"] = 0
+
+    cohort_subtabs = st.tabs(["🏁 Course", "🏃 Athlètes", "📍 Checkpoints", "📊 Analyse", "🤖 Analyse de course"])
+
+    # ── Sous-onglet : Course ──
+    with cohort_subtabs[0]:
+        co1, co2 = st.columns(2)
+        st.session_state["cohort_course"]["name"] = co1.text_input(
+            "Nom de la course", value=st.session_state["cohort_course"]["name"], key="cohort_course_name", placeholder="ex: UTMB 2025")
+        st.session_state["cohort_course"]["date"] = co2.date_input(
+            "Date", value=st.session_state["cohort_course"]["date"], key="cohort_course_date")
+        co3, co4, co5 = st.columns(3)
+        st.session_state["cohort_course"]["dist"] = co3.number_input(
+            "Distance (km)", value=float(st.session_state["cohort_course"]["dist"]), key="cohort_course_dist")
+        st.session_state["cohort_course"]["lat"] = co4.number_input(
+            "Latitude départ", value=float(st.session_state["cohort_course"]["lat"]), format="%.4f", key="cohort_course_lat")
+        st.session_state["cohort_course"]["lon"] = co5.number_input(
+            "Longitude départ", value=float(st.session_state["cohort_course"]["lon"]), format="%.4f", key="cohort_course_lon")
+
+        if st.button("🌡️ Récupérer la météo", key="cohort_fetch_weather"):
+            cc = st.session_state["cohort_course"]
+            if cc["lat"] and cc["lon"]:
+                with st.spinner("Récupération météo..."):
+                    st.session_state["cohort_weather"] = fetch_daily_weather(cc["lat"], cc["lon"], cc["date"])
+            else:
+                st.warning("Renseigne latitude/longitude.")
+
+        w = st.session_state.get("cohort_weather")
+        if w:
+            st.markdown("##### Conditions météo")
+            wc1, wc2, wc3, wc4 = st.columns(4)
+            wc1.metric("T° max", f"{w['tmax']:.0f}°C" if w.get("tmax") is not None else "—")
+            wc2.metric("T° min", f"{w['tmin']:.0f}°C" if w.get("tmin") is not None else "—")
+            wc3.metric("Précip.", f"{w['precip']:.1f} mm" if w.get("precip") is not None else "—")
+            wc4.metric("Vent max", f"{w['wind']:.0f} km/h" if w.get("wind") is not None else "—")
+            st.caption("Source : archive (année précédente, même date)" if w.get("isPast") else "Source : prévisions Open-Meteo")
+            if w.get("tmax") is not None and w.get("tmin") is not None:
+                tmoy = (w["tmax"] + w["tmin"]) / 2.0
+                d_t = tmoy - 10.0
+                weather_pen_cohort = min(0.20, d_t * 0.008) if d_t > 0 else max(-0.06, d_t * 0.004)
+                bg = "#fef2f2" if weather_pen_cohort > 0.08 else "#fffbeb" if weather_pen_cohort > 0.03 else "#f0fdf4"
+                st.markdown(f'<div style="margin-top:8px;padding:10px 14px;border-radius:8px;background:{bg};font-size:13px;">'
+                            f'T° moy. estimée <strong>{tmoy:.1f}°C</strong> — référence optimale 10°C — '
+                            f'impact estimé <strong>{weather_pen_cohort*100:+.1f}%</strong> sur les temps</div>', unsafe_allow_html=True)
+
+    # ── Sous-onglet : Athlètes ──
+    with cohort_subtabs[1]:
+        with st.expander("➕ Ajouter un athlète", expanded=True):
+            ac1, ac2 = st.columns(2)
+            cohort_new_name = ac1.text_input("Nom", key="cohort_new_name", placeholder="ex: Thomas B. ou Athlète A")
+            _default_color = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
+            cohort_new_color = ac2.color_picker("Couleur", value=_default_color, key="cohort_new_color")
+            cohort_input_mode = st.radio("Format des données", ["Splits Strava", "Live-trail"], horizontal=True, key="cohort_input_mode")
+            cohort_new_splits = st.text_area(
+                "Données (coller le texte brut)", key="cohort_new_splits", height=150,
+                placeholder=("  1\t1,00km\t5:50\t5:50/km\t6 m\t146 bpm\n  2\t1,00km\t6:31\t6:31/km\t91 m\t167 bpm\n  ..."
+                             if cohort_input_mode == "Splits Strava"
+                             else "3.1 km\n20.1 km\nArzon Port Navalo\njeu. 13:22\n1:22:20\n14.6 km/h\n202 m+\n..."))
+            if st.button("➕ Ajouter l'athlète", key="cohort_add_athlete"):
+                if not cohort_new_splits.strip():
+                    st.warning("Colle les données d'abord.")
+                elif cohort_input_mode == "Live-trail":
+                    res = parse_itra(cohort_new_splits)
+                    if len(res["cps"]) < 2:
+                        st.error("Format non reconnu — vérifie les données.")
+                    else:
+                        st.session_state["cohort_athlete_id_counter"] += 1
+                        name = cohort_new_name.strip() or f"Athlète {len(st.session_state['cohort_athletes'])+1}"
+                        st.session_state["cohort_athletes"].append({
+                            "id": st.session_state["cohort_athlete_id_counter"], "name": name, "color": cohort_new_color,
+                            "splits": res["splits"], "totalSecs": res["cps"][-1]["cumSecs"], "totalKm": res["cps"][-1]["cumDist"]})
+                        if not st.session_state["cohort_checkpoints"]:
+                            for cp in res["cps"]:
+                                st.session_state["cohort_cp_id_counter"] += 1
+                                st.session_state["cohort_checkpoints"].append(
+                                    {"id": st.session_state["cohort_cp_id_counter"], "name": cp["name"], "km": cp["cumDist"]})
+                        st.success("Athlète importé !"); st.rerun()
+                else:
+                    splits = parse_splits_strava(cohort_new_splits)
+                    if len(splits) < 2:
+                        st.error("Format non reconnu — vérifie les données.")
+                    else:
+                        st.session_state["cohort_athlete_id_counter"] += 1
+                        name = cohort_new_name.strip() or f"Athlète {len(st.session_state['cohort_athletes'])+1}"
+                        st.session_state["cohort_athletes"].append({
+                            "id": st.session_state["cohort_athlete_id_counter"], "name": name, "color": cohort_new_color,
+                            "splits": splits, "totalSecs": sum(sp["secs"] for sp in splits), "totalKm": sum(sp["dist"] for sp in splits)})
+                        st.success("Athlète ajouté !"); st.rerun()
+
+        if not st.session_state["cohort_athletes"]:
+            st.caption("Aucun athlète pour l'instant.")
+        else:
+            for a in st.session_state["cohort_athletes"]:
+                avg_pace_a = a["totalSecs"] / max(a["totalKm"], 0.1)
+                col_a, col_b = st.columns([5, 1])
+                col_a.markdown(
+                    f"<span style='color:{a['color']};font-size:1.1em'>●</span> **{a['name']}** — "
+                    f"{a['totalKm']:.1f} km · {seconds_to_hms(a['totalSecs'])} · {pace_str(avg_pace_a)}/km",
+                    unsafe_allow_html=True)
+                if col_b.button("Supprimer", key=f"cohort_del_athlete_{a['id']}"):
+                    st.session_state["cohort_athletes"] = [x for x in st.session_state["cohort_athletes"] if x["id"] != a["id"]]
+                    st.rerun()
+
+    # ── Sous-onglet : Checkpoints ──
+    with cohort_subtabs[2]:
+        with st.expander("➕ Ajouter un checkpoint", expanded=True):
+            kc1, kc2 = st.columns([3, 2])
+            cohort_cp_name = kc1.text_input("Nom du checkpoint", key="cohort_cp_name", placeholder="ex: Col du Bonhomme")
+            cohort_cp_km = kc2.number_input("Kilomètre", min_value=0.0, value=0.0, step=0.5, key="cohort_cp_km")
+            if st.button("➕ Ajouter", key="cohort_add_cp"):
+                if cohort_cp_name.strip():
+                    st.session_state["cohort_cp_id_counter"] += 1
+                    st.session_state["cohort_checkpoints"].append(
+                        {"id": st.session_state["cohort_cp_id_counter"], "name": cohort_cp_name.strip(), "km": cohort_cp_km})
+                    st.session_state["cohort_checkpoints"].sort(key=lambda c: c["km"])
+                    st.rerun()
+        if not st.session_state["cohort_checkpoints"]:
+            st.caption("Aucun checkpoint défini.")
+        else:
+            for cp in st.session_state["cohort_checkpoints"]:
+                kk1, kk2, kk3 = st.columns([4, 2, 1])
+                kk1.write(cp["name"]); kk2.write(f"km {cp['km']:.1f}")
+                if kk3.button("Retirer", key=f"cohort_del_cp_{cp['id']}"):
+                    st.session_state["cohort_checkpoints"] = [x for x in st.session_state["cohort_checkpoints"] if x["id"] != cp["id"]]
+                    st.rerun()
+
+    # ── Sous-onglet : Analyse (cohorte) ──
+    with cohort_subtabs[3]:
+        cohort_athletes_list = st.session_state["cohort_athletes"]
+        cohort_checkpoints_list = st.session_state["cohort_checkpoints"]
+        if not cohort_athletes_list:
+            st.caption("Ajoute au moins un athlète pour lancer l'analyse.")
+        else:
+            cohort_weather_pen = None
+            w = st.session_state.get("cohort_weather")
+            if w and w.get("tmax") is not None and w.get("tmin") is not None:
+                tmoy = (w["tmax"] + w["tmin"]) / 2.0
+                d_t = tmoy - 10.0
+                cohort_weather_pen = min(0.20, d_t * 0.008) if d_t > 0 else max(-0.06, d_t * 0.004)
+
+            st.markdown("#### Aperçu global")
+            cols_overview = st.columns(len(cohort_athletes_list))
+            for col, a in zip(cols_overview, cohort_athletes_list):
+                avg_pace_a = a["totalSecs"] / max(a["totalKm"], 0.1)
+                with col:
+                    st.markdown(f"<span style='color:{a['color']}'>●</span> {a['name']}", unsafe_allow_html=True)
+                    st.metric("Temps", seconds_to_hms(a["totalSecs"]))
+                    st.caption(f"{pace_str(avg_pace_a)}/km · {a['totalKm']:.1f} km")
+                    if cohort_weather_pen is not None:
+                        corrected = a["totalSecs"] * (1 + cohort_weather_pen)
+                        st.caption(f"corrigé : {seconds_to_hms(corrected)}")
+            apercu_rows = [{"Athlète": a["name"], "Distance (km)": round(a["totalKm"],1), "Temps total": seconds_to_hms(a["totalSecs"]),
+                            "Allure moy (min/km)": pace_str(a["totalSecs"]/max(a["totalKm"],0.1))} for a in cohort_athletes_list]
+            st.download_button("⬇️ Aperçu (CSV)", pd.DataFrame(apercu_rows).to_csv(index=False).encode("utf-8"),
+                               file_name=f"apercu_{st.session_state['cohort_course']['name'] or 'course'}.csv", key="cohort_dl_apercu")
+
+            st.markdown("#### Allure km par km")
+            st.pyplot(plot_cohort_pace_chart(cohort_athletes_list, cohort_checkpoints_list))
+
+            if cohort_checkpoints_list:
+                st.markdown("#### Temps de passage aux checkpoints")
+                rows_cp = []
+                for cp in cohort_checkpoints_list:
+                    times = [get_time_at_km(a, cp["km"]) for a in cohort_athletes_list]
+                    min_t = min(times)
+                    row = {"Checkpoint": cp["name"], "Km": cp["km"]}
+                    for a, t in zip(cohort_athletes_list, times):
+                        row[a["name"]] = seconds_to_hms(t) + (" (1er)" if t == min_t else f" (+{seconds_to_hms(t-min_t)})")
+                    row["Moyenne"] = seconds_to_hms(sum(times)/len(times))
+                    rows_cp.append(row)
+                st.dataframe(pd.DataFrame(rows_cp), use_container_width=True, hide_index=True)
+                st.pyplot(plot_cohort_cp_chart(cohort_athletes_list, cohort_checkpoints_list))
+
+            st.markdown("#### Détail par athlète")
+            for a in cohort_athletes_list:
+                avg_pace_a = a["totalSecs"] / max(a["totalKm"], 0.1)
+                with st.expander(f"{a['name']} — {pace_str(avg_pace_a)}/km · {seconds_to_hms(a['totalSecs'])}"):
+                    rows_d = []
+                    for sp in a["splits"]:
+                        pace_sp = sp["secs"] / sp["dist"]
+                        diff_sp = pace_sp - avg_pace_a
+                        rows_d.append({"Km": sp["km"], "Dist (km)": round(sp["dist"],2), "Allure": pace_str(pace_sp)+"/km",
+                                       "D+ seg (m)": sp["elev"], "FC": sp["hr"] if sp["hr"] else "—",
+                                       "vs moy.": ("+" if diff_sp>0 else "")+pace_str(abs(diff_sp))})
+                    df_d = pd.DataFrame(rows_d)
+                    st.dataframe(df_d, use_container_width=True, hide_index=True)
+                    st.download_button("⬇️ Splits (CSV)", df_d.to_csv(index=False).encode("utf-8"),
+                                       file_name=f"splits_{a['name']}.csv", key=f"cohort_dl_splits_{a['id']}")
+
+    # ── Sous-onglet : Analyse de course (vs algorithme) ──
+    with cohort_subtabs[4]:
+        cohort_athletes_list = st.session_state["cohort_athletes"]
+        cohort_checkpoints_list = st.session_state["cohort_checkpoints"]
+        if not cohort_athletes_list:
+            st.caption("Ajoute au moins un athlète pour comparer à l'algorithme.")
+        else:
+            ccm1, ccm2 = st.columns(2)
+            cohort_athlete_names = [a["name"] for a in cohort_athletes_list]
+            cohort_sel_name = ccm1.selectbox("Coureur à comparer", cohort_athlete_names, key="cohort_comp_athlete")
+            cohort_selected = next(a for a in cohort_athletes_list if a["name"] == cohort_sel_name)
+            cohort_profile_key = ccm2.selectbox("Profil terrain (calibré v8.1)", list(TERRAIN_PROFILES.keys()), index=2, key="cohort_comp_profile")
+
+            ccm3, ccm4 = st.columns(2)
+            cohort_mode_label = ccm3.selectbox(
+                "Calage de l'allure",
+                ["Recalée sur le temps réel (compare la répartition)", "Allure de base manuelle"],
+                key="cohort_comp_mode")
+            cohort_mode_key = "cale" if "Recalée" in cohort_mode_label else "manuel"
+            cohort_manual_pace = None
+            if cohort_mode_key == "manuel":
+                cohort_manual_pace_str = ccm4.text_input("Allure de base (mm:ss/km, plat)", value="5:30", key="cohort_comp_pace")
+                _mm = re.match(r"^(\d+):(\d{2})$", cohort_manual_pace_str.strip())
+                cohort_manual_pace = (int(_mm.group(1)) * 60 + int(_mm.group(2))) if _mm else None
+
+            ccm5, ccm6 = st.columns(2)
+            cohort_apply_fatigue = ccm5.checkbox("Appliquer la fatigue", value=True, key="cohort_comp_fatigue")
+            w = st.session_state.get("cohort_weather")
+            cohort_temp_c = (w["tmax"] + w["tmin"]) / 2.0 if (w and w.get("tmax") is not None and w.get("tmin") is not None) else None
+            cohort_apply_temp = ccm6.checkbox("Appliquer la météo", value=True, disabled=(cohort_temp_c is None), key="cohort_comp_temp")
+            if cohort_temp_c is None:
+                st.caption("Récupère la météo dans le sous-onglet 🏁 Course pour activer cette option.")
+
+            st.caption("⚠️ D+/D- estimé à partir du dénivelé NET entre checkpoints (pas du détail GPX) — sous-estime "
+                       "l'effort sur les tronçons très vallonnés. Coefficients calibrés sur 1245 segments coureurs "
+                       "réels (12 ultra-trails, top10) — voir l'en-tête du fichier pour la méthodologie v8.1.")
+
+            cohort_predicted = build_prediction_cohort(
+                cohort_selected, cohort_profile_key, cohort_apply_fatigue,
+                cohort_apply_temp and cohort_temp_c is not None, cohort_temp_c, cohort_mode_key, cohort_manual_pace)
+            cohort_predicted_athlete = {"id": "predicted", "name": "Prédiction algo", "color": "#94a3b8",
+                                        "splits": cohort_predicted["splits"], "totalSecs": cohort_predicted["totalSecs"],
+                                        "totalKm": cohort_predicted["totalKm"], "dashed": True}
+
+            cohort_delta = cohort_selected["totalSecs"] - cohort_predicted["totalSecs"]
+            cohort_comparison = []
+            for sp, ps in zip(cohort_selected["splits"], cohort_predicted["splits"]):
+                real_pace = sp["secs"] / sp["dist"]
+                pred_pace = ps["secs"] / ps["dist"]
+                cohort_comparison.append({"km": sp["km"], "dist": sp["dist"], "elev": sp["elev"],
+                                          "real_pace": real_pace, "pred_pace": pred_pace, "diff": real_pace - pred_pace,
+                                          "gm": ps["gm"], "fm": ps["fm"], "tm": ps["tm"]})
+
+            cohort_mape = (sum(abs(c["diff"]) / max(1.0, c["pred_pace"]) for c in cohort_comparison) / len(cohort_comparison) * 100) if cohort_comparison else 0.0
+
+            _third = max(1, len(cohort_comparison) // 3)
+            _first_third = cohort_comparison[:_third]; _last_third = cohort_comparison[-_third:]
+            def _avg_diff(lst): return sum(c["diff"] for c in lst) / len(lst) if lst else 0.0
+            _diff_start = _avg_diff(_first_third); _diff_end = _avg_diff(_last_third)
+            if _diff_start < -8 and _diff_end > 8:
+                cohort_trend = (f"🟠 Départ plus rapide que recommandé ({pace_str(abs(_diff_start))}/km plus vite en "
+                                f"moyenne sur le 1er tiers), avec une perte de rythme en fin de course "
+                                f"({pace_str(_diff_end)}/km plus lent sur le dernier tiers) — signature classique "
+                                f"d'un départ trop ambitieux.")
+            elif _diff_start > 8 and _diff_end < -8:
+                cohort_trend = "🔵 Départ plus prudent que recommandé, avec une accélération en fin de course — marge de progression possible sur la première partie."
+            elif abs(_diff_start) > 8 or abs(_diff_end) > 8:
+                cohort_trend = "🟡 Écart notable par rapport à la courbe recommandée par l'algorithme sur certaines portions — voir le détail par segment ci-dessous."
+            else:
+                cohort_trend = "🟢 La répartition d'effort réelle suit d'assez près la courbe recommandée par l'algorithme."
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Temps réel", seconds_to_hms(cohort_selected["totalSecs"]))
+            mc2.metric("Temps prédit (algo)", seconds_to_hms(cohort_predicted["totalSecs"]))
+            mc3.metric("Écart total", ("+" if cohort_delta > 0 else "-") + seconds_to_hms(abs(cohort_delta)))
+            mc4.metric("Écart moy. par segment", f"{cohort_mape:.1f} %")
+            st.info(cohort_trend)
+
+            st.markdown("#### Allure réelle vs recommandée par l'algo")
+            st.pyplot(plot_cohort_pace_chart([cohort_selected, cohort_predicted_athlete], cohort_checkpoints_list))
+
+            if cohort_checkpoints_list:
+                st.markdown("#### Temps aux checkpoints — réel vs prédit")
+                st.pyplot(plot_cohort_cp_chart([cohort_selected, cohort_predicted_athlete], cohort_checkpoints_list))
+                rows_cpc = []
+                for cp in cohort_checkpoints_list:
+                    t_real = get_time_at_km(cohort_selected, cp["km"]); t_pred = get_time_at_km(cohort_predicted_athlete, cp["km"])
+                    diff_cp = t_real - t_pred
+                    rows_cpc.append({"Checkpoint": cp["name"], "Km": cp["km"], "Réel": seconds_to_hms(t_real),
+                                     "Prédit": seconds_to_hms(t_pred), "Écart": ("+" if diff_cp>0 else "-")+seconds_to_hms(abs(diff_cp))})
+                st.dataframe(pd.DataFrame(rows_cpc), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Détail par segment")
+            rows_seg = []
+            for c in cohort_comparison:
+                rows_seg.append({"Km": c["km"], "Dist (km)": round(c["dist"],2), "Allure réelle": pace_str(c["real_pace"])+"/km",
+                                 "Allure prédite": pace_str(c["pred_pace"])+"/km",
+                                 "Écart": ("+" if c["diff"]>0 else "")+pace_str(abs(c["diff"])),
+                                 "Mult pente": round(c["gm"],3), "Mult fatigue": round(c["fm"],3), "Mult météo": round(c["tm"],3)})
+            df_seg = pd.DataFrame(rows_seg)
+            st.dataframe(df_seg, use_container_width=True, hide_index=True)
+            st.download_button("⬇️ Comparaison détaillée (CSV)", df_seg.to_csv(index=False).encode("utf-8"),
+                               file_name=f"comparaison_algo_{cohort_selected['name']}.csv", key="cohort_dl_comparison")
