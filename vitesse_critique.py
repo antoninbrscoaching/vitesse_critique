@@ -3244,17 +3244,28 @@ with main_tabs[3]:
             st.session_state["cohort_add_msg"] = ""
 
         with st.expander("➕ Ajouter un athlète", expanded=True):
-            ac1, ac2 = st.columns(2)
-            cohort_new_name = ac1.text_input("Nom", key="cohort_new_name", placeholder="ex: Thomas B. ou Athlète A")
-            _default_color = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
-            cohort_new_color = ac2.color_picker("Couleur", value=_default_color, key="cohort_new_color")
+            # Le sélecteur de format reste HORS du formulaire pour que le texte
+            # d'exemple ci-dessous se mette à jour immédiatement quand on le change.
             cohort_input_mode = st.radio("Format des données", ["Splits Strava", "Live-trail"], horizontal=True, key="cohort_input_mode")
-            cohort_new_splits = st.text_area(
-                "Données (coller le texte brut)", key="cohort_new_splits", height=150,
-                placeholder=("  1\t1,00km\t5:50\t5:50/km\t6 m\t146 bpm\n  2\t1,00km\t6:31\t6:31/km\t91 m\t167 bpm\n  ..."
-                             if cohort_input_mode == "Splits Strava"
-                             else "3.1 km\n20.1 km\nArzon Port Navalo\njeu. 13:22\n1:22:20\n14.6 km/h\n202 m+\n..."))
-            if st.button("➕ Ajouter l'athlète", key="cohort_add_athlete"):
+
+            # clear_on_submit=True est le mécanisme officiel Streamlit pour vider
+            # les champs après validation — affecter directement st.session_state
+            # à une clé de widget déjà instancié dans le run lève une
+            # StreamlitAPIException, d'où l'usage d'un formulaire ici plutôt que
+            # d'une réinitialisation manuelle.
+            with st.form("cohort_add_athlete_form", clear_on_submit=True):
+                ac1, ac2 = st.columns(2)
+                cohort_new_name = ac1.text_input("Nom", key="cohort_new_name", placeholder="ex: Thomas B. ou Athlète A")
+                _default_color = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
+                cohort_new_color = ac2.color_picker("Couleur", value=_default_color, key="cohort_new_color")
+                cohort_new_splits = st.text_area(
+                    "Données (coller le texte brut)", key="cohort_new_splits", height=150,
+                    placeholder=("  1\t1,00km\t5:50\t5:50/km\t6 m\t146 bpm\n  2\t1,00km\t6:31\t6:31/km\t91 m\t167 bpm\n  ..."
+                                 if cohort_input_mode == "Splits Strava"
+                                 else "3.1 km\n20.1 km\nArzon Port Navalo\njeu. 13:22\n1:22:20\n14.6 km/h\n202 m+\n..."))
+                cohort_submitted = st.form_submit_button("➕ Ajouter l'athlète")
+
+            if cohort_submitted:
                 if not cohort_new_splits.strip():
                     st.warning("Colle les données d'abord.")
                 elif cohort_input_mode == "Live-trail":
@@ -3272,11 +3283,7 @@ with main_tabs[3]:
                                 st.session_state["cohort_cp_id_counter"] += 1
                                 st.session_state["cohort_checkpoints"].append(
                                     {"id": st.session_state["cohort_cp_id_counter"], "name": cp["name"], "km": cp["cumDist"]})
-                        # Vide le formulaire et avance la couleur pour le prochain athlète
                         st.session_state["cohort_add_msg"] = f"✅ {name} importé !"
-                        st.session_state["cohort_new_name"] = ""
-                        st.session_state["cohort_new_splits"] = ""
-                        st.session_state["cohort_new_color"] = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
                         st.rerun()
                 else:
                     splits = parse_splits_strava(cohort_new_splits)
@@ -3288,11 +3295,7 @@ with main_tabs[3]:
                         st.session_state["cohort_athletes"].append({
                             "id": st.session_state["cohort_athlete_id_counter"], "name": name, "color": cohort_new_color,
                             "splits": splits, "totalSecs": sum(sp["secs"] for sp in splits), "totalKm": sum(sp["dist"] for sp in splits)})
-                        # Vide le formulaire et avance la couleur pour le prochain athlète
                         st.session_state["cohort_add_msg"] = f"✅ {name} ajouté !"
-                        st.session_state["cohort_new_name"] = ""
-                        st.session_state["cohort_new_splits"] = ""
-                        st.session_state["cohort_new_color"] = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
                         st.rerun()
 
         if not st.session_state["cohort_athletes"]:
