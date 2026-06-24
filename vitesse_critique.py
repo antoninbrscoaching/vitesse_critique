@@ -62,6 +62,7 @@ import requests
 import io
 import json as _json
 from scipy import stats as sp_stats
+from scipy.optimize import least_squares
 
 st.set_page_config(page_title="Coach Running — Suite complète", layout="wide", page_icon="🏃")
 TZ_NAME_DEFAULT = "Europe/Paris"
@@ -1694,6 +1695,85 @@ TERRAIN_PROFILES = {
     },
 }
 
+def get_all_terrain_profiles():
+    """Fusionne les 4 profils génériques v8.1 avec les profils calibrés par
+    course (sauvegardés depuis l'onglet 👥 Analyse de cohorte, en session ou
+    importés via JSON). Les profils calibrés ont la priorité en cas de clé
+    identique (ne devrait pas arriver en pratique, noms distincts)."""
+    merged = dict(TERRAIN_PROFILES)
+    merged.update(st.session_state.get("custom_terrain_profiles", {}))
+    return merged
+
+def fit_cohort_profile(athletes_list):
+    """Calibre k_up / plafond de pente (max_cap) / seuil et taux de fatigue
+    SPÉCIFIQUEMENT sur les splits réels d'une cohorte d'athlètes pour une
+    course donnée — même méthode (régression log-allure, effets coureur
+    profilés analytiquement) que la calibration v8.1 d'origine sur 1245
+    segments/12 courses, appliquée ici à une seule course.
+    g0_up/k_down/down_cap/g0_down/max_down sont FIXÉS aux valeurs validées
+    globalement : la calibration d'origine a montré qu'ils ne sont pas
+    ré-estimables de façon fiable même avec 12 courses et >1000 segments —
+    ils le seraient encore moins à partir d'une seule course.
+    D+/D- par segment estimé depuis le dénivelé NET entre checkpoints (pas
+    le détail GPX) — même limite que le reste de l'onglet cohorte.
+    Retourne None si la cohorte est trop petite pour un résultat exploitable."""
+    rows = []
+    for a in athletes_list:
+        d_plus_total = sum(sp["elev"] for sp in a["splits"] if sp["elev"] > 0)
+        total_km = a["totalKm"]
+        cum_dist = 0.0; cum_dplus = 0.0
+        for sp in a["splits"]:
+            if sp["dist"] <= 0 or sp["secs"] <= 0:
+                continue
+            d_up = max(0.0, sp["elev"]); d_down = max(0.0, -sp["elev"])
+            cum_dist += sp["dist"]; cum_dplus += d_up
+            rows.append({"athlete": a["name"], "d_up": d_up, "d_down": d_down, "dist_m": sp["dist"] * 1000.0,
+                         "cum_dplus": cum_dplus, "cum_dist": cum_dist, "d_plus_total": d_plus_total,
+                         "total_km": total_km, "pace": sp["secs"] / sp["dist"]})
+
+    n_athletes = len({r["athlete"] for r in rows})
+    if len(rows) < 10 or n_athletes < 2:
+        return None
+
+    g0_up, g0_down, down_cap, k_down, max_down = 5.0, 2.0, -0.50, 15.0, -0.06
+    log_pace = np.array([math.log(r["pace"]) for r in rows])
+    _, group_idx = np.unique([r["athlete"] for r in rows], return_inverse=True)
+    n_groups = int(group_idx.max()) + 1
+
+    def predict_logmult(params):
+        k_up, max_up, fat_thr, fat_rate = params
+        out = np.empty(len(rows))
+        for i, r in enumerate(rows):
+            gm = elev_factor_global(r["d_up"], r["d_down"], r["dist_m"], k_up, k_down, down_cap, g0_up, g0_down, max_up, max_down)
+            fm = fatigue_multiplier_advanced(r["cum_dplus"], r["cum_dist"], r["d_plus_total"], r["total_km"], fat_thr, fat_rate, "mixte")
+            out[i] = math.log(gm) + math.log(fm)
+        return out
+
+    def residuals(params):
+        resid = log_pace - predict_logmult(params)
+        sums = np.bincount(group_idx, weights=resid, minlength=n_groups)
+        counts = np.bincount(group_idx, minlength=n_groups)
+        means = sums / np.maximum(1, counts)
+        return resid - means[group_idx]
+
+    x0 = [15.0, 0.55, 40.0, 18.0]
+    lb = [1.0, 0.10, 3.0, 0.0]
+    ub = [60.0, 1.20, 95.0, 45.0]
+    res = least_squares(residuals, x0, bounds=(lb, ub), max_nfev=3000)
+    resid_final = residuals(res.x)
+    ss_res = float(np.sum(resid_final ** 2))
+    ss_tot = float(np.sum((log_pace - log_pace.mean()) ** 2))
+    r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    return {
+        "k_up": round(float(res.x[0]), 2), "g0_up": g0_up,
+        "k_down": 4.5, "down_cap": -0.10, "minetti_weight": 0.30,
+        "elev_smooth_window": 5, "grade_power": 0.70, "base_cap": 0.18, "extra_per_pct": 0.012,
+        "max_cap": round(float(res.x[1]), 3),
+        "fatigue_threshold": round(float(res.x[2])), "fatigue_rate": round(float(res.x[3]), 1),
+        "r2": round(r2, 3), "n_segments": len(rows), "n_athletes": n_athletes,
+    }
+
 SURFACE_OPTIONS = {
     "🏟️ Route / Piste synthétique":              1.00,
     "🪨 Chemin stabilisé / Gravier":             1.03,
@@ -2010,6 +2090,14 @@ with main_tabs[0]:
                                   horizontal=True, key="mode_activite")
     IS_TRAIL = "Trail" in mode_activite
 
+    # ── v8.1 : suggestion auto. du profil terrain (étape 1/2 — sans GPX) ──
+    # Doit être placé AVANT l'instanciation du widget terrain_profil_radio
+    # (section 4️⃣) dans ce même run, sinon Streamlit lève une
+    # StreamlitAPIException ("cannot be modified after widget is instantiated").
+    if st.session_state.get("_last_mode_activite_for_suggestion") != mode_activite:
+        st.session_state["_last_mode_activite_for_suggestion"] = mode_activite
+        st.session_state["terrain_profil_radio"] = "🛣️ Route / Plat" if not IS_TRAIL else "🏔️ Trail modéré"
+
     st.markdown("---")
     st.header("1️⃣  Parcours GPX")
     gpx_file=st.file_uploader("📂 Importer le GPX de la course cible",type=["gpx"],key="gpx_main")
@@ -2027,6 +2115,23 @@ with main_tabs[0]:
             c2.metric("D+ GPS",f"{dup_tmp:.0f} m")
             c3.metric("D- GPS",f"{ddn_tmp:.0f} m")
             c4.metric("Alt. moy.",f"{avg_alt_tmp:.0f} m")
+
+            # ── v8.1 : suggestion auto. du profil terrain (étape 2/2 — affinée sur D+/km réel) ──
+            # Mêmes garanties d'ordre que l'étape 1 : ce bloc s'exécute en
+            # section 1️⃣, donc toujours avant le widget terrain_profil_radio (section 4️⃣).
+            _dplus_per_km_tmp = dup_tmp / max(tot_tmp/1000.0, 0.001)
+            if IS_TRAIL:
+                if _dplus_per_km_tmp < 30: _suggested_profile = "🏞️ Trail roulant / peu technique"
+                elif _dplus_per_km_tmp < 50: _suggested_profile = "🏔️ Trail modéré"
+                else: _suggested_profile = "⛰️ Ultra-trail montagneux"
+            else:
+                _suggested_profile = "🛣️ Route / Plat"
+            if st.session_state.get("_last_gpx_name_for_suggestion") != (gpx_file.name, mode_activite):
+                st.session_state["_last_gpx_name_for_suggestion"] = (gpx_file.name, mode_activite)
+                st.session_state["terrain_profil_radio"] = _suggested_profile
+            st.info(f"🤖 Profil de terrain suggéré : **{_suggested_profile}** "
+                    f"(D+ = {_dplus_per_km_tmp:.0f} m/km sur {tot_tmp/1000:.1f} km) — "
+                    f"appliqué automatiquement, modifiable dans la section 4️⃣ si besoin.")
 
             if IS_TRAIL:
                 st.markdown("---")
@@ -2291,20 +2396,24 @@ with main_tabs[0]:
         apply_grade=st.checkbox("Prendre en compte la pente",value=True)
         use_minetti=st.checkbox("Modèle Minetti",value=True)
         st.markdown("##### 🗺️ Profil du parcours")
-        terrain_profil=st.radio("Type de terrain",list(TERRAIN_PROFILES.keys()),horizontal=True,key="terrain_profil_radio")
+        _all_terrain_profiles = get_all_terrain_profiles()
+        terrain_profil=st.radio("Type de terrain",list(_all_terrain_profiles.keys()),horizontal=True,key="terrain_profil_radio")
         _prev=st.session_state.get("_prev_terrain_profil","")
         if terrain_profil!=_prev:
             st.session_state["_prev_terrain_profil"]=terrain_profil
-            _d=TERRAIN_PROFILES[terrain_profil]
+            _d=_all_terrain_profiles[terrain_profil]
             for k,v in _d.items():st.session_state[f"tp_{k}"]=v
-        _d=TERRAIN_PROFILES[terrain_profil]
+        _d=_all_terrain_profiles[terrain_profil]
         _profil_info={
             "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=4 (v8 — moins réactif au bruit GPS), lissage altitude ×25pts. Allure stable sur plat.",
             "🏞️ Trail roulant / peu technique":"v8.1 — Ultra-trail à faible D+/km (<30 m/km), type Sainte-Lyon/Nantes-Montaigu/EcoTrail. k_up=19.5 mais plafond bas (max_cap=0.15) : la pente sature vite car les côtes y sont rares. Fatigue continue dès le début (seuil 5%).",
             "🏔️ Trail modéré":"v8.1 — Profil technique moyen calibré sur Templiers/Chianti/St-Jacques (D+ ~40-50m/km). k_up=10.7, plafond 67%. Seuil de fatigue à 60% confirmé par la donnée réelle (seul profil où l'hypothèse plateau-puis-chute tient).",
             "⛰️ Ultra-trail montagneux":"v8.1 — Calibré sur TDS/UTMB/OCC/TransGC/Transvulcania/MCC (D+ ~55-65m/km). k_up=13.2, plafond le plus élevé (79%) sur les pentes très raides. Fatigue continue dès le début (seuil 5%). DEM recommandé.",
         }
-        st.info(_profil_info.get(terrain_profil,""))
+        if terrain_profil in _profil_info:
+            st.info(_profil_info[terrain_profil])
+        else:
+            st.info(f"📌 Profil calibré depuis l'onglet 👥 Analyse de cohorte (k_up={_d.get('k_up')}, plafond={_d.get('max_cap',0)*100:.0f}%, seuil fatigue={_d.get('fatigue_threshold','—')}%) — paramètres non calibrés repris du profil « Trail modéré ».")
 
         tech_global_ui=st.session_state.get("tech_global",{})
         if IS_TRAIL and tech_global_ui.get("global_score",0)>0 and terrain_profil=="🏔️ Trail modéré":
@@ -3395,9 +3504,14 @@ with main_tabs[3]:
                         rows_d.append({"Segment": sp["km"], "Km cumulé": round(cum_km_a,1), "Dist (km)": round(sp["dist"],2),
                                        "Allure": pace_str(pace_sp)+"/km",
                                        "D+ seg (m)": sp["elev"], "FC": sp["hr"] if sp["hr"] else "—",
-                                       "vs moy.": ("+" if diff_sp>0 else "")+pace_str(abs(diff_sp))})
+                                       "Écart vs allure moy.": ("+" if diff_sp>0 else "")+pace_str(abs(diff_sp))})
                     df_d = pd.DataFrame(rows_d)
-                    st.dataframe(df_d, use_container_width=True, hide_index=True)
+                    st.dataframe(df_d, use_container_width=True, hide_index=True, column_config={
+                        "Écart vs allure moy.": st.column_config.TextColumn(
+                            help="Différence entre l'allure de ce segment et l'allure MOYENNE de cet athlète sur toute "
+                                 "la course (pas l'allure des autres athlètes). Négatif = segment couru plus vite que "
+                                 "sa propre moyenne, positif = plus lent.")
+                    })
                     st.download_button("⬇️ Splits (CSV)", df_d.to_csv(index=False).encode("utf-8"),
                                        file_name=f"splits_{a['name']}.csv", key=f"cohort_dl_splits_{a['id']}")
 
@@ -3506,3 +3620,80 @@ with main_tabs[3]:
             st.dataframe(df_seg, use_container_width=True, hide_index=True)
             st.download_button("⬇️ Comparaison détaillée (CSV)", df_seg.to_csv(index=False).encode("utf-8"),
                                file_name=f"comparaison_algo_{cohort_selected['name']}.csv", key="cohort_dl_comparison")
+
+            st.markdown("---")
+            st.markdown("#### 🔬 Calibrer un profil sur cette course")
+            st.caption(
+                "Utilise TOUS les athlètes de la cohorte (pas seulement celui sélectionné plus haut) pour ajuster "
+                "k_up, le plafond de pente et le modèle de fatigue spécifiquement sur cette course — même méthode "
+                "(régression log-allure, effets coureur profilés analytiquement) que la calibration v8.1 d'origine "
+                "(1245 segments, 12 courses), appliquée ici à une seule course. Le cap descente, la sensibilité "
+                "météo et les paramètres secondaires restent ceux validés globalement — non ré-estimables de façon "
+                "fiable à partir d'une seule course, même avec une cohorte complète.")
+
+            if len(cohort_athletes_list) < 2:
+                st.info("Ajoute au moins 2 athlètes dans cette cohorte pour pouvoir calibrer un profil sur cette course.")
+            else:
+                if st.button("🔬 Calibrer un profil sur cette course", key="cohort_calibrate_btn"):
+                    with st.spinner("Calibration en cours..."):
+                        st.session_state["cohort_fit_result"] = fit_cohort_profile(cohort_athletes_list)
+
+                _fit_result = st.session_state.get("cohort_fit_result")
+                if _fit_result is None and "cohort_fit_result" in st.session_state:
+                    st.warning("Pas assez de données pour une calibration fiable (minimum recommandé : 2 athlètes "
+                               "et ~10 segments cumulés). Ajoute des athlètes ou attends d'avoir plus de checkpoints.")
+                elif _fit_result:
+                    fc1, fc2, fc3, fc4 = st.columns(4)
+                    fc1.metric("k_up calibré", f"{_fit_result['k_up']:.1f}")
+                    fc2.metric("Plafond pente", f"{_fit_result['max_cap']*100:.0f} %")
+                    fc3.metric("Seuil fatigue", f"{_fit_result['fatigue_threshold']:.0f} %")
+                    fc4.metric("Taux fatigue", f"{_fit_result['fatigue_rate']:.0f} %")
+                    st.caption(f"R² = {_fit_result['r2']:.2f} · {_fit_result['n_athletes']} athlètes · {_fit_result['n_segments']} segments utilisés.")
+                    st.caption("ℹ️ k_up et le plafond de pente sont en général bien identifiés par cette méthode. "
+                               "Le seuil et le taux de fatigue, eux, peuvent se compenser l'un l'autre (plusieurs "
+                               "combinaisons donnent une courbe de dégradation très proche) même quand le R² est "
+                               "élevé — fie-toi surtout au temps total prédit pour juger de la qualité du profil, "
+                               "pas à ces deux chiffres pris isolément.")
+                    if _fit_result["r2"] < 0.5:
+                        st.warning("⚠️ R² faible — calibration peu fiable (cohorte trop petite ou trop homogène en "
+                                   "allure/dénivelé pour bien séparer pente et fatigue). Utilisable à titre indicatif.")
+
+                    _default_profile_name = f"📌 {st.session_state['cohort_course']['name'] or 'Course'} (calibré)"
+                    cohort_profile_name = st.text_input("Nom du profil à sauvegarder", value=_default_profile_name, key="cohort_profile_name_input")
+                    if st.button("💾 Sauvegarder comme profil terrain", key="cohort_save_profile_btn"):
+                        if "custom_terrain_profiles" not in st.session_state:
+                            st.session_state["custom_terrain_profiles"] = {}
+                        st.session_state["custom_terrain_profiles"][cohort_profile_name] = {
+                            k: v for k, v in _fit_result.items() if k not in ("r2", "n_segments", "n_athletes")
+                        }
+                        st.success(f"Profil « {cohort_profile_name} » sauvegardé — sélectionnable dans l'onglet "
+                                   f"🏃 Prédiction de course, section 4️⃣ Paramètres du modèle.")
+
+                _custom_profiles = st.session_state.get("custom_terrain_profiles", {})
+                if _custom_profiles:
+                    st.markdown("##### 📚 Profils calibrés sauvegardés (cette session)")
+                    for _pname in list(_custom_profiles.keys()):
+                        _pc1, _pc2 = st.columns([5, 1])
+                        _pc1.write(_pname)
+                        if _pc2.button("Suppr.", key=f"cohort_del_profile_{_pname}"):
+                            del st.session_state["custom_terrain_profiles"][_pname]
+                            st.rerun()
+                    st.download_button(
+                        "⬇️ Exporter ces profils (JSON)",
+                        data=_json.dumps(_custom_profiles, ensure_ascii=False, indent=2).encode("utf-8"),
+                        file_name="profils_calibres.json", key="cohort_export_profiles")
+                    st.caption("⚠️ Ces profils sont en mémoire de session uniquement — exporte-les en JSON pour "
+                               "les retrouver lors d'une prochaine session (à réimporter ci-dessous).")
+
+                cohort_import_file = st.file_uploader("⬆️ Importer des profils calibrés (JSON)", type=["json"], key="cohort_import_profiles")
+                if cohort_import_file and st.session_state.get("_last_imported_profile_file") != cohort_import_file.name:
+                    st.session_state["_last_imported_profile_file"] = cohort_import_file.name
+                    try:
+                        _imported = _json.loads(cohort_import_file.read().decode("utf-8"))
+                        if "custom_terrain_profiles" not in st.session_state:
+                            st.session_state["custom_terrain_profiles"] = {}
+                        st.session_state["custom_terrain_profiles"].update(_imported)
+                        st.success(f"{len(_imported)} profil(s) importé(s).")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Fichier JSON invalide : {e}")
