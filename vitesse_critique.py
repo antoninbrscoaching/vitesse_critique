@@ -1,5 +1,22 @@
 # analyse_course_v8.py
 # Application Streamlit unifiée — 3 onglets
+# NOUVEAUTÉS v8.2 :
+#   - Modèle de marche en forte pente (VAM) : au-delà d'un seuil de pente
+#     (défaut 25%, réglable), le temps est gouverné par la VAM (Vitesse
+#     d'Ascension Moyenne, m de D+/heure) plutôt que par l'allure horizontale.
+#     Corrige une sous-estimation majeure du temps sur les passages très
+#     raides (>25-30%) : le plafond de pente calibré (max_cap) reflète des
+#     pentes MOYENNES de segments de plusieurs km dans les données de
+#     calibration v8.1, pas les pointes instantanées les plus raides d'un
+#     parcours réel — sans ce patch, un parcours type UTMB pouvait être
+#     largement sous-estimé en temps.
+#   - Détection du point de rupture sur tests à effort maximal (onglet VC,
+#     section 4️⃣) : pour chaque test importé en FIT/TCX, détecte le moment où
+#     l'allure décroche le plus nettement, en % de la durée totale. Comparer
+#     ce % entre tests de durées différentes permet de repérer une signature
+#     de fatigue propre à l'athlète, utilisable comme point de départ pour le
+#     seuil de fatigue en course longue.
+#
 # NOUVEAUTÉS v8.1 (calibration empirique) :
 #   - Courbe de pente en montée recalibrée par profil sur 1245 segments coureurs
 #     (top10 réel de 12 ultra-trails : TDS, UTMB, OCC, Templiers, Sainte-Lyon,
@@ -218,6 +235,33 @@ def combined_grade_multiplier(grade_pct,use_minetti,minetti_weight,k_up,k_down,d
     w=max(0.0,min(1.0,float(minetti_weight)))
     return w*m_min+(1.0-w)*m_heu
 
+# ── v8.2 PATCH : marche en forte pente, gouvernée par la VAM ──────────────
+# Le modèle de pente ci-dessus (combined_grade_multiplier) a été calibré sur
+# des SEGMENTS DE PLUSIEURS KM (moyennés), pas sur la pente instantanée GPX.
+# Son plafond (max_up/max_cap) reflète donc "jusqu'où une pente MOYENNE de
+# segment a pu pénaliser l'allure dans les données réelles" — pas le coût
+# physiologique réel d'un passage ponctuel à 35-45% où même les meilleurs
+# marchent. Au-delà d'un seuil de pente, ce patch fait gouverner le temps par
+# la VAM (Vitesse d'Ascension Moyenne, m de D+ par heure) plutôt que par
+# l'allure horizontale — c'est le bon référentiel physiologique pour la
+# marche en forte pente, indépendant de la calibration k_up/max_cap.
+def grade_multiplier_with_vam(grade_pct, base_s_per_km, vam_threshold_pct, vam_rate_m_per_h, vam_blend_width_pct,
+                               use_minetti, minetti_weight, k_up, k_down, down_cap, g0_up, g0_down, max_up, max_down):
+    g = float(grade_pct)
+    mult_smooth = combined_grade_multiplier(g, use_minetti, minetti_weight, k_up, k_down, down_cap, g0_up, g0_down, max_up, max_down)
+    if g <= 0:
+        return mult_smooth
+    lo = float(vam_threshold_pct) - float(vam_blend_width_pct) / 2.0
+    if g <= lo:
+        return mult_smooth
+    d_plus_per_km_m = g / 100.0 * 1000.0  # m de D+ pour 1km horizontal à cette pente
+    t_vam_s_per_km = d_plus_per_km_m / max(1.0, float(vam_rate_m_per_h)) * 3600.0
+    mult_vam = t_vam_s_per_km / max(1.0, float(base_s_per_km))
+    hi = float(vam_threshold_pct) + float(vam_blend_width_pct) / 2.0
+    w = 1.0 if g >= hi else max(0.0, (g - lo) / max(1e-6, (hi - lo)))
+    return (1.0 - w) * mult_smooth + w * max(mult_smooth, mult_vam)
+# ───────────────────────────────────────────────────────────────────────────
+
 def temp_multiplier(temp_eff, opt_temp, cold_quad, hot_quad, max_penalty):
     if temp_eff is None: return 1.0
     d = float(temp_eff) - float(opt_temp)
@@ -258,6 +302,22 @@ def cap_combined(mult_total,grade_pct,base_cap,extra_per_pct,max_cap):
     g=max(0.0,float(grade_pct))
     cap=min(float(max_cap),float(base_cap)+float(extra_per_pct)*g)
     return min(float(mult_total),1.0+cap)
+
+def cap_combined_with_vam(mult_total, grade_pct, base_cap, extra_per_pct, max_cap,
+                           base_s_per_km, apply_vam, vam_threshold_pct, vam_rate_m_per_h):
+    """Comme cap_combined, mais empêche le plafonnement de redescendre sous le
+    plancher physiologique imposé par la VAM quand la pente NETTE du km est
+    elle-même extrême — sinon ce second plafond (calibré sur des pentes
+    nettes de km, pas sur la pente instantanée) annulerait le correctif
+    apporté par grade_multiplier_with_vam au niveau point par point."""
+    capped = cap_combined(mult_total, grade_pct, base_cap, extra_per_pct, max_cap)
+    g = max(0.0, float(grade_pct))
+    if apply_vam and g >= float(vam_threshold_pct):
+        d_plus_per_km_m = g / 100.0 * 1000.0
+        t_vam_s_per_km = d_plus_per_km_m / max(1.0, float(vam_rate_m_per_h)) * 3600.0
+        mult_vam_floor = t_vam_s_per_km / max(1.0, float(base_s_per_km))
+        return max(capped, mult_vam_floor)
+    return capped
 
 def fatigue_multiplier(d_plus_cum,dist_cum,d_plus_total,dist_total,rate_pct,mode):
     """Modèle de fatigue simple (conservé pour compatibilité)."""
@@ -699,6 +759,89 @@ def compute_vc(distances_m,durations_s):
     slope,intercept,r,p,se=sp_stats.linregress(T,D)
     return float(slope),float(intercept),float(r**2)
 
+# ── v8.2 PATCH : détection du point de rupture sur un test à effort maximal ──
+def compute_pace_series_from_points(points, window_s=20.0, grid_step_s=5.0):
+    """À partir d'une liste de points (dict issus de parse_fit_ref, ou objets
+    SimplePoint issus de parse_tcx_ref — les deux formats coexistent dans
+    l'app), construit une série temps/allure lissée sur fenêtre glissante.
+    Retourne (None, None) si la trace est trop courte ou sans temps exploitable."""
+    def _t(p): return p.get("time") if isinstance(p, dict) else getattr(p, "time", None)
+    def _lat(p): return p.get("lat") if isinstance(p, dict) else getattr(p, "latitude", None)
+    def _lon(p): return p.get("lon") if isinstance(p, dict) else getattr(p, "longitude", None)
+    def _dist(p):
+        if not isinstance(p, dict): return None
+        v = p.get("dist")
+        return safe_float(v) if v is not None else None
+
+    pts = [p for p in (points or []) if _t(p) is not None]
+    if len(pts) < 10:
+        return None, None
+    t0 = _t(pts[0])
+    try:
+        times_s = np.array([(_t(p) - t0).total_seconds() for p in pts])
+    except Exception:
+        return None, None
+
+    raw_dists = [_dist(p) for p in pts]
+    if all(d is not None for d in raw_dists) and raw_dists[-1] and raw_dists[-1] > 1.0:
+        dists_m = np.array([d if d is not None else 0.0 for d in raw_dists])
+    else:
+        d = [0.0]
+        for i in range(1, len(pts)):
+            d.append(d[-1] + haversine_m(_lat(pts[i-1]), _lon(pts[i-1]), _lat(pts[i]), _lon(pts[i])))
+        dists_m = np.array(d)
+
+    order = np.argsort(times_s)
+    times_s = times_s[order]; dists_m = dists_m[order]
+    t_max = times_s[-1]
+    if t_max < 60:
+        return None, None
+    grid = np.arange(0, t_max, grid_step_s)
+    dist_grid = np.interp(grid, times_s, dists_m)
+    half = max(1, int(window_s / grid_step_s / 2))
+    pace = np.full(len(grid), np.nan)
+    for i in range(len(grid)):
+        i0, i1 = max(0, i - half), min(len(grid) - 1, i + half)
+        dd = dist_grid[i1] - dist_grid[i0]; dt = grid[i1] - grid[i0]
+        if dd > 1.0 and dt > 0:
+            pace[i] = dt / (dd / 1000.0)
+    valid = ~np.isnan(pace)
+    if valid.sum() < 10:
+        return None, None
+    return grid[valid], pace[valid]
+
+def detect_pace_breakpoint(t_array_s, pace_array_s_per_km):
+    """Cherche le point unique qui sépare le test en deux régimes d'allure
+    les plus distincts possibles (minimise la somme des variances intra-
+    segment — détection de rupture classique à un seul point de cassure).
+    Retourne le moment, le % de la durée totale, les allures avant/après,
+    le % de dégradation et un R² indiquant la qualité de la séparation."""
+    n = len(pace_array_s_per_km)
+    if n < 8:
+        return None
+    total_var = float(np.var(pace_array_s_per_km)) * n
+    if total_var <= 0:
+        return None
+    best_idx = None; best_explained = -1.0
+    margin = max(2, n // 10)
+    for idx in range(margin, n - margin):
+        seg1 = pace_array_s_per_km[:idx]; seg2 = pace_array_s_per_km[idx:]
+        ss = float(np.var(seg1)) * len(seg1) + float(np.var(seg2)) * len(seg2)
+        explained = total_var - ss
+        if explained > best_explained:
+            best_explained = explained; best_idx = idx
+    if best_idx is None:
+        return None
+    t_break = float(t_array_s[best_idx])
+    pct_break = t_break / float(t_array_s[-1]) * 100.0
+    pace_before = float(np.mean(pace_array_s_per_km[:best_idx]))
+    pace_after = float(np.mean(pace_array_s_per_km[best_idx:]))
+    drop_pct = (pace_after - pace_before) / max(1e-6, pace_before) * 100.0
+    r2_break = best_explained / total_var
+    return {"t_break_s": t_break, "pct_break": pct_break, "pace_before": pace_before,
+            "pace_after": pace_after, "drop_pct": drop_pct, "r2": r2_break}
+# ───────────────────────────────────────────────────────────────────────────
+
 def build_holding_table(vc_ms,d_prime,refs_fit,K_riegel):
     if vc_ms is None or vc_ms<=0:return pd.DataFrame()
     X,Y=[],[]
@@ -945,7 +1088,8 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     meteo_fallback_temp=12.0, meteo_fallback_amp=4.0,
     meteo_fallback_wind=2.0,  meteo_fallback_humidity=60.0,
     meteo_fallback_wind_dir=180.0,
-    pace_sensitivity_ref=360.0):
+    pace_sensitivity_ref=360.0,
+    apply_vam=True,vam_threshold_pct=25.0,vam_rate_m_per_h=900.0,vam_blend_width_pct=10.0):
 
     if not points or len(points)<2:raise ValueError("GPX invalide ou trop court.")
     if dem_elevations is not None and len(dem_elevations)==len(points):
@@ -1046,8 +1190,12 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
             _dd = float(_dist_seg[_j+1] - _dist_seg[_j]) if _j+1<len(_dist_seg) else 1.0
             if _dd <= 0: continue
             _g_pt = (_elev_seg[_j+1]-_elev_seg[_j])/_dd*100.0
-            _m_pt = combined_grade_multiplier(_g_pt,use_minetti,minetti_weight,
-                                               k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down)
+            if apply_vam:
+                _m_pt = grade_multiplier_with_vam(_g_pt,base_s_per_km,vam_threshold_pct,vam_rate_m_per_h,vam_blend_width_pct,
+                                                   use_minetti,minetti_weight,k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down)
+            else:
+                _m_pt = combined_grade_multiplier(_g_pt,use_minetti,minetti_weight,
+                                                   k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down)
             _weighted_mult  += _m_pt * _dd
             _weighted_grade += _g_pt * _dd
             _total_w += _dd
@@ -1128,7 +1276,8 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
         wm=float(row["wind_mult_raw"]);g=float(row["grade"])
         gate=wind_gate(g,wind_gate_g1,wind_gate_g2,wind_gate_min);wm_gated=1.0+gate*(wm-1.0)
         t_w=float(row["t_no_wind"])*(wm_gated**wind_power)
-        gm_capped=cap_combined(float(row["grade_mult"]),g,base_cap,extra_per_pct,max_cap)
+        gm_capped=cap_combined_with_vam(float(row["grade_mult"]),g,base_cap,extra_per_pct,max_cap,
+                                        base_s_per_km,apply_vam,vam_threshold_pct,vam_rate_m_per_h)
         gm_raw=float(row["grade_mult"])
         if gm_raw > 0:
             t_final=t_w*(gm_capped/gm_raw)
@@ -2472,6 +2621,24 @@ with main_tabs[0]:
         _col=_terrain_colors.get(terrain_profil,"#444")
         st.markdown(f'<div style="background:rgba(0,0,0,0.04);border-left:3px solid {_col};border-radius:4px;padding:6px 12px;font-size:0.82rem;margin-top:6px;"><b>{terrain_profil}</b> · k_up={k_up:.0f} · k_down={k_down:.0f} · Minetti={minetti_weight:.2f} · Plafond={max_cap:.0%} · Surface <b>{surface_sel.split()[0]} ×{surface_mult:.2f}</b></div>',unsafe_allow_html=True)
 
+    with st.expander("🥾 Marche en forte pente (VAM)", expanded=True):
+        st.caption(
+            "Au-delà d'un certain % de pente, même les meilleurs grimpeurs marchent — l'allure devient gouvernée "
+            "par la VAM (Vitesse d'Ascension Moyenne, m de D+/heure) plutôt que par la vitesse horizontale. Sans "
+            "ce correctif, le modèle peut sous-estimer fortement le temps sur les portions très raides (>25-30%), "
+            "car le plafond de pénalité calibré (max_cap) reflète des pentes MOYENNES de segments de plusieurs km "
+            "dans les données de calibration — pas les pointes instantanées les plus raides du parcours.")
+        apply_vam=st.checkbox("Activer le modèle de marche en forte pente",value=True,key="apply_vam")
+        vam_threshold_pct=25.0;vam_rate_m_per_h=900.0;vam_blend_width_pct=10.0
+        if apply_vam:
+            vc1,vc2=st.columns(2)
+            vam_threshold_pct=vc1.slider("Pente à partir de laquelle la marche domine (%)",15.0,40.0,25.0,1.0,key="vam_threshold")
+            vam_rate_m_per_h=vc2.number_input("VAM soutenable (m de D+ / heure)",min_value=300.0,max_value=2000.0,value=900.0,step=50.0,key="vam_rate",
+                                               help="Ordre de grandeur : ~600-800 m/h coureur loisir, ~900-1100 m/h bon traileur entraîné, >1300 m/h niveau élite/skyrunning — dépend aussi de la technicité du terrain.")
+            if EXPERT:
+                vam_blend_width_pct=st.slider("Largeur de transition (%)",2.0,20.0,10.0,1.0,key="vam_blend",
+                                               help="Évite une cassure brutale entre le modèle de pente classique et le modèle de marche.")
+
     with st.expander("💨 Vent"):
         apply_wind=st.checkbox("Appliquer l'effet du vent",value=True)
         wind_mode="Lissé"
@@ -2599,7 +2766,9 @@ with main_tabs[0]:
                         meteo_fallback_temp=meteo_fb["temp"],meteo_fallback_amp=meteo_fb["amp"],
                         meteo_fallback_wind=meteo_fb["wind"],meteo_fallback_humidity=meteo_fb["humidity"],
                         meteo_fallback_wind_dir=meteo_fb["wind_dir"],
-                        pace_sensitivity_ref=pace_sensitivity_ref)
+                        pace_sensitivity_ref=pace_sensitivity_ref,
+                        apply_vam=apply_vam,vam_threshold_pct=vam_threshold_pct,
+                        vam_rate_m_per_h=vam_rate_m_per_h,vam_blend_width_pct=vam_blend_width_pct)
                     st.session_state["res"]=res
                     st.session_state["refs_fit_vc"]=res.get("refs_fit",[])
                     st.session_state["K_riegel_vc"]=res.get("K",1.06)
@@ -2861,6 +3030,8 @@ with main_tabs[1]:
 
             use_file_vc = st.checkbox("📂 Importer depuis un fichier FIT/TCX",
                                       key=f"vc_use_file_{i}")
+            if not use_file_vc:
+                st.session_state.pop(f"vc_points_{i}", None)  # v8.2 — évite une analyse de rupture sur des données obsolètes
 
             dist_v = 5000.0
             secs_v = 0.0
@@ -2929,6 +3100,10 @@ with main_tabs[1]:
                             d_up_v = float(parsed_vc_i["D_up"])
                         secs_v = float(hms_to_seconds(dur_i))
                         hr_ref_vc = parsed_vc_i.get("hr_analysis")
+                        # v8.2 — conserve les points pour la détection de rupture (section 4️⃣)
+                        st.session_state[f"vc_points_{i}"] = (
+                            seg_i if pts_i and (start_td_i.total_seconds() > 0 or end_td_i.total_seconds() < 86399) else pts_i)
+                        st.session_state[f"vc_label_{i}"] = f"Réf {i} ({dist_v/1000:.1f} km, {dur_i})"
                         if secs_v > 0 and dist_v > 0:
                             st.caption(f"📍 **{dist_v:.0f} m** · **{dur_i}** · **{pace_str(secs_v/(dist_v/1000))}/km** · D+ {d_up_v:.0f} m")
                         if hr_ref_vc and hr_ref_vc.get("hr_avg"):
@@ -3122,6 +3297,66 @@ with main_tabs[1]:
             _ax_palier(axes[2], "eqO2", "Éq. O₂",        "#2ca02c")
             _ax_palier(axes[3], "HR",   "FC (bpm)",       "#e377c2")
             plt.tight_layout(); st.pyplot(fig_gz); plt.close(fig_gz)
+
+    st.markdown("---")
+    st.header("4️⃣ Détection du point de rupture (tests à effort maximal)")
+    st.caption(
+        "Pour chaque référence importée via fichier FIT/TCX (section 1️⃣ ci-dessus), détecte le moment où "
+        "l'allure décroche le plus nettement — une rupture à un seul changement de régime (allure stable, puis "
+        "allure dégradée). Comparer ce point en % de la durée totale entre plusieurs tests de durées différentes "
+        "peut révéler une signature de fatigue récurrente propre à l'athlète, utilisable comme point de départ "
+        "pour le seuil de fatigue en course longue (onglet 🏃 Prédiction, section 4️⃣).")
+
+    _bp_rows = []
+    for _i in range(1, st.session_state.n_refs_vc + 1):
+        _pts = st.session_state.get(f"vc_points_{_i}")
+        if not _pts:
+            continue
+        _t_bp, _pace_bp = compute_pace_series_from_points(_pts)
+        if _t_bp is None or len(_t_bp) < 10:
+            continue
+        _bp = detect_pace_breakpoint(_t_bp, _pace_bp)
+        if _bp is None:
+            continue
+        _label = st.session_state.get(f"vc_label_{_i}", f"Réf {_i}")
+        _bp_rows.append({"Test": _label, "Durée totale": seconds_to_hms(float(_t_bp[-1])),
+                         "Rupture à": seconds_to_hms(_bp["t_break_s"]), "% de la durée": round(_bp["pct_break"], 1),
+                         "Allure avant": pace_str(_bp["pace_before"]) + "/km", "Allure après": pace_str(_bp["pace_after"]) + "/km",
+                         "Dégradation": f"{_bp['drop_pct']:+.1f}%", "Qualité (R²)": round(_bp["r2"], 2)})
+
+    if not _bp_rows:
+        st.info("Importe au moins un test via fichier FIT/TCX (section 1️⃣ ci-dessus, ≥1 min) pour activer cette "
+                "analyse — les références saisies à la main (sans fichier) n'ont pas de courbe d'allure à analyser.")
+    else:
+        df_bp = pd.DataFrame(_bp_rows)
+        st.dataframe(df_bp, use_container_width=True, hide_index=True)
+
+        _valid = [r for r in _bp_rows if r["Qualité (R²)"] >= 0.3]
+        if len(_valid) >= 2:
+            _pcts = [r["% de la durée"] for r in _valid]
+            _drops = [float(r["Dégradation"].replace("%", "")) for r in _valid]
+            _avg_pct = float(np.mean(_pcts)); _std_pct = float(np.std(_pcts)); _avg_drop = float(np.mean(_drops))
+            st.markdown(f"**Signature moyenne détectée : rupture vers {_avg_pct:.0f}% de l'effort "
+                        f"(±{_std_pct:.0f} pts) · dégradation moyenne {_avg_drop:+.1f}%**")
+            if _std_pct < 15:
+                st.success(f"📍 Cohérent entre tests de durées différentes — signe d'une vraie signature "
+                           f"physiologique plutôt qu'un artefact d'un seul test. Tu pourrais tester "
+                           f"`fatigue_threshold ≈ {_avg_pct:.0f}` dans l'onglet 🏃 Prédiction comme point de départ "
+                           f"pour cet athlète (à confirmer/affiner avec les courses réelles dans l'onglet "
+                           f"👥 Analyse de cohorte).")
+            else:
+                st.warning(f"⚠️ Le point de rupture varie pas mal selon la durée du test (±{_std_pct:.0f} pts) — "
+                           f"peut-être pas une signature fixe en %, ou tests pas tous menés au même niveau "
+                           f"d'effort relatif (quasi-maximal soutenable sur leur durée respective).")
+        elif len(_valid) == 1:
+            st.caption("Un seul test exploitable pour l'instant — importe au moins 2-3 tests de durées "
+                       "différentes (effort maximal soutenu sur chacun) pour voir si le point de rupture est "
+                       "cohérent entre eux.")
+        st.caption(
+            "⚠️ Le mécanisme de rupture sur un test court (quelques minutes à 1h, effort quasi-maximal) n'est pas "
+            "forcément le même phénomène physiologique que la fatigue sur une course de plusieurs heures "
+            "(déplétion glycogénique, dommages musculaires, thermorégulation...). À traiter comme une piste à "
+            "recouper avec des données de course réelles, pas comme une vérité automatiquement transférable.")
 
 
 # ══════════════════════════════════════════════════════════════
