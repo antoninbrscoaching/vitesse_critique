@@ -1865,13 +1865,17 @@ def get_time_at_km(athlete, target_km):
 def plot_cohort_pace_chart(athletes_list, checkpoints_list):
     fig, ax = plt.subplots(figsize=(11, 4))
     for a in athletes_list:
-        x = [sp["km"] for sp in a["splits"]]
-        y = [sp["secs"] / sp["dist"] for sp in a["splits"]]
-        ax.plot(x, y, color=a["color"], lw=2, ls="--" if a.get("dashed") else "-", label=a["name"])
+        cum = 0.0; x = []; y = []
+        for sp in a["splits"]:
+            cum_start = cum; cum += sp["dist"]
+            x.append((cum_start + cum) / 2.0)  # position réelle en km (milieu du segment)
+            y.append(sp["secs"] / sp["dist"])
+        ax.plot(x, y, color=a["color"], lw=2, marker="o" if len(x) < 60 else None, ms=3,
+                ls="--" if a.get("dashed") else "-", label=a["name"])
     for cp in checkpoints_list:
         ax.axvline(cp["km"], color="#f59e0b", lw=1, ls=":", alpha=0.6)
     ax.invert_yaxis()
-    ax.set_xlabel("Kilomètre"); ax.set_ylabel("Allure")
+    ax.set_xlabel("Distance (km)"); ax.set_ylabel("Allure")
     yticks = ax.get_yticks()
     ax.set_yticks(yticks)
     ax.set_yticklabels([pace_str(t) for t in yticks if t > 0])
@@ -1880,20 +1884,29 @@ def plot_cohort_pace_chart(athletes_list, checkpoints_list):
     return fig
 
 def plot_cohort_cp_chart(athletes_list, checkpoints_list):
-    fig, ax = plt.subplots(figsize=(11, 4))
-    x = list(range(len(checkpoints_list)))
-    labels = [f"{cp['name']}\nkm {cp['km']:.1f}" for cp in checkpoints_list]
+    n_cp = len(checkpoints_list)
+    fig_w = max(11, n_cp * 0.55)
+    fig, ax = plt.subplots(figsize=(fig_w, 4.5))
     for a in athletes_list:
+        x = [cp["km"] for cp in checkpoints_list]
         y = [get_time_at_km(a, cp["km"]) / 60.0 for cp in checkpoints_list]
         ax.plot(x, y, color=a["color"], lw=2, marker="o", ms=5, ls="--" if a.get("dashed") else "-", label=a["name"])
-    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=8)
+    ymin, ymax = ax.get_ylim()
+    for idx, cp in enumerate(checkpoints_list):
+        ax.axvline(cp["km"], color="#94a3b8", lw=0.5, ls=":", alpha=0.4, zorder=0)
+        y_offset = 8 if idx % 2 == 0 else 26  # alterne la hauteur pour limiter le chevauchement
+        ax.annotate(f"{cp['name']}\nkm {cp['km']:.1f}", xy=(cp["km"], ymax),
+                    xytext=(0, y_offset), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=7, color="#475569")
+    ax.set_xlabel("Distance (km)"); ax.set_ylabel("Temps cumulé")
     yticks = ax.get_yticks()
     ax.set_yticks(yticks)
     ax.set_yticklabels([f"{int(t // 60)}h{int(round(t % 60)):02d}" for t in yticks])
-    ax.set_ylabel("Temps cumulé"); ax.set_title("Temps de passage aux checkpoints")
-    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    ax.set_title("Temps de passage aux checkpoints — positions proportionnelles à la distance réelle")
+    ax.legend(fontsize=8, loc="lower right"); ax.grid(alpha=0.3)
     fig.tight_layout()
     return fig
+
 
 def fetch_daily_weather(lat, lon, date_obj):
     """Météo journalière (tmax/tmin/précip/vent) — endpoint Open-Meteo distinct
@@ -3178,6 +3191,8 @@ with main_tabs[3]:
         st.session_state["cohort_athlete_id_counter"] = 0
     if "cohort_cp_id_counter" not in st.session_state:
         st.session_state["cohort_cp_id_counter"] = 0
+    if "cohort_add_msg" not in st.session_state:
+        st.session_state["cohort_add_msg"] = ""
 
     cohort_subtabs = st.tabs(["🏁 Course", "🏃 Athlètes", "📍 Checkpoints", "📊 Analyse", "🤖 Analyse de course"])
 
@@ -3224,6 +3239,10 @@ with main_tabs[3]:
 
     # ── Sous-onglet : Athlètes ──
     with cohort_subtabs[1]:
+        if st.session_state.get("cohort_add_msg"):
+            st.success(st.session_state["cohort_add_msg"])
+            st.session_state["cohort_add_msg"] = ""
+
         with st.expander("➕ Ajouter un athlète", expanded=True):
             ac1, ac2 = st.columns(2)
             cohort_new_name = ac1.text_input("Nom", key="cohort_new_name", placeholder="ex: Thomas B. ou Athlète A")
@@ -3253,7 +3272,12 @@ with main_tabs[3]:
                                 st.session_state["cohort_cp_id_counter"] += 1
                                 st.session_state["cohort_checkpoints"].append(
                                     {"id": st.session_state["cohort_cp_id_counter"], "name": cp["name"], "km": cp["cumDist"]})
-                        st.success("Athlète importé !"); st.rerun()
+                        # Vide le formulaire et avance la couleur pour le prochain athlète
+                        st.session_state["cohort_add_msg"] = f"✅ {name} importé !"
+                        st.session_state["cohort_new_name"] = ""
+                        st.session_state["cohort_new_splits"] = ""
+                        st.session_state["cohort_new_color"] = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
+                        st.rerun()
                 else:
                     splits = parse_splits_strava(cohort_new_splits)
                     if len(splits) < 2:
@@ -3264,7 +3288,12 @@ with main_tabs[3]:
                         st.session_state["cohort_athletes"].append({
                             "id": st.session_state["cohort_athlete_id_counter"], "name": name, "color": cohort_new_color,
                             "splits": splits, "totalSecs": sum(sp["secs"] for sp in splits), "totalKm": sum(sp["dist"] for sp in splits)})
-                        st.success("Athlète ajouté !"); st.rerun()
+                        # Vide le formulaire et avance la couleur pour le prochain athlète
+                        st.session_state["cohort_add_msg"] = f"✅ {name} ajouté !"
+                        st.session_state["cohort_new_name"] = ""
+                        st.session_state["cohort_new_splits"] = ""
+                        st.session_state["cohort_new_color"] = COHORT_PALETTE[len(st.session_state["cohort_athletes"]) % len(COHORT_PALETTE)]
+                        st.rerun()
 
         if not st.session_state["cohort_athletes"]:
             st.caption("Aucun athlète pour l'instant.")
@@ -3355,10 +3384,13 @@ with main_tabs[3]:
                 avg_pace_a = a["totalSecs"] / max(a["totalKm"], 0.1)
                 with st.expander(f"{a['name']} — {pace_str(avg_pace_a)}/km · {seconds_to_hms(a['totalSecs'])}"):
                     rows_d = []
+                    cum_km_a = 0.0
                     for sp in a["splits"]:
+                        cum_km_a += sp["dist"]
                         pace_sp = sp["secs"] / sp["dist"]
                         diff_sp = pace_sp - avg_pace_a
-                        rows_d.append({"Km": sp["km"], "Dist (km)": round(sp["dist"],2), "Allure": pace_str(pace_sp)+"/km",
+                        rows_d.append({"Segment": sp["km"], "Km cumulé": round(cum_km_a,1), "Dist (km)": round(sp["dist"],2),
+                                       "Allure": pace_str(pace_sp)+"/km",
                                        "D+ seg (m)": sp["elev"], "FC": sp["hr"] if sp["hr"] else "—",
                                        "vs moy.": ("+" if diff_sp>0 else "")+pace_str(abs(diff_sp))})
                     df_d = pd.DataFrame(rows_d)
@@ -3412,10 +3444,12 @@ with main_tabs[3]:
 
             cohort_delta = cohort_selected["totalSecs"] - cohort_predicted["totalSecs"]
             cohort_comparison = []
+            _cum_km_comp = 0.0
             for sp, ps in zip(cohort_selected["splits"], cohort_predicted["splits"]):
+                _cum_km_comp += sp["dist"]
                 real_pace = sp["secs"] / sp["dist"]
                 pred_pace = ps["secs"] / ps["dist"]
-                cohort_comparison.append({"km": sp["km"], "dist": sp["dist"], "elev": sp["elev"],
+                cohort_comparison.append({"km": sp["km"], "cum_km": round(_cum_km_comp,1), "dist": sp["dist"], "elev": sp["elev"],
                                           "real_pace": real_pace, "pred_pace": pred_pace, "diff": real_pace - pred_pace,
                                           "gm": ps["gm"], "fm": ps["fm"], "tm": ps["tm"]})
 
@@ -3461,7 +3495,7 @@ with main_tabs[3]:
             st.markdown("#### Détail par segment")
             rows_seg = []
             for c in cohort_comparison:
-                rows_seg.append({"Km": c["km"], "Dist (km)": round(c["dist"],2), "Allure réelle": pace_str(c["real_pace"])+"/km",
+                rows_seg.append({"Segment": c["km"], "Km cumulé": c["cum_km"], "Dist (km)": round(c["dist"],2), "Allure réelle": pace_str(c["real_pace"])+"/km",
                                  "Allure prédite": pace_str(c["pred_pace"])+"/km",
                                  "Écart": ("+" if c["diff"]>0 else "")+pace_str(abs(c["diff"])),
                                  "Mult pente": round(c["gm"],3), "Mult fatigue": round(c["fm"],3), "Mult météo": round(c["tm"],3)})
