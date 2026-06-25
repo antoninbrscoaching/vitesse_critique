@@ -849,8 +849,7 @@ def build_holding_table(vc_ms,d_prime,refs_fit,K_riegel):
         d_m=float(r.get("distance",0));t_s=float(r.get("temps",0))
         if d_m>0 and t_s>0:X.append(math.log(d_m/1000.0));Y.append(math.log(t_s))
     if len(X)>=2:
-        K_fit,loga,_,_,_=sp_stats.linregress(X,Y)
-        K_fit=float(max(0.85,min(1.25,K_fit)));a_fit=math.exp(float(loga))
+        a_fit,K_fit=clamped_loglog_fit(X,Y)
     elif len(X)==1:K_fit=float(K_riegel);a_fit=math.exp(Y[0])/math.exp(X[0])
     else:K_fit=float(K_riegel);a_fit=240.0
     pct_steps=[pct/100.0 for pct in range(80,121,2)];rows=[]
@@ -970,8 +969,7 @@ def predict_performances(vc_ms,d_prime,refs_fit,K_riegel,genre="H"):
         d_m=float(r.get("distance",0));t_s=float(r.get("temps",0))
         if d_m>0 and t_s>0:X.append(math.log(d_m/1000.0));Y.append(math.log(t_s))
     if len(X)>=2:
-        K_fit,loga,_,_,_=sp_stats.linregress(X,Y)
-        K_fit=float(max(0.85,min(1.25,K_fit)));a_fit=math.exp(float(loga))
+        a_fit,K_fit=clamped_loglog_fit(X,Y)
     elif len(X)==1:K_fit=float(K_riegel);a_fit=math.exp(Y[0])/math.exp(X[0])
     else:K_fit=float(K_riegel);a_fit=240.0
     results={}
@@ -997,6 +995,22 @@ def predict_performances(vc_ms,d_prime,refs_fit,K_riegel,genre="H"):
             if ratio<best_ratio:best_ratio=ratio;best_dist=dist_label
     return results,best_dist
 
+# v8.2 PATCH — BUG CRITIQUE corrigé : quand la pente K de la régression
+# log-log est plafonnée à [0.85,1.25], l'ordonnée à l'origine (a) doit être
+# RECALCULÉE pour rester cohérente avec la pente effectivement utilisée.
+# Avant ce patch, "a" restait celui de la régression NON plafonnée — (a,K)
+# ne formait alors plus une paire valide, et predict_flat() pouvait prédire
+# des temps complètement absurdes (ex : 0h51 pour un marathon de référence
+# à 2h41) dès qu'on s'éloignait du centre de gravité des références.
+def clamped_loglog_fit(X, Y):
+    X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
+    if len(X) < 2:
+        return None
+    K_raw, loga_raw = np.polyfit(X, Y, 1)
+    K = float(max(0.85, min(1.25, K_raw)))
+    loga = float(loga_raw) if abs(K - K_raw) < 1e-9 else float(np.mean(Y - K * X))
+    return math.exp(loga), K
+
 def fit_loglog(refs):
     X,Y=[],[]
     for r in refs:
@@ -1005,7 +1019,7 @@ def fit_loglog(refs):
         if d_m<=0 or secs<=0:continue
         X.append(math.log(d_m/1000.0));Y.append(math.log(secs))
     if len(X)>=2:
-        K,loga=np.polyfit(X,Y,1);K=float(max(0.85,min(1.25,K)));a=math.exp(float(loga))
+        a,K=clamped_loglog_fit(X,Y)
         return(a if 0<a<1e7 else 240.0),K
     elif len(X)==1:return math.exp(Y[0])/(math.exp(X[0])),1.0
     return 240.0,1.0
