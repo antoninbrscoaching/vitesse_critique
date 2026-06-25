@@ -2704,8 +2704,22 @@ with main_tabs[0]:
         force_dist=st.checkbox("Forcer la distance",value=False)
         dist_forcee=st.number_input("Distance (km)",value=41.0,format="%.3f") if force_dist else None
     with colf2:
-        force_temps=st.checkbox("Travailler à partir d'un objectif de temps",value=True)
+        # v8.2 — défaut passé à False : cette case FORCE le temps total sur la
+        # valeur saisie (la prédiction ne fait plus que redistribuer ce total
+        # entre les km selon la forme du modèle de pente/fatigue) ; laissée
+        # cochée par défaut, une valeur périmée d'un test précédent écrasait
+        # silencieusement de vraies prédictions (ex : objectif à 10h15 réutilisé
+        # tel quel sur un parcours type UTMB → allure moyenne ~3:30/km affichée
+        # sans aucun message d'alerte).
+        force_temps=st.checkbox("Travailler à partir d'un objectif de temps",value=False,
+                                 help="⚠️ Force le temps total sur la valeur saisie ci-dessous — n'est plus une "
+                                      "prédiction libre à partir de tes références. Pense à décocher (ou à mettre "
+                                      "à jour la valeur) en changeant de course, sous peine d'obtenir un résultat "
+                                      "qui n'a plus de rapport avec le parcours chargé.")
         temps_objectif=hms_input("Temps objectif","3:45:00",key="temps_objectif_target") if force_temps else None
+        if force_temps:
+            st.warning(f"⚠️ Le temps total prédit sera **forcé sur {temps_objectif}** — ce n'est pas un calcul "
+                       f"libre à partir de tes références. Décoche la case ci-dessus pour une vraie prédiction.")
 
     _diff_days_race=(date_course-date.today()).days
     if 0<=_diff_days_race<=15:
@@ -2798,6 +2812,18 @@ with main_tabs[0]:
         c3.metric(f"📏 {_ref_sel} {_delta_low:+d}%",seconds_to_hms(_t_low))
         c4.metric(f"📏 {_ref_sel} {_delta_high:+d}%",seconds_to_hms(_t_high))
         c5.metric("K Riegel",f"{res['K']:.3f}")
+
+        # v8.2 — signale une extrapolation fragile plutôt que de la laisser silencieuse
+        _K_val = res['K']
+        if _K_val >= 1.24 or _K_val <= 0.86:
+            st.warning(f"⚠️ K Riegel collé à une borne ({_K_val:.2f}) — signe que tes références sont trop "
+                       f"hétérogènes (distance/terrain/conditions) ou trop peu nombreuses pour une extrapolation "
+                       f"fiable vers cette distance. Ajoute une référence de distance intermédiaire si possible.")
+        _ref_dists_km = [safe_float(r.get("distance",0))/1000.0 for r in refs_raw if safe_float(r.get("distance",0))>0]
+        if _ref_dists_km and _dist_simulated_km > max(_ref_dists_km)*1.5:
+            st.warning(f"⚠️ La distance cible ({_dist_simulated_km:.0f} km) dépasse largement ta référence la "
+                       f"plus longue ({max(_ref_dists_km):.0f} km) — l'extrapolation du modèle Riegel devient "
+                       f"moins fiable au-delà de ~1,5× la plus longue référence.")
 
         df_out=res["df"]
         if not df_out.empty:
