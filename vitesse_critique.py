@@ -16,6 +16,11 @@
 #     ce % entre tests de durées différentes permet de repérer une signature
 #     de fatigue propre à l'athlète, utilisable comme point de départ pour le
 #     seuil de fatigue en course longue.
+#   - Import direct de profils calibrés (JSON) dans l'onglet Prédiction,
+#     section 4️⃣ : plus besoin de repasser par l'onglet Cohorte pour
+#     appliquer un profil déjà calibré — le fichier profils_calibres.json
+#     (exporté depuis l'onglet Cohorte ou depuis l'artefact de calibration)
+#     se dépose directement ici et les coefficients s'appliquent aussitôt.
 #
 # NOUVEAUTÉS v8.1 (calibration empirique) :
 #   - Courbe de pente en montée recalibrée par profil sur 1245 segments coureurs
@@ -1861,8 +1866,9 @@ TERRAIN_PROFILES = {
 def get_all_terrain_profiles():
     """Fusionne les 4 profils génériques v8.1 avec les profils calibrés par
     course (sauvegardés depuis l'onglet 👥 Analyse de cohorte, en session ou
-    importés via JSON). Les profils calibrés ont la priorité en cas de clé
-    identique (ne devrait pas arriver en pratique, noms distincts)."""
+    importés via JSON — soit depuis là, soit directement depuis l'onglet
+    Prédiction section 4️⃣). Les profils calibrés ont la priorité en cas de
+    clé identique (ne devrait pas arriver en pratique, noms distincts)."""
     merged = dict(TERRAIN_PROFILES)
     merged.update(st.session_state.get("custom_terrain_profiles", {}))
     return merged
@@ -2239,7 +2245,7 @@ main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","�
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v8 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Fatigue avancée · Prédiction FC")
+    st.caption("v8.2 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Fatigue avancée · Prédiction FC · Import JSON direct")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -2558,6 +2564,44 @@ with main_tabs[0]:
     with st.expander("🎢 Modèle de pente & Terrain",expanded=True):
         apply_grade=st.checkbox("Prendre en compte la pente",value=True)
         use_minetti=st.checkbox("Modèle Minetti",value=True)
+
+        # ── v8.2 : import direct d'un fichier de profils calibrés (JSON) ────────
+        # Auparavant, un profil calibré (onglet 👥 Analyse de cohorte) ne pouvait
+        # être appliqué ici qu'en repassant par cet autre onglet. Ce bloc permet
+        # de déposer directement profils_calibres.json (ou le fichier exporté par
+        # l'artefact de calibration externe) et applique aussitôt les coefficients
+        # — DOIT rester avant l'instanciation du widget terrain_profil_radio
+        # ci-dessous, sinon Streamlit lève une StreamlitAPIException.
+        st.markdown("##### 📥 Importer un profil calibré (JSON)")
+        st.caption("Fichier exporté depuis l'onglet 👥 Analyse de cohorte, ou depuis l'artefact de calibration "
+                   "externe. Les coefficients (k_up, plafond de pente, seuil/taux de fatigue…) s'appliquent "
+                   "automatiquement dès le dépôt — plus besoin de repasser par l'onglet Cohorte.")
+        _pred_import_file = st.file_uploader(
+            "Déposer un fichier .json", type=["json"], key="pred_import_profiles_file")
+        if _pred_import_file and st.session_state.get("_last_pred_imported_profile_file") != _pred_import_file.name:
+            st.session_state["_last_pred_imported_profile_file"] = _pred_import_file.name
+            try:
+                _imported_raw = _json.loads(_pred_import_file.read().decode("utf-8"))
+                if not isinstance(_imported_raw, dict) or not _imported_raw:
+                    raise ValueError("le fichier ne contient aucun profil exploitable.")
+                _REQUIRED_KEYS = {"k_up", "max_cap"}
+                _valid_imported = {name: params for name, params in _imported_raw.items()
+                                    if isinstance(params, dict) and _REQUIRED_KEYS.issubset(params.keys())}
+                if not _valid_imported:
+                    raise ValueError("aucun profil valide trouvé (clés k_up/max_cap manquantes).")
+                if "custom_terrain_profiles" not in st.session_state:
+                    st.session_state["custom_terrain_profiles"] = {}
+                st.session_state["custom_terrain_profiles"].update(_valid_imported)
+                # Sélectionne automatiquement le profil importé (le premier si
+                # plusieurs) AVANT l'instanciation du radio ci-dessous, pour que
+                # les coefficients s'auto-appliquent sans clic supplémentaire.
+                st.session_state["terrain_profil_radio"] = next(iter(_valid_imported))
+                st.session_state["_prev_terrain_profil"] = ""  # force la resynchro des sliders tp_*
+                _names = ", ".join(_valid_imported.keys())
+                st.success(f"✅ {len(_valid_imported)} profil(s) importé(s) et appliqué(s) : {_names}")
+            except Exception as e:
+                st.error(f"❌ Fichier JSON invalide — {e}")
+
         st.markdown("##### 🗺️ Profil du parcours")
         _all_terrain_profiles = get_all_terrain_profiles()
         terrain_profil=st.radio("Type de terrain",list(_all_terrain_profiles.keys()),horizontal=True,key="terrain_profil_radio")
@@ -2576,7 +2620,10 @@ with main_tabs[0]:
         if terrain_profil in _profil_info:
             st.info(_profil_info[terrain_profil])
         else:
-            st.info(f"📌 Profil calibré depuis l'onglet 👥 Analyse de cohorte (k_up={_d.get('k_up')}, plafond={_d.get('max_cap',0)*100:.0f}%, seuil fatigue={_d.get('fatigue_threshold','—')}%) — paramètres non calibrés repris du profil « Trail modéré ».")
+            st.info(f"📌 Profil calibré (importé ou depuis l'onglet 👥 Analyse de cohorte) : k_up={_d.get('k_up')} · "
+                    f"plafond={_d.get('max_cap',0)*100:.0f}% · seuil fatigue={_d.get('fatigue_threshold','—')}% · "
+                    f"taux fatigue={_d.get('fatigue_rate','—')}% — paramètres non calibrés (k_down, minetti_weight, "
+                    f"lissage…) repris des valeurs standard « Trail modéré ».")
 
         tech_global_ui=st.session_state.get("tech_global",{})
         if IS_TRAIL and tech_global_ui.get("global_score",0)>0 and terrain_profil=="🏔️ Trail modéré":
@@ -3958,7 +4005,8 @@ with main_tabs[3]:
                         data=_json.dumps(_custom_profiles, ensure_ascii=False, indent=2).encode("utf-8"),
                         file_name="profils_calibres.json", key="cohort_export_profiles")
                     st.caption("⚠️ Ces profils sont en mémoire de session uniquement — exporte-les en JSON pour "
-                               "les retrouver lors d'une prochaine session (à réimporter ci-dessous).")
+                               "les retrouver lors d'une prochaine session (à réimporter ci-dessous, ou directement "
+                               "dans l'onglet 🏃 Prédiction, section 4️⃣).")
 
                 cohort_import_file = st.file_uploader("⬆️ Importer des profils calibrés (JSON)", type=["json"], key="cohort_import_profiles")
                 if cohort_import_file and st.session_state.get("_last_imported_profile_file") != cohort_import_file.name:
