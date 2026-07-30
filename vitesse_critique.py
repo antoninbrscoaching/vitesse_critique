@@ -1,5 +1,14 @@
 # analyse_course_v8.py
 # Application Streamlit unifiée — 3 onglets
+# NOUVEAUTÉS v8.4 :
+#   - Signature de fatigue personnelle (seuil/taux) désormais calculée
+#     AUTOMATIQUEMENT depuis tes propres courses de référence (section 2️⃣
+#     de l'onglet Prédiction, FIT/TCX importés) — plus besoin de passer par
+#     l'onglet 🧪 Tests d'endurance + VC ni de cliquer sur un bouton
+#     séparé. La détection tourne dans le même passage de script que le
+#     reste de la section 4️⃣, donc pas de décalage d'un run à l'autre.
+#     L'onglet Vitesse Critique reste dédié à l'analyse des tests
+#     d'effort/entraînement, sans lien avec la prédiction de course.
 # NOUVEAUTÉS v8.2 :
 #   - Modèle de marche en forte pente (VAM) : au-delà d'un seuil de pente
 #     (défaut 25%, réglable), le temps est gouverné par la VAM (Vitesse
@@ -2278,7 +2287,7 @@ main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","�
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v8.2 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Fatigue avancée · Prédiction FC · Import JSON direct")
+    st.caption("v8.4 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Fatigue avancée · Prédiction FC · Import JSON direct · K Riegel relevé · Fatigue perso auto")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -2430,6 +2439,7 @@ with main_tabs[0]:
             dur_hms_file=avg_temp_ref=avg_wind_ref=avg_hum_ref=hr_ref=None
             fname=file_in.name.lower() if file_in else ""
             fit_data=tcx_data=None
+            ref_breakpoint=None
             if file_in:
                 if fname.endswith(".fit"):
                     fit_data=parse_fit_ref(file_in)
@@ -2448,12 +2458,14 @@ with main_tabs[0]:
                 sh=hms_input("Début segment","0:00:00",key=f"start_{i}",compact=True)
                 eh=hms_input("Fin segment","23:59:59",key=f"end_{i}",compact=True)
                 start_td,end_td=hms_to_timedelta(sh),hms_to_timedelta(eh)
+                pts_src=None
+                if fit_data and "points" in fit_data:pts_src=fit_data["points"]
+                elif tcx_data and "points" in tcx_data:pts_src=tcx_data["points"]
+                _pts_for_breakpoint=pts_src
                 if start_td.total_seconds()>0 or end_td.total_seconds()<86399:
-                    pts_src=None
-                    if fit_data and "points" in fit_data:pts_src=fit_data["points"]
-                    elif tcx_data and "points" in tcx_data:pts_src=tcx_data["points"]
                     if pts_src:
                         seg=extract_segment(pts_src,start_td,end_td)
+                        _pts_for_breakpoint=seg
                         seg_dist=0.0;seg_elevs=[];seg_times=[]
                         for j in range(1,len(seg)):
                             p1,p2=seg[j-1],seg[j]
@@ -2466,6 +2478,20 @@ with main_tabs[0]:
                         dup,ddn=compute_dplus_dminus(seg_elevs)
                         if len(seg_times)>=2:dur_hms_file=seconds_to_hms((seg_times[-1]-seg_times[0]).total_seconds())
                         dist=round(seg_dist)
+                # v8.4 — détection automatique du point de rupture d'allure sur CETTE
+                # référence (surtout utile pour les références longues/ultra type Saint-
+                # Jacques) : donne un signal de fatigue personnel directement depuis tes
+                # courses réelles, sans dépendre de l'onglet 🧪 Tests d'endurance + VC —
+                # cet onglet reste dédié à l'analyse des tests d'effort/entraînement,
+                # indépendant de la prédiction de course.
+                if _pts_for_breakpoint:
+                    _t_bp,_pace_bp=compute_pace_series_from_points(_pts_for_breakpoint)
+                    if _t_bp is not None and len(_t_bp)>=10:
+                        ref_breakpoint=detect_pace_breakpoint(_t_bp,_pace_bp)
+                        if ref_breakpoint and ref_breakpoint.get("r2",0)>=0.3:
+                            st.caption(f"🔍 Rupture d'allure détectée à {ref_breakpoint['pct_break']:.0f}% de cette "
+                                       f"course (dégradation {ref_breakpoint['drop_pct']:+.0f}%) — utilisée pour la "
+                                       f"signature de fatigue personnelle ci-dessous (section 4️⃣).")
             else:
                 if EXPERT:
                     cs2,ce2=st.columns(2)
@@ -2486,7 +2512,23 @@ with main_tabs[0]:
             refs_raw.append({"distance":float(dist),"temps":str(temps_eff),
                               "D_up":float(dup),"D_down":float(ddn),"duration_hms_file":dur_hms_file,
                               "avg_temp":avg_temp_ref,"avg_humidity":avg_hum_ref,"avg_wind":avg_wind_ref,
-                              "hr_analysis":hr_ref,"hr_avg":hr_avg_ref,"hr_max":hr_max_ref})
+                              "hr_analysis":hr_ref,"hr_avg":hr_avg_ref,"hr_max":hr_max_ref,
+                              "breakpoint":ref_breakpoint})
+
+    # v8.4 — signature de fatigue personnelle, calculée automatiquement à partir des
+    # ruptures d'allure détectées ci-dessus sur tes propres références (aucune action
+    # séparée requise, aucune dépendance à l'onglet 🧪 Tests d'endurance + VC).
+    _bp_valid=[r["breakpoint"] for r in refs_raw if r.get("breakpoint") and r["breakpoint"].get("r2",0)>=0.3]
+    auto_fatigue_threshold=auto_fatigue_rate=None
+    auto_fatigue_n=len(_bp_valid); auto_fatigue_std=None
+    if _bp_valid:
+        _pcts=[b["pct_break"] for b in _bp_valid]; _drops=[abs(b["drop_pct"]) for b in _bp_valid]
+        auto_fatigue_threshold=round(float(np.mean(_pcts))); auto_fatigue_rate=round(float(np.mean(_drops)))
+        auto_fatigue_std=float(np.std(_pcts)) if len(_pcts)>=2 else None
+    st.session_state["auto_fatigue_threshold"]=auto_fatigue_threshold
+    st.session_state["auto_fatigue_rate"]=auto_fatigue_rate
+    st.session_state["auto_fatigue_n"]=auto_fatigue_n
+    st.session_state["auto_fatigue_std"]=auto_fatigue_std
 
     st.markdown("---")
     st.header("3️⃣  Recalibration des références vers les conditions idéales")
@@ -2635,22 +2677,29 @@ with main_tabs[0]:
             except Exception as e:
                 st.error(f"❌ Fichier JSON invalide — {e}")
 
-        _has_personal_fatigue = st.session_state.get("personal_fatigue_threshold") is not None
+        # v8.4 — signature de fatigue personnelle calculée automatiquement à partir de
+        # tes propres courses de référence (section 2️⃣ ci-dessus, ruptures d'allure
+        # détectées sur les FIT/TCX importés) — aucune action séparée, aucune dépendance
+        # à l'onglet 🧪 Tests d'endurance + VC (qui reste dédié à l'entraînement).
+        _auto_fat_thr = st.session_state.get("auto_fatigue_threshold")
+        _auto_fat_rate = st.session_state.get("auto_fatigue_rate")
+        _auto_fat_n = st.session_state.get("auto_fatigue_n", 0)
+        _auto_fat_std = st.session_state.get("auto_fatigue_std")
+        _has_personal_fatigue = _auto_fat_thr is not None
         _use_personal_fatigue = False
         if _has_personal_fatigue:
-            _pf_thr = st.session_state["personal_fatigue_threshold"]
-            _pf_rate = st.session_state.get("personal_fatigue_rate", 18)
+            _consistency = f" (cohérence ±{_auto_fat_std:.0f} pts sur {_auto_fat_n} courses)" if _auto_fat_std is not None else f" (1 course)"
             _use_personal_fatigue = st.checkbox(
-                f"🔒 Garder mon seuil/taux de fatigue personnel (seuil {_pf_thr}% · taux {_pf_rate}%) — "
-                f"ne pas l'écraser par le profil de terrain sélectionné ci-dessous",
+                f"🔒 Utiliser ma fatigue détectée automatiquement (seuil {_auto_fat_thr}% · taux {_auto_fat_rate}%){_consistency} "
+                f"— au lieu du seuil/taux du profil de terrain ci-dessous",
                 value=st.session_state.get("personal_fatigue_locked", True), key="use_personal_fatigue_chk")
             st.session_state["personal_fatigue_locked"] = _use_personal_fatigue
             st.caption(
-                "k_up et le plafond de pente restent ceux du profil sélectionné/importé (spécifiques au terrain) — "
-                "seuls le seuil et le taux de fatigue viennent de ta propre signature détectée dans l'onglet "
-                "🧪 Tests d'endurance + VC, section 4️⃣. Idée : la fatigue en % de course transfère raisonnablement "
-                "bien d'une distance à l'autre, contrairement au coefficient de pente qui, lui, dépend du terrain "
-                "précis de CETTE course.")
+                "Détecté à partir de la rupture d'allure sur tes courses de référence importées en FIT/TCX "
+                "(section 2️⃣) — pas depuis l'onglet Vitesse Critique. k_up et le plafond de pente restent ceux du "
+                "profil sélectionné/importé (spécifiques au terrain de CETTE course) ; seuls le seuil et le taux de "
+                "fatigue viennent de toi. Le transfert en % d'une course à l'autre est une approximation "
+                "raisonnable, pas une certitude physiologique.")
 
         st.markdown("##### 🗺️ Profil du parcours")
         _all_terrain_profiles = get_all_terrain_profiles()
@@ -2666,8 +2715,8 @@ with main_tabs[0]:
                     continue  # préserve la signature personnelle plutôt que celle du profil terrain
                 st.session_state[f"tp_{k}"]=v
             if _use_personal_fatigue:
-                st.session_state["tp_fatigue_threshold"] = st.session_state["personal_fatigue_threshold"]
-                st.session_state["tp_fatigue_rate"] = st.session_state.get("personal_fatigue_rate", 18)
+                st.session_state["tp_fatigue_threshold"] = _auto_fat_thr
+                st.session_state["tp_fatigue_rate"] = _auto_fat_rate
         _d=_all_terrain_profiles[terrain_profil]
         _profil_info={
             "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=4 (v8 — moins réactif au bruit GPS), lissage altitude ×25pts. Allure stable sur plat.",
@@ -3497,20 +3546,10 @@ with main_tabs[1]:
                         f"(±{_std_pct:.0f} pts) · dégradation moyenne {_avg_drop:+.1f}%**")
             if _std_pct < 15:
                 st.success(f"📍 Cohérent entre tests de durées différentes — signe d'une vraie signature "
-                           f"physiologique plutôt qu'un artefact d'un seul test.")
-                st.caption(
-                    "Un seuil de fatigue en % de course reste un point de départ raisonnable même en changeant de "
-                    "distance/discipline (marathon → ultra) : ce n'est pas prouvé physiologiquement de façon "
-                    "rigoureuse, mais c'est une meilleure estimation que la valeur générique du profil terrain "
-                    "quand tu n'as pas encore de course longue à toi pour calibrer ce paramètre directement.")
-                if st.button(f"🔒 Utiliser {_avg_pct:.0f}% / {_avg_drop:+.0f}% comme seuil/taux de fatigue personnel",
-                             key="lock_personal_fatigue_btn"):
-                    st.session_state["personal_fatigue_threshold"] = round(_avg_pct)
-                    st.session_state["personal_fatigue_rate"] = round(abs(_avg_drop))
-                    st.session_state["personal_fatigue_locked"] = True
-                    st.success("✅ Enregistré — dans l'onglet 🏃 Prédiction, section 4️⃣, une case à cocher te "
-                               "permet maintenant de garder ce réglage même en important un profil de cohorte "
-                               "(qui n'apportera plus que k_up/plafond de pente, pas la fatigue).")
+                           f"physiologique plutôt qu'un artefact d'un seul test. Tu pourrais tester "
+                           f"`fatigue_threshold ≈ {_avg_pct:.0f}` dans l'onglet 🏃 Prédiction comme point de départ "
+                           f"pour cet athlète (à confirmer/affiner avec les courses réelles dans l'onglet "
+                           f"👥 Analyse de cohorte).")
             else:
                 st.warning(f"⚠️ Le point de rupture varie pas mal selon la durée du test (±{_std_pct:.0f} pts) — "
                            f"peut-être pas une signature fixe en %, ou tests pas tous menés au même niveau "
