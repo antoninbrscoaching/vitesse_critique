@@ -2581,9 +2581,10 @@ with main_tabs[0]:
     # en particulier au transfert marathon → ultra-trail : le "mur" du marathon (déplétion
     # glycogénique ~30-35km) et la fatigue d'un ultra de plusieurs heures ne sont pas le
     # même phénomène physiologique, même quand la rupture est nette dans les données.
-    _bp_valid=[r["breakpoint"] for r in refs_raw if r.get("breakpoint") and r["breakpoint"].get("r2",0)>=0.3]
+    _bp_attempted=[r["breakpoint"] for r in refs_raw if r.get("breakpoint")]
+    _bp_valid=[b for b in _bp_attempted if b.get("r2",0)>=0.3]
     auto_fatigue_threshold=auto_fatigue_rate=auto_fatigue_r2max=None
-    auto_fatigue_n=len(_bp_valid); auto_fatigue_std=None
+    auto_fatigue_n=len(_bp_valid); auto_fatigue_total=len(_bp_attempted); auto_fatigue_std=None
     if _bp_valid:
         _pcts=[b["pct_break"] for b in _bp_valid]; _drops=[abs(b["drop_pct"]) for b in _bp_valid]
         auto_fatigue_threshold=round(float(np.mean(_pcts))); auto_fatigue_rate=round(float(np.mean(_drops)))
@@ -2592,8 +2593,10 @@ with main_tabs[0]:
     st.session_state["auto_fatigue_threshold"]=auto_fatigue_threshold
     st.session_state["auto_fatigue_rate"]=auto_fatigue_rate
     st.session_state["auto_fatigue_n"]=auto_fatigue_n
+    st.session_state["auto_fatigue_total"]=auto_fatigue_total
     st.session_state["auto_fatigue_std"]=auto_fatigue_std
     st.session_state["auto_fatigue_r2max"]=auto_fatigue_r2max
+
 
     st.markdown("---")
     st.header("3️⃣  Recalibration des références vers les conditions idéales")
@@ -2895,19 +2898,22 @@ with main_tabs[0]:
             # sur tes propres références (section 2️⃣). Une référence courte/route (marathon)
             # n'a pas le même mécanisme physiologique qu'un ultra, mais reste informative sur
             # ta façon de gérer un effort soutenu — à utiliser en connaissance de cause.
-            st.markdown("##### Phase 2 — ta fatigue personnelle (optionnelle, s'ajoute à la phase 1)")
+            st.markdown("##### Phase 2 — ta fatigue personnelle (s'ajoute à la phase 1)")
             _auto_fat_thr = st.session_state.get("auto_fatigue_threshold")
             _auto_fat_rate = st.session_state.get("auto_fatigue_rate")
             _auto_fat_n = st.session_state.get("auto_fatigue_n", 0)
+            _auto_fat_total = st.session_state.get("auto_fatigue_total", 0)
             _auto_fat_std = st.session_state.get("auto_fatigue_std")
             _auto_fat_r2max = st.session_state.get("auto_fatigue_r2max")
             if _auto_fat_thr is not None:
-                _consistency = f" · cohérence ±{_auto_fat_std:.0f} pts sur {_auto_fat_n} courses" if _auto_fat_std is not None else " · 1 course"
+                _consistency = f" · cohérence ±{_auto_fat_std:.0f} pts" if _auto_fat_std is not None else ""
                 _r2_txt = f" · R²={_auto_fat_r2max:.2f}" if _auto_fat_r2max is not None else ""
+                st.caption(f"{_auto_fat_n}/{_auto_fat_total} référence(s) exploitable(s) (R²≥0.3) parmi celles "
+                           f"importées en section 2️⃣ — moyenne utilisée si plusieurs.")
                 dual_fatigue = st.checkbox(
                     f"🔒 Ajouter ma fatigue personnelle détectée (rupture à {_auto_fat_thr}% · dégradation "
                     f"{_auto_fat_rate}%{_consistency}{_r2_txt})",
-                    value=st.session_state.get("dual_fatigue_locked", False), key="dual_fatigue_chk")
+                    value=st.session_state.get("dual_fatigue_locked", True), key="dual_fatigue_chk")
                 st.session_state["dual_fatigue_locked"] = dual_fatigue
                 if dual_fatigue:
                     c_p2a,c_p2b = st.columns(2)
