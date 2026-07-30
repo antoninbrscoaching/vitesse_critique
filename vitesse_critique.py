@@ -1,5 +1,14 @@
 # analyse_course_v8.py
 # Application Streamlit unifiée — 3 onglets
+# NOUVEAUTÉS v8.5 :
+#   - Modèle de fatigue à DEUX phases empilées (fatigue_multiplier_dual) :
+#     Phase 1 (parcours) reste pilotée par le profil terrain / JSON de
+#     cohorte comme avant. Phase 2 (optionnelle, décochée par défaut)
+#     AJOUTE une fatigue personnelle plus tardive, détectée sur tes
+#     propres références (section 2️⃣), par-dessus la phase 1 — au lieu
+#     de la remplacer comme le faisait la v8.4. Le R² du point de rupture
+#     est affiché à côté du réglage pour juger de sa fiabilité.
+#
 # NOUVEAUTÉS v8.4 :
 #   - Signature de fatigue personnelle (seuil/taux) désormais calculée
 #     AUTOMATIQUEMENT depuis tes propres courses de référence (section 2️⃣
@@ -356,6 +365,47 @@ def fatigue_multiplier(d_plus_cum,dist_cum,d_plus_total,dist_total,rate_pct,mode
     k=2.0;factor=(math.exp(k*prog)-1.0)/(math.exp(k)-1.0)
     return 1.0+rate*factor
 
+
+def fatigue_multiplier_dual(d_plus_cum, dist_cum, d_plus_total, dist_total,
+                             threshold1_pct, rate1_pct, threshold2_pct, rate2_pct, mode):
+    """
+    Modèle de fatigue à DEUX phases, empilées :
+    - Phase 1 (0 → seuil1) : montée en régime + dynamique propre à CE parcours — calibrée
+      sur des coureurs réels de cette course (seuil1/taux1 = fatigue_threshold/fatigue_rate
+      du profil terrain, typiquement issus d'un JSON de cohorte).
+    - Phase 2 (seuil1 → seuil2) : rythme de croisière, convergence douce vers rate1 (reprend
+      la forme du modèle à une phase de fatigue_multiplier_advanced).
+    - Phase 3 (seuil2 → 100%) : fatigue personnelle profonde, calibrée sur TES propres
+      références longues (seuil2/taux2 = rupture d'allure détectée), qui s'AJOUTE par-dessus
+      rate1 plutôt que de le remplacer.
+    Si seuil2 <= seuil1, seuil2 est repoussé à seuil1+2% pour éviter une phase 2 dégénérée.
+    Si rate2=0 (aucune donnée personnelle), se réduit exactement au modèle à une phase.
+    """
+    if rate1_pct <= 0 and rate2_pct <= 0:
+        return 1.0
+    dist_total = max(1e-6, float(dist_total)); d_plus_total = max(1e-6, float(d_plus_total))
+    thr1 = max(0.01, min(0.97, float(threshold1_pct) / 100.0))
+    thr2 = max(thr1 + 0.02, min(0.99, float(threshold2_pct) / 100.0))
+    rate1 = max(0.0, float(rate1_pct)) / 100.0
+    rate2 = max(0.0, float(rate2_pct)) / 100.0
+    prog_dist = min(1.0, dist_cum / dist_total)
+    prog_dplus = min(1.0, d_plus_cum / max(1.0, d_plus_total))
+    dplus_ratio = d_plus_total / dist_total
+    w_dplus = min(0.8, dplus_ratio * 10.0)
+    if mode == "distance": prog = prog_dist
+    elif mode == "d_plus": prog = prog_dplus
+    else: prog = w_dplus * prog_dplus + (1.0 - w_dplus) * prog_dist
+    pre1 = rate1 * 0.10
+    k = 2.5
+    if prog <= thr1:
+        factor = pre1 * (prog / thr1)
+    elif prog <= thr2:
+        p = (prog - thr1) / (thr2 - thr1)
+        factor = pre1 + (rate1 - pre1) * (math.exp(k * p) - 1.0) / (math.exp(k) - 1.0)
+    else:
+        p = (prog - thr2) / (1.0 - thr2)
+        factor = rate1 + rate2 * (math.exp(k * p) - 1.0) / (math.exp(k) - 1.0)
+    return 1.0 + min(factor, (rate1 + rate2) * 1.05)
 
 def fatigue_multiplier_advanced(d_plus_cum, dist_cum, d_plus_total, dist_total,
                                  threshold_pct, decay_rate_pct, mode):
@@ -1140,6 +1190,7 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     drag_coeff,tail_credit,wind_cap_head,wind_cap_tail,wind_power,
     wind_gate_g1,wind_gate_g2,wind_gate_min,base_cap,extra_per_pct,max_cap,
     apply_fatigue,fatigue_rate,fatigue_mode,fatigue_threshold=60.0,
+    dual_fatigue=False,fatigue_threshold2=None,fatigue_rate2=None,
     apply_ultra=False,ultra_amp=0.0,
     objective_hms=None,show_smooth_pace=True,smooth_window_km=3,dem_elevations=None,
     surface_mult=1.0,tz_name=TZ_NAME_DEFAULT,
@@ -1284,9 +1335,15 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
             t1=t_flat*(gm**grade_power)
         else:gm=1.0;t1=t_flat
         t2=t1*alt_mult
-        fm=(fatigue_multiplier_advanced(cum_dp,cum_dist,d_plus_total,total_corr,
-                                         fatigue_threshold,fatigue_rate,fatigue_mode)
-            if apply_fatigue and fatigue_rate>0 else 1.0)
+        if apply_fatigue and dual_fatigue and fatigue_rate2 and fatigue_rate2>0:
+            fm=fatigue_multiplier_dual(cum_dp,cum_dist,d_plus_total,total_corr,
+                                        fatigue_threshold,fatigue_rate,
+                                        fatigue_threshold2,fatigue_rate2,fatigue_mode)
+        elif apply_fatigue and fatigue_rate>0:
+            fm=fatigue_multiplier_advanced(cum_dp,cum_dist,d_plus_total,total_corr,
+                                            fatigue_threshold,fatigue_rate,fatigue_mode)
+        else:
+            fm=1.0
         t3=t2*fm
         passage_dt=dt_dep+timedelta(seconds=cum_t+t3/2.0)
         lat_s=float(np.interp(d,dists_corr,lats_arr));lon_s=float(np.interp(d,dists_corr,lons_arr))
@@ -2287,7 +2344,7 @@ main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","�
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v8.4 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Fatigue avancée · Prédiction FC · Import JSON direct · K Riegel relevé · Fatigue perso auto")
+    st.caption("v8.5 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Prédiction FC · Import JSON direct · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -2685,55 +2742,15 @@ with main_tabs[0]:
             except Exception as e:
                 st.error(f"❌ Fichier JSON invalide — {e}")
 
-        # v8.4 — signature de fatigue personnelle calculée automatiquement à partir de
-        # tes propres courses de référence (section 2️⃣ ci-dessus, ruptures d'allure
-        # détectées sur les FIT/TCX importés) — aucune action séparée, aucune dépendance
-        # à l'onglet 🧪 Tests d'endurance + VC (qui reste dédié à l'entraînement).
-        _auto_fat_thr = st.session_state.get("auto_fatigue_threshold")
-        _auto_fat_rate = st.session_state.get("auto_fatigue_rate")
-        _auto_fat_n = st.session_state.get("auto_fatigue_n", 0)
-        _auto_fat_std = st.session_state.get("auto_fatigue_std")
-        _auto_fat_r2max = st.session_state.get("auto_fatigue_r2max")
-        _has_personal_fatigue = _auto_fat_thr is not None
-        _use_personal_fatigue = False
-        if _has_personal_fatigue:
-            _consistency = f" · cohérence ±{_auto_fat_std:.0f} pts sur {_auto_fat_n} courses" if _auto_fat_std is not None else " · 1 course"
-            _r2_txt = f" · R²={_auto_fat_r2max:.2f}" if _auto_fat_r2max is not None else ""
-            _weak = _auto_fat_r2max is not None and _auto_fat_r2max < 0.6
-            _use_personal_fatigue = st.checkbox(
-                f"🔒 Utiliser ma fatigue détectée automatiquement (seuil {_auto_fat_thr}% · taux {_auto_fat_rate}%"
-                f"{_consistency}{_r2_txt}) — au lieu du seuil/taux du profil de terrain ci-dessous",
-                value=st.session_state.get("personal_fatigue_locked", False), key="use_personal_fatigue_chk")
-            st.session_state["personal_fatigue_locked"] = _use_personal_fatigue
-            if _weak:
-                st.warning(
-                    f"⚠️ R²={_auto_fat_r2max:.2f} — signal faible (la rupture détectée n'explique qu'une fraction de "
-                    f"la variation d'allure). Décoché par défaut pour cette raison. Si cette signature vient d'une "
-                    f"référence courte/route (marathon, semi...), garde à l'esprit que le \"mur\" du marathon "
-                    f"(déplétion glycogénique ~30-35km) et la fatigue d'un ultra-trail de plusieurs heures ne sont "
-                    f"pas le même phénomène physiologique — le transfert en % reste une approximation fragile.")
-            st.caption(
-                "Détecté à partir de la rupture d'allure sur tes courses de référence importées en FIT/TCX "
-                "(section 2️⃣) — pas depuis l'onglet Vitesse Critique. k_up et le plafond de pente restent ceux du "
-                "profil sélectionné/importé (spécifiques au terrain de CETTE course) ; seuls le seuil et le taux de "
-                "fatigue viennent de toi si tu coches cette case.")
-
         st.markdown("##### 🗺️ Profil du parcours")
         _all_terrain_profiles = get_all_terrain_profiles()
         terrain_profil=st.radio("Type de terrain",list(_all_terrain_profiles.keys()),horizontal=True,key="terrain_profil_radio")
         _prev=st.session_state.get("_prev_terrain_profil","")
-        _prev_lock=st.session_state.get("_prev_personal_fatigue_lock")
-        if terrain_profil!=_prev or _use_personal_fatigue!=_prev_lock:
+        if terrain_profil!=_prev:
             st.session_state["_prev_terrain_profil"]=terrain_profil
-            st.session_state["_prev_personal_fatigue_lock"]=_use_personal_fatigue
             _d=_all_terrain_profiles[terrain_profil]
             for k,v in _d.items():
-                if _use_personal_fatigue and k in ("fatigue_threshold", "fatigue_rate"):
-                    continue  # préserve la signature personnelle plutôt que celle du profil terrain
                 st.session_state[f"tp_{k}"]=v
-            if _use_personal_fatigue:
-                st.session_state["tp_fatigue_threshold"] = _auto_fat_thr
-                st.session_state["tp_fatigue_rate"] = _auto_fat_rate
         _d=_all_terrain_profiles[terrain_profil]
         _profil_info={
             "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=4 (v8 — moins réactif au bruit GPS), lissage altitude ×25pts. Allure stable sur plat.",
@@ -2746,11 +2763,11 @@ with main_tabs[0]:
         else:
             _eff_fat_thr = st.session_state.get("tp_fatigue_threshold", _d.get("fatigue_threshold","—"))
             _eff_fat_rate = st.session_state.get("tp_fatigue_rate", _d.get("fatigue_rate","—"))
-            _fat_src = " (ta signature personnelle 🔒)" if _use_personal_fatigue else " (valeur du profil)"
             st.info(f"📌 Profil calibré (importé ou depuis l'onglet 👥 Analyse de cohorte) : k_up={_d.get('k_up')} · "
-                    f"plafond={_d.get('max_cap',0)*100:.0f}% · seuil fatigue={_eff_fat_thr}%{_fat_src} · "
-                    f"taux fatigue={_eff_fat_rate}%{_fat_src} — paramètres non calibrés (k_down, minetti_weight, "
-                    f"lissage…) repris des valeurs standard « Trail modéré ».")
+                    f"plafond={_d.get('max_cap',0)*100:.0f}% · seuil fatigue phase 1={_eff_fat_thr}% · "
+                    f"taux fatigue phase 1={_eff_fat_rate}% — paramètres non calibrés (k_down, minetti_weight, "
+                    f"lissage…) repris des valeurs standard « Trail modéré ». La phase 2 (fatigue personnelle) se "
+                    f"règle plus bas, dans l'expander 🔋 Fatigue en course.")
 
         tech_global_ui=st.session_state.get("tech_global",{})
         if IS_TRAIL and tech_global_ui.get("global_score",0)>0 and terrain_profil=="🏔️ Trail modéré":
@@ -2844,10 +2861,12 @@ with main_tabs[0]:
             wind_cap_head=st.slider("Pénalité max vent face (%)",0.00,0.25,wind_cap_head,0.01)
             wind_cap_tail=st.slider("Gain max vent dos (%)",-0.12,0.00,wind_cap_tail,0.01)
 
-    with st.expander("🔋 Fatigue en course — modèle avec seuil de dégradation"):
+    with st.expander("🔋 Fatigue en course — modèle à seuil(s) de dégradation"):
         apply_fatigue=st.checkbox("Activer la fatigue",value=True)
         fatigue_threshold=60.0;fatigue_rate=0.0;fatigue_mode="mixte"
+        dual_fatigue=False; fatigue_threshold2=None; fatigue_rate2=None
         if apply_fatigue:
+            st.markdown("##### Phase 1 — parcours (issue du profil de terrain / JSON de cohorte)")
             # v8.1 — seuil/taux par défaut dépendants du profil terrain (calibrés sur
             # 1245 segments coureurs réels) : dégradation continue dès le début pour
             # les profils roulant/montagneux, plateau-puis-chute à 60% conservé pour
@@ -2865,7 +2884,55 @@ with main_tabs[0]:
             fatigue_mode=st.selectbox("Type de fatigue",["mixte (recommandé)","distance (plat)","d_plus (montagne)"]).split()[0]
             if fatigue_rate>0:
                 _tot_km_hint = f"~{fatigue_threshold/100*tot_tmp/1000:.1f} km" if (gpx_file and points) else "distance GPX non chargée"
-                st.caption(f"📊 Modèle : stable jusqu'à **{fatigue_threshold}%** de la course ({_tot_km_hint}), puis dégradation exponentielle jusqu'à **+{fatigue_rate:.0f}%** à l'arrivée.")
+                st.caption(f"📊 Phase 1 : stable jusqu'à **{fatigue_threshold}%** de la course ({_tot_km_hint}), puis "
+                           f"dégradation exponentielle jusqu'à **+{fatigue_rate:.0f}%**.")
+
+            # v8.5 — Phase 2 : fatigue personnelle, EN PLUS de la phase 1 (pas à sa place).
+            # Idée : la phase 1 (souvent un seuil bas, ~5-10%) reflète la dynamique propre
+            # à CE parcours calibrée sur des coureurs réels (JSON de cohorte) — stabilisation
+            # post-départ + effort cumulé du terrain. La phase 2 vient se superposer plus
+            # loin dans la course pour représenter TA fatigue profonde personnelle, détectée
+            # sur tes propres références (section 2️⃣). Une référence courte/route (marathon)
+            # n'a pas le même mécanisme physiologique qu'un ultra, mais reste informative sur
+            # ta façon de gérer un effort soutenu — à utiliser en connaissance de cause.
+            st.markdown("##### Phase 2 — ta fatigue personnelle (optionnelle, s'ajoute à la phase 1)")
+            _auto_fat_thr = st.session_state.get("auto_fatigue_threshold")
+            _auto_fat_rate = st.session_state.get("auto_fatigue_rate")
+            _auto_fat_n = st.session_state.get("auto_fatigue_n", 0)
+            _auto_fat_std = st.session_state.get("auto_fatigue_std")
+            _auto_fat_r2max = st.session_state.get("auto_fatigue_r2max")
+            if _auto_fat_thr is not None:
+                _consistency = f" · cohérence ±{_auto_fat_std:.0f} pts sur {_auto_fat_n} courses" if _auto_fat_std is not None else " · 1 course"
+                _r2_txt = f" · R²={_auto_fat_r2max:.2f}" if _auto_fat_r2max is not None else ""
+                dual_fatigue = st.checkbox(
+                    f"🔒 Ajouter ma fatigue personnelle détectée (rupture à {_auto_fat_thr}% · dégradation "
+                    f"{_auto_fat_rate}%{_consistency}{_r2_txt})",
+                    value=st.session_state.get("dual_fatigue_locked", False), key="dual_fatigue_chk")
+                st.session_state["dual_fatigue_locked"] = dual_fatigue
+                if dual_fatigue:
+                    c_p2a,c_p2b = st.columns(2)
+                    fatigue_threshold2 = c_p2a.slider("Seuil phase 2 (% de la course)",
+                        min_value=int(fatigue_threshold)+2, max_value=98,
+                        value=max(int(fatigue_threshold)+2, int(st.session_state.get("tp_fatigue_threshold2",_auto_fat_thr))),
+                        step=1, key="tp_fatigue_threshold2",
+                        help="Doit être après le seuil de phase 1. C'est ici que ta fatigue personnelle prend le relais.")
+                    fatigue_rate2 = c_p2b.slider("Ralentissement additionnel phase 2 (%)",0.0,40.0,
+                        float(st.session_state.get("tp_fatigue_rate2",_auto_fat_rate)),0.5,
+                        key="tp_fatigue_rate2",
+                        help="S'ajoute par-dessus le ralentissement de la phase 1 (pas à sa place).")
+                    if _auto_fat_r2max is not None and _auto_fat_r2max < 0.3:
+                        st.warning(f"⚠️ R²={_auto_fat_r2max:.2f} — signal très faible, quasiment du bruit. "
+                                   f"Résultat peu fiable si tu gardes cette case cochée.")
+                    elif _auto_fat_r2max is not None and _auto_fat_r2max < 0.6:
+                        st.caption(f"ℹ️ R²={_auto_fat_r2max:.2f} — signal modéré (typique d'un point de rupture "
+                                   f"réel noyé dans du bruit GPS/allure). Traite le résultat comme indicatif, "
+                                   f"pas comme une certitude.")
+                    st.caption(f"📊 Phase 2 : dégradation stable à +{fatigue_rate:.0f}% (fin de phase 1) jusqu'à "
+                               f"**{fatigue_threshold2}%**, puis accélère jusqu'à **+{fatigue_rate+fatigue_rate2:.0f}%** "
+                               f"cumulé à l'arrivée.")
+            else:
+                st.caption("Aucune rupture d'allure exploitable détectée sur tes références (section 2️⃣) pour "
+                           "l'instant — importe une référence en FIT/TCX pour activer cette option.")
 
     with st.expander("🎚️ Sensibilité aux conditions selon l'allure",expanded=False):
         st.caption("Plus tu cours vite, moins la météo et le vent te ralentissent en proportion.")
@@ -2961,6 +3028,7 @@ with main_tabs[0]:
                         apply_fatigue=apply_fatigue,fatigue_rate=fatigue_rate,
                         fatigue_threshold=float(st.session_state.get("tp_fatigue_threshold",60.0)),
                         fatigue_mode=fatigue_mode,
+                        dual_fatigue=dual_fatigue,fatigue_threshold2=fatigue_threshold2,fatigue_rate2=fatigue_rate2,
                         apply_ultra=apply_ultra,ultra_amp=ultra_amp,
                         objective_hms=temps_objectif if force_temps else None,
                         show_smooth_pace=show_smooth_pace,smooth_window_km=smooth_window_km,
@@ -3040,7 +3108,10 @@ with main_tabs[0]:
                     ax.plot(x,ps,lw=2.5,color="firebrick",label="Allure lissée")
                 if apply_fatigue and fatigue_rate>0 and len(x)>0:
                     thresh_km=fatigue_threshold/100.0*len(x)
-                    ax.axvline(thresh_km,color="orange",lw=1.5,ls="--",alpha=0.7,label=f"Seuil fatigue ({fatigue_threshold}%)")
+                    ax.axvline(thresh_km,color="orange",lw=1.5,ls="--",alpha=0.7,label=f"Seuil phase 1 ({fatigue_threshold}%)")
+                    if dual_fatigue and fatigue_threshold2:
+                        thresh2_km=fatigue_threshold2/100.0*len(x)
+                        ax.axvline(thresh2_km,color="darkred",lw=1.5,ls="--",alpha=0.7,label=f"Seuil phase 2 perso ({fatigue_threshold2}%)")
                 ax.invert_yaxis();ax.set_xlabel("Kilomètre");ax.set_ylabel("Allure (min/km)")
                 ax.set_title("Allure prévisionnelle km par km");ax.legend();ax.grid(alpha=0.3)
                 st.pyplot(fig);plt.close(fig)
