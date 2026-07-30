@@ -2641,45 +2641,66 @@ with main_tabs[0]:
 
     if refs_with_hr:
         st.markdown("#### 💓 Prédiction de zone FC cible — données personnelles de l'athlète")
-        st.caption("Basé uniquement sur les FC observées lors des courses de référence — pas de valeurs normatives.")
-        _dur_target_s = hms_to_seconds(st.session_state.get("temps_objectif_target","")) if st.session_state.get("temps_objectif_target") else None
-        if not _dur_target_s or _dur_target_s == 0:
-            _allures = [hms_to_seconds(r.get("duration_hms_file") or r.get("temps","0")) / max(1, safe_float(r["distance"],1)/1000)
-                        for r in refs_raw if safe_float(r.get("distance",0)) > 0]
-            _allure_moy = float(np.mean(_allures)) if _allures else 360.0
-            _dist_km_est = tot_tmp / 1000.0 if (gpx_file and points) else 21.097
-            _dur_target_s = _allure_moy * _dist_km_est
-        hr_pred = predict_hr_zone(refs_with_hr, _dur_target_s)
-        if hr_pred:
-            hc1, hc2, hc3, hc4 = st.columns(4)
-            hc1.metric("FC moy. prédite", f"{hr_pred['hr_target_avg']} bpm")
-            hc2.metric("Fourchette cible", f"{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm")
-            hc3.metric("FC max estimée",   f"{hr_pred['hr_target_max']} bpm")
-            hc4.metric("Références FC",    f"{hr_pred['n_refs']} course(s)",
-                       delta=f"R²={hr_pred['r2']}" if hr_pred.get("r2") else "Moyenne brute")
-            if hr_pred.get("model") == "regression" and hr_pred.get("r2",0) >= 0.70:
-                st.success(f"✅ Régression FC solide (R²={hr_pred['r2']:.2f}) — vise **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm** en moyenne sur la course.")
-            elif hr_pred.get("model") == "regression":
-                st.info(f"📊 Régression FC indicative (R²={hr_pred['r2']:.2f}) — ajoute plus de références pour affiner. Cible : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**.")
+        _use_hr_regression = st.checkbox(
+            "Intégrer ma régression FC personnelle", value=True, key="use_hr_regression_chk",
+            help="Désactive cette section si tu ne veux pas t'appuyer sur la régression FC/durée calculée à partir "
+                 "de tes références.")
+        if _use_hr_regression:
+            st.caption("Basé uniquement sur les FC observées lors des courses de référence — pas de valeurs normatives.")
+            # Priorité au temps RÉELLEMENT calculé (section 6️⃣, si déjà lancé) plutôt qu'à
+            # l'estimation grossière (allure moyenne des références × distance GPX) — cette
+            # dernière ne sert plus que de repli tant qu'aucun calcul n'a encore été fait.
+            # Comme cette section 3️⃣ s'exécute avant la section 6️⃣ dans le script, le résultat
+            # utilisé est celui du dernier calcul lancé (léger décalage d'un run, comme pour
+            # k_up_val ailleurs dans l'app) — se met à jour automatiquement après le calcul.
+            _res_prev = st.session_state.get("res")
+            if _res_prev and _res_prev.get("total_s"):
+                _dur_target_s = float(_res_prev["total_s"])
+                _dur_source = "temps prédit (dernier calcul lancé)"
+            elif st.session_state.get("temps_objectif_target"):
+                _dur_target_s = hms_to_seconds(st.session_state.get("temps_objectif_target",""))
+                _dur_source = "objectif de temps saisi"
             else:
-                st.info(f"💓 FC cible estimée (moyenne de {hr_pred['n_refs']} référence(s)) : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**.")
-            if len(refs_with_hr) >= 2:
-                fig_hr_pred, ax_hr_p = plt.subplots(figsize=(7, 3.5))
-                durs_h = [r["dur_s"]/60.0 for r in refs_with_hr]
-                hrs_h  = [r["hr_avg"] for r in refs_with_hr]
-                ax_hr_p.scatter(durs_h, hrs_h, s=80, color="#d62728", zorder=5, label="FC moy. observée")
-                if hr_pred.get("model") == "regression":
-                    d_line = np.linspace(max(1, min(durs_h)*0.8), max(max(durs_h)*1.2, _dur_target_s/60*1.1), 80)
-                    hr_line = [hr_pred["slope"]*math.log(max(1,d*60))+hr_pred["intercept"] for d in d_line]
-                    ax_hr_p.plot(d_line, hr_line, color="#1f77b4", lw=2, ls="--", label="Régression log(durée)")
-                    sigma_viz = (hr_pred['hr_target_range'][1]-hr_pred['hr_target_range'][0])/2
-                    ax_hr_p.fill_between(d_line,[h-sigma_viz for h in hr_line],[h+sigma_viz for h in hr_line],alpha=0.12,color="#1f77b4")
-                ax_hr_p.axvline(_dur_target_s/60, color="#f97316", lw=2, ls=":", label=f"Course cible ({_dur_target_s/60:.0f} min)")
-                ax_hr_p.scatter([_dur_target_s/60],[hr_pred["hr_target_avg"]],s=150,color="#f97316",marker="*",zorder=6,label=f"FC cible {hr_pred['hr_target_avg']} bpm")
-                ax_hr_p.set_xlabel("Durée de la course (min)"); ax_hr_p.set_ylabel("FC moyenne (bpm)")
-                ax_hr_p.set_title("Régression FC personnelle — données athlète uniquement")
-                ax_hr_p.legend(fontsize=8); ax_hr_p.grid(alpha=0.3); fig_hr_pred.tight_layout()
-                st.pyplot(fig_hr_pred); plt.close(fig_hr_pred)
+                _dur_target_s = None; _dur_source = "estimation grossière"
+            if not _dur_target_s or _dur_target_s == 0:
+                _allures = [hms_to_seconds(r.get("duration_hms_file") or r.get("temps","0")) / max(1, safe_float(r["distance"],1)/1000)
+                            for r in refs_raw if safe_float(r.get("distance",0)) > 0]
+                _allure_moy = float(np.mean(_allures)) if _allures else 360.0
+                _dist_km_est = tot_tmp / 1000.0 if (gpx_file and points) else 21.097
+                _dur_target_s = _allure_moy * _dist_km_est
+            st.caption(f"⏱️ Durée cible utilisée : **{seconds_to_hms(_dur_target_s)}** ({_dur_source})"
+                       + ("" if _res_prev else " — lance le calcul en section 6️⃣ pour utiliser le temps réellement prédit."))
+            hr_pred = predict_hr_zone(refs_with_hr, _dur_target_s)
+            if hr_pred:
+                hc1, hc2, hc3, hc4 = st.columns(4)
+                hc1.metric("FC moy. prédite", f"{hr_pred['hr_target_avg']} bpm")
+                hc2.metric("Fourchette cible", f"{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm")
+                hc3.metric("FC max estimée",   f"{hr_pred['hr_target_max']} bpm")
+                hc4.metric("Références FC",    f"{hr_pred['n_refs']} course(s)",
+                           delta=f"R²={hr_pred['r2']}" if hr_pred.get("r2") else "Moyenne brute")
+                if hr_pred.get("model") == "regression" and hr_pred.get("r2",0) >= 0.70:
+                    st.success(f"✅ Régression FC solide (R²={hr_pred['r2']:.2f}) — vise **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm** en moyenne sur la course.")
+                elif hr_pred.get("model") == "regression":
+                    st.info(f"📊 Régression FC indicative (R²={hr_pred['r2']:.2f}) — ajoute plus de références pour affiner. Cible : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**.")
+                else:
+                    st.info(f"💓 FC cible estimée (moyenne de {hr_pred['n_refs']} référence(s)) : **{hr_pred['hr_target_range'][0]}–{hr_pred['hr_target_range'][1]} bpm**.")
+                if len(refs_with_hr) >= 2:
+                    fig_hr_pred, ax_hr_p = plt.subplots(figsize=(7, 3.5))
+                    durs_h = [r["dur_s"]/60.0 for r in refs_with_hr]
+                    hrs_h  = [r["hr_avg"] for r in refs_with_hr]
+                    ax_hr_p.scatter(durs_h, hrs_h, s=80, color="#d62728", zorder=5, label="FC moy. observée")
+                    if hr_pred.get("model") == "regression":
+                        d_line = np.linspace(max(1, min(durs_h)*0.8), max(max(durs_h)*1.2, _dur_target_s/60*1.1), 80)
+                        hr_line = [hr_pred["slope"]*math.log(max(1,d*60))+hr_pred["intercept"] for d in d_line]
+                        ax_hr_p.plot(d_line, hr_line, color="#1f77b4", lw=2, ls="--", label="Régression log(durée)")
+                        sigma_viz = (hr_pred['hr_target_range'][1]-hr_pred['hr_target_range'][0])/2
+                        ax_hr_p.fill_between(d_line,[h-sigma_viz for h in hr_line],[h+sigma_viz for h in hr_line],alpha=0.12,color="#1f77b4")
+                    ax_hr_p.axvline(_dur_target_s/60, color="#f97316", lw=2, ls=":", label=f"Course cible ({_dur_target_s/60:.0f} min)")
+                    ax_hr_p.scatter([_dur_target_s/60],[hr_pred["hr_target_avg"]],s=150,color="#f97316",marker="*",zorder=6,label=f"FC cible {hr_pred['hr_target_avg']} bpm")
+                    ax_hr_p.set_xlabel("Durée de la course (min)"); ax_hr_p.set_ylabel("FC moyenne (bpm)")
+                    ax_hr_p.set_title("Régression FC personnelle — données athlète uniquement")
+                    ax_hr_p.legend(fontsize=8); ax_hr_p.grid(alpha=0.3); fig_hr_pred.tight_layout()
+                    st.pyplot(fig_hr_pred); plt.close(fig_hr_pred)
     else:
         st.caption("💓 Chargez des fichiers FIT ou TCX dans les références pour obtenir une prédiction de zone cardiaque personnalisée.")
 
