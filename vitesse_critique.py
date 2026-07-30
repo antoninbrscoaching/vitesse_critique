@@ -2490,8 +2490,9 @@ with main_tabs[0]:
                         ref_breakpoint=detect_pace_breakpoint(_t_bp,_pace_bp)
                         if ref_breakpoint and ref_breakpoint.get("r2",0)>=0.3:
                             st.caption(f"🔍 Rupture d'allure détectée à {ref_breakpoint['pct_break']:.0f}% de cette "
-                                       f"course (dégradation {ref_breakpoint['drop_pct']:+.0f}%) — utilisée pour la "
-                                       f"signature de fatigue personnelle ci-dessous (section 4️⃣).")
+                                       f"course (dégradation {ref_breakpoint['drop_pct']:+.0f}%, R²={ref_breakpoint['r2']:.2f}) "
+                                       f"— disponible en option pour la fatigue en section 4️⃣ (voir le R² avant de "
+                                       f"t'y fier : sous 0.6, le signal reste faible).")
             else:
                 if EXPERT:
                     cs2,ce2=st.columns(2)
@@ -2518,17 +2519,24 @@ with main_tabs[0]:
     # v8.4 — signature de fatigue personnelle, calculée automatiquement à partir des
     # ruptures d'allure détectées ci-dessus sur tes propres références (aucune action
     # séparée requise, aucune dépendance à l'onglet 🧪 Tests d'endurance + VC).
+    # Seuil de détection à 0.3 (affichage), mais le signal reste faible en dessous de
+    # 0.6 — la case reste décochée par défaut dans ce cas (voir section 4️⃣). Attention
+    # en particulier au transfert marathon → ultra-trail : le "mur" du marathon (déplétion
+    # glycogénique ~30-35km) et la fatigue d'un ultra de plusieurs heures ne sont pas le
+    # même phénomène physiologique, même quand la rupture est nette dans les données.
     _bp_valid=[r["breakpoint"] for r in refs_raw if r.get("breakpoint") and r["breakpoint"].get("r2",0)>=0.3]
-    auto_fatigue_threshold=auto_fatigue_rate=None
+    auto_fatigue_threshold=auto_fatigue_rate=auto_fatigue_r2max=None
     auto_fatigue_n=len(_bp_valid); auto_fatigue_std=None
     if _bp_valid:
         _pcts=[b["pct_break"] for b in _bp_valid]; _drops=[abs(b["drop_pct"]) for b in _bp_valid]
         auto_fatigue_threshold=round(float(np.mean(_pcts))); auto_fatigue_rate=round(float(np.mean(_drops)))
         auto_fatigue_std=float(np.std(_pcts)) if len(_pcts)>=2 else None
+        auto_fatigue_r2max=float(max(b.get("r2",0) for b in _bp_valid))
     st.session_state["auto_fatigue_threshold"]=auto_fatigue_threshold
     st.session_state["auto_fatigue_rate"]=auto_fatigue_rate
     st.session_state["auto_fatigue_n"]=auto_fatigue_n
     st.session_state["auto_fatigue_std"]=auto_fatigue_std
+    st.session_state["auto_fatigue_r2max"]=auto_fatigue_r2max
 
     st.markdown("---")
     st.header("3️⃣  Recalibration des références vers les conditions idéales")
@@ -2685,21 +2693,30 @@ with main_tabs[0]:
         _auto_fat_rate = st.session_state.get("auto_fatigue_rate")
         _auto_fat_n = st.session_state.get("auto_fatigue_n", 0)
         _auto_fat_std = st.session_state.get("auto_fatigue_std")
+        _auto_fat_r2max = st.session_state.get("auto_fatigue_r2max")
         _has_personal_fatigue = _auto_fat_thr is not None
         _use_personal_fatigue = False
         if _has_personal_fatigue:
-            _consistency = f" (cohérence ±{_auto_fat_std:.0f} pts sur {_auto_fat_n} courses)" if _auto_fat_std is not None else f" (1 course)"
+            _consistency = f" · cohérence ±{_auto_fat_std:.0f} pts sur {_auto_fat_n} courses" if _auto_fat_std is not None else " · 1 course"
+            _r2_txt = f" · R²={_auto_fat_r2max:.2f}" if _auto_fat_r2max is not None else ""
+            _weak = _auto_fat_r2max is not None and _auto_fat_r2max < 0.6
             _use_personal_fatigue = st.checkbox(
-                f"🔒 Utiliser ma fatigue détectée automatiquement (seuil {_auto_fat_thr}% · taux {_auto_fat_rate}%){_consistency} "
-                f"— au lieu du seuil/taux du profil de terrain ci-dessous",
-                value=st.session_state.get("personal_fatigue_locked", True), key="use_personal_fatigue_chk")
+                f"🔒 Utiliser ma fatigue détectée automatiquement (seuil {_auto_fat_thr}% · taux {_auto_fat_rate}%"
+                f"{_consistency}{_r2_txt}) — au lieu du seuil/taux du profil de terrain ci-dessous",
+                value=st.session_state.get("personal_fatigue_locked", False), key="use_personal_fatigue_chk")
             st.session_state["personal_fatigue_locked"] = _use_personal_fatigue
+            if _weak:
+                st.warning(
+                    f"⚠️ R²={_auto_fat_r2max:.2f} — signal faible (la rupture détectée n'explique qu'une fraction de "
+                    f"la variation d'allure). Décoché par défaut pour cette raison. Si cette signature vient d'une "
+                    f"référence courte/route (marathon, semi...), garde à l'esprit que le \"mur\" du marathon "
+                    f"(déplétion glycogénique ~30-35km) et la fatigue d'un ultra-trail de plusieurs heures ne sont "
+                    f"pas le même phénomène physiologique — le transfert en % reste une approximation fragile.")
             st.caption(
                 "Détecté à partir de la rupture d'allure sur tes courses de référence importées en FIT/TCX "
                 "(section 2️⃣) — pas depuis l'onglet Vitesse Critique. k_up et le plafond de pente restent ceux du "
                 "profil sélectionné/importé (spécifiques au terrain de CETTE course) ; seuls le seuil et le taux de "
-                "fatigue viennent de toi. Le transfert en % d'une course à l'autre est une approximation "
-                "raisonnable, pas une certitude physiologique.")
+                "fatigue viennent de toi si tu coches cette case.")
 
         st.markdown("##### 🗺️ Profil du parcours")
         _all_terrain_profiles = get_all_terrain_profiles()
