@@ -2635,14 +2635,39 @@ with main_tabs[0]:
             except Exception as e:
                 st.error(f"❌ Fichier JSON invalide — {e}")
 
+        _has_personal_fatigue = st.session_state.get("personal_fatigue_threshold") is not None
+        _use_personal_fatigue = False
+        if _has_personal_fatigue:
+            _pf_thr = st.session_state["personal_fatigue_threshold"]
+            _pf_rate = st.session_state.get("personal_fatigue_rate", 18)
+            _use_personal_fatigue = st.checkbox(
+                f"🔒 Garder mon seuil/taux de fatigue personnel (seuil {_pf_thr}% · taux {_pf_rate}%) — "
+                f"ne pas l'écraser par le profil de terrain sélectionné ci-dessous",
+                value=st.session_state.get("personal_fatigue_locked", True), key="use_personal_fatigue_chk")
+            st.session_state["personal_fatigue_locked"] = _use_personal_fatigue
+            st.caption(
+                "k_up et le plafond de pente restent ceux du profil sélectionné/importé (spécifiques au terrain) — "
+                "seuls le seuil et le taux de fatigue viennent de ta propre signature détectée dans l'onglet "
+                "🧪 Tests d'endurance + VC, section 4️⃣. Idée : la fatigue en % de course transfère raisonnablement "
+                "bien d'une distance à l'autre, contrairement au coefficient de pente qui, lui, dépend du terrain "
+                "précis de CETTE course.")
+
         st.markdown("##### 🗺️ Profil du parcours")
         _all_terrain_profiles = get_all_terrain_profiles()
         terrain_profil=st.radio("Type de terrain",list(_all_terrain_profiles.keys()),horizontal=True,key="terrain_profil_radio")
         _prev=st.session_state.get("_prev_terrain_profil","")
-        if terrain_profil!=_prev:
+        _prev_lock=st.session_state.get("_prev_personal_fatigue_lock")
+        if terrain_profil!=_prev or _use_personal_fatigue!=_prev_lock:
             st.session_state["_prev_terrain_profil"]=terrain_profil
+            st.session_state["_prev_personal_fatigue_lock"]=_use_personal_fatigue
             _d=_all_terrain_profiles[terrain_profil]
-            for k,v in _d.items():st.session_state[f"tp_{k}"]=v
+            for k,v in _d.items():
+                if _use_personal_fatigue and k in ("fatigue_threshold", "fatigue_rate"):
+                    continue  # préserve la signature personnelle plutôt que celle du profil terrain
+                st.session_state[f"tp_{k}"]=v
+            if _use_personal_fatigue:
+                st.session_state["tp_fatigue_threshold"] = st.session_state["personal_fatigue_threshold"]
+                st.session_state["tp_fatigue_rate"] = st.session_state.get("personal_fatigue_rate", 18)
         _d=_all_terrain_profiles[terrain_profil]
         _profil_info={
             "🛣️ Route / Plat":"Route, piste, parcours plat. k_up=4 (v8 — moins réactif au bruit GPS), lissage altitude ×25pts. Allure stable sur plat.",
@@ -2653,9 +2678,12 @@ with main_tabs[0]:
         if terrain_profil in _profil_info:
             st.info(_profil_info[terrain_profil])
         else:
+            _eff_fat_thr = st.session_state.get("tp_fatigue_threshold", _d.get("fatigue_threshold","—"))
+            _eff_fat_rate = st.session_state.get("tp_fatigue_rate", _d.get("fatigue_rate","—"))
+            _fat_src = " (ta signature personnelle 🔒)" if _use_personal_fatigue else " (valeur du profil)"
             st.info(f"📌 Profil calibré (importé ou depuis l'onglet 👥 Analyse de cohorte) : k_up={_d.get('k_up')} · "
-                    f"plafond={_d.get('max_cap',0)*100:.0f}% · seuil fatigue={_d.get('fatigue_threshold','—')}% · "
-                    f"taux fatigue={_d.get('fatigue_rate','—')}% — paramètres non calibrés (k_down, minetti_weight, "
+                    f"plafond={_d.get('max_cap',0)*100:.0f}% · seuil fatigue={_eff_fat_thr}%{_fat_src} · "
+                    f"taux fatigue={_eff_fat_rate}%{_fat_src} — paramètres non calibrés (k_down, minetti_weight, "
                     f"lissage…) repris des valeurs standard « Trail modéré ».")
 
         tech_global_ui=st.session_state.get("tech_global",{})
@@ -3469,10 +3497,20 @@ with main_tabs[1]:
                         f"(±{_std_pct:.0f} pts) · dégradation moyenne {_avg_drop:+.1f}%**")
             if _std_pct < 15:
                 st.success(f"📍 Cohérent entre tests de durées différentes — signe d'une vraie signature "
-                           f"physiologique plutôt qu'un artefact d'un seul test. Tu pourrais tester "
-                           f"`fatigue_threshold ≈ {_avg_pct:.0f}` dans l'onglet 🏃 Prédiction comme point de départ "
-                           f"pour cet athlète (à confirmer/affiner avec les courses réelles dans l'onglet "
-                           f"👥 Analyse de cohorte).")
+                           f"physiologique plutôt qu'un artefact d'un seul test.")
+                st.caption(
+                    "Un seuil de fatigue en % de course reste un point de départ raisonnable même en changeant de "
+                    "distance/discipline (marathon → ultra) : ce n'est pas prouvé physiologiquement de façon "
+                    "rigoureuse, mais c'est une meilleure estimation que la valeur générique du profil terrain "
+                    "quand tu n'as pas encore de course longue à toi pour calibrer ce paramètre directement.")
+                if st.button(f"🔒 Utiliser {_avg_pct:.0f}% / {_avg_drop:+.0f}% comme seuil/taux de fatigue personnel",
+                             key="lock_personal_fatigue_btn"):
+                    st.session_state["personal_fatigue_threshold"] = round(_avg_pct)
+                    st.session_state["personal_fatigue_rate"] = round(abs(_avg_drop))
+                    st.session_state["personal_fatigue_locked"] = True
+                    st.success("✅ Enregistré — dans l'onglet 🏃 Prédiction, section 4️⃣, une case à cocher te "
+                               "permet maintenant de garder ce réglage même en important un profil de cohorte "
+                               "(qui n'apportera plus que k_up/plafond de pente, pas la fatigue).")
             else:
                 st.warning(f"⚠️ Le point de rupture varie pas mal selon la durée du test (±{_std_pct:.0f} pts) — "
                            f"peut-être pas une signature fixe en %, ou tests pas tous menés au même niveau "
