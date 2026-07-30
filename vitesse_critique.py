@@ -27,6 +27,15 @@
 #     (top10 réel de 12 ultra-trails : TDS, UTMB, OCC, Templiers, Sainte-Lyon,
 #     Saint-Jacques, Trans Gran Canaria, Transvulcania, Chianti, MCC, EcoTrail,
 #     Nantes-Montaigu). g0_up=5.0 pour tous les profils trail (au lieu de 3.0) ;
+# NOUVEAUTÉS v8.3 :
+#   - BUG CRITIQUE corrigé : le plafond haut de l'exposant de fatigue Riegel
+#     (K) est relevé de 1.25 à 1.60. La borne 1.25 reflétait des exposants
+#     typiques de course sur route (5km→marathon) ; elle était bien trop
+#     basse pour extrapoler des références ultra-trail (ex : marathon →
+#     66km → 135km) vers une distance encore plus longue (UTMB, 100 miles).
+#     Le K brut (non plafonné) est maintenant affiché à côté du K utilisé
+#     dans l'onglet Prédiction pour repérer ce genre de troncature.
+#
 #     k_up et max_cap (=max_up) recalibrés par type de course.
 #   - Nouveau profil "🏞️ Trail roulant / peu technique" (R²=0.918, le mieux
 #     identifié des 3 clusters) pour les ultra-trails à faible D+/km.
@@ -1001,20 +1010,41 @@ def predict_performances(vc_ms,d_prime,refs_fit,K_riegel,genre="H"):
     return results,best_dist
 
 # v8.2 PATCH — BUG CRITIQUE corrigé : quand la pente K de la régression
-# log-log est plafonnée à [0.85,1.25], l'ordonnée à l'origine (a) doit être
-# RECALCULÉE pour rester cohérente avec la pente effectivement utilisée.
-# Avant ce patch, "a" restait celui de la régression NON plafonnée — (a,K)
-# ne formait alors plus une paire valide, et predict_flat() pouvait prédire
+# log-log est plafonnée, l'ordonnée à l'origine (a) doit être RECALCULÉE
+# pour rester cohérente avec la pente effectivement utilisée. Avant ce
+# patch, "a" restait celui de la régression NON plafonnée — (a,K) ne
+# formait alors plus une paire valide, et predict_flat() pouvait prédire
 # des temps complètement absurdes (ex : 0h51 pour un marathon de référence
 # à 2h41) dès qu'on s'éloignait du centre de gravité des références.
-def clamped_loglog_fit(X, Y):
+#
+# v8.3 PATCH — plafond haut de K relevé de 1.25 à 1.60 : la borne 1.25
+# reflète des exposants Riegel typiques route (5km→marathon). Elle est
+# beaucoup trop basse pour extrapoler des références ultra-trail (ex :
+# marathon → 66km → 135km) vers une distance encore plus longue (UTMB
+# ~170km+) : la fatigue réelle sur ces distances (déplétion glycogénique,
+# nuit, autosuffisance) donne souvent des K observés >1.25, parfois >1.5.
+# Écraser ce signal à 1.25 tronque artificiellement la base de temps plat
+# extrapolée et peut sous-estimer le temps total de plusieurs heures sur
+# un 100 miles. Le plafond bas (0.85) reste inchangé — aucune course ne
+# ralentit moins vite que le rythme constant en extrapolant vers le long.
+def clamped_loglog_fit(X, Y, k_max=1.60):
     X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
     if len(X) < 2:
         return None
     K_raw, loga_raw = np.polyfit(X, Y, 1)
-    K = float(max(0.85, min(1.25, K_raw)))
+    K = float(max(0.85, min(k_max, K_raw)))
     loga = float(loga_raw) if abs(K - K_raw) < 1e-9 else float(np.mean(Y - K * X))
     return math.exp(loga), K
+
+def raw_loglog_slope(X, Y):
+    """K non plafonné de la régression log-log — calculé séparément pour affichage,
+    afin que l'utilisateur voie quand le plafond de clamped_loglog_fit tronque un
+    signal de fatigue réel plutôt que de filtrer du bruit."""
+    if len(X) < 2:
+        return None
+    X = np.asarray(X, dtype=float); Y = np.asarray(Y, dtype=float)
+    K_raw, _ = np.polyfit(X, Y, 1)
+    return float(K_raw)
 
 def fit_loglog(refs):
     X,Y=[],[]
@@ -1154,6 +1184,9 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
                            temp_max_penalty,k_up,k_down,down_cap,g0_up,g0_down,max_up,max_down,
                            elev_ref_power,temp_ref_power)
     a,K=fit_loglog(refs_fit)
+    _X_kraw=[math.log(max(1e-6,safe_float(r.get("distance",0))/1000.0)) for r in refs_fit if safe_float(r.get("distance",0))>0 and float(r.get("temps",0))>0]
+    _Y_kraw=[math.log(float(r.get("temps",0))) for r in refs_fit if safe_float(r.get("distance",0))>0 and float(r.get("temps",0))>0]
+    K_raw=raw_loglog_slope(_X_kraw,_Y_kraw)
     base_total_s=predict_flat(int(distance_cible_km*1000),a,K)
     base_s_per_km=base_total_s/max(distance_cible_km,1e-9)*float(surface_mult)
 
@@ -1360,7 +1393,7 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
     return{"df":df_out,"total_s":total_s,"total_human":seconds_to_hms(total_s),
            "ci_low":_ci_low_hms,"ci_high":_ci_high_hms,
            "ci_low_label":_ci_low_label,"ci_high_label":_ci_high_label,
-           "dist_gpx_km":dist_gpx_km,"K":K,"avg_alt":avg_alt,"d_plus_total":d_plus_total,
+           "dist_gpx_km":dist_gpx_km,"K":K,"K_raw":K_raw,"avg_alt":avg_alt,"d_plus_total":d_plus_total,
            "refs_fit":refs_fit,"pre_df":df_pre}
 
 def extract_interval_df(df,start_hms,end_hms):
@@ -2872,14 +2905,23 @@ with main_tabs[0]:
         _t_low=_t_ref*(1+_delta_low/100.0); _t_high=_t_ref*(1+_delta_high/100.0)
         c3.metric(f"📏 {_ref_sel} {_delta_low:+d}%",seconds_to_hms(_t_low))
         c4.metric(f"📏 {_ref_sel} {_delta_high:+d}%",seconds_to_hms(_t_high))
-        c5.metric("K Riegel",f"{res['K']:.3f}")
+        c5.metric("K Riegel",f"{res['K']:.3f}",
+                  delta=(f"brut={res['K_raw']:.2f}" if res.get("K_raw") is not None and abs(res["K_raw"]-res["K"])>0.01 else None))
 
-        # v8.2 — signale une extrapolation fragile plutôt que de la laisser silencieuse
-        _K_val = res['K']
-        if _K_val >= 1.24 or _K_val <= 0.86:
-            st.warning(f"⚠️ K Riegel collé à une borne ({_K_val:.2f}) — signe que tes références sont trop "
+        # v8.3 — signale une extrapolation fragile plutôt que de la laisser silencieuse.
+        # Plafonds relevés à [0.85, 1.60] (v8.3) — l'ancien plafond à 1.25 (calibré pour
+        # des écarts de distance route) tronquait silencieusement un vrai signal de
+        # fatigue ultra quand K brut dépassait 1.25, ce qui pouvait sous-estimer le
+        # temps total de plusieurs heures sur une extrapolation vers un 100 miles.
+        _K_val = res['K']; _K_raw_val = res.get('K_raw')
+        if _K_val >= 1.58 or _K_val <= 0.86:
+            _raw_txt = f" (K brut avant plafonnement : {_K_raw_val:.2f})" if _K_raw_val is not None else ""
+            st.warning(f"⚠️ K Riegel collé à une borne ({_K_val:.2f}){_raw_txt} — signe que tes références sont trop "
                        f"hétérogènes (distance/terrain/conditions) ou trop peu nombreuses pour une extrapolation "
                        f"fiable vers cette distance. Ajoute une référence de distance intermédiaire si possible.")
+        elif _K_raw_val is not None and abs(_K_raw_val - _K_val) > 0.05:
+            st.info(f"ℹ️ Le K brut de tes références ({_K_raw_val:.2f}) a été légèrement ajusté à {_K_val:.2f} "
+                    f"pour rester dans une plage physiologiquement plausible.")
         _ref_dists_km = [safe_float(r.get("distance",0))/1000.0 for r in refs_raw if safe_float(r.get("distance",0))>0]
         if _ref_dists_km and _dist_simulated_km > max(_ref_dists_km)*1.5:
             st.warning(f"⚠️ La distance cible ({_dist_simulated_km:.0f} km) dépasse largement ta référence la "
