@@ -109,6 +109,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 import xml.etree.ElementTree as ET
 import requests
 import io
+import warnings
 import json as _json
 from scipy import stats as sp_stats
 from scipy.optimize import least_squares
@@ -646,43 +647,167 @@ def parse_gpx_points(file):
         return gpx,pts
     except Exception as e:st.error(f"Erreur GPX:{e}");return None,[]
 
-def parse_fit_ref(file,tz_name=TZ_NAME_DEFAULT):
+# ── v8.6 PATCH — lecture FIT tolérante ────────────────────────────────────
+# fitparse lève FitParseError "Invalid field size N for type 'uintXX'" dès qu'un
+# message de définition déclare un champ dont la taille n'est pas un multiple de
+# son type de base (fréquent sur Coros/Suunto/Wahoo et sur les Garmin avec champs
+# développeur). fitdecode, lui, se contente d'un warning et lit le fichier.
+# parse_fit_ref essaie donc fitparse, puis bascule automatiquement sur fitdecode.
+# ──────────────────────────────────────────────────────────────────────────
+SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
+
+def _fit_read_bytes(file):
+    """Lit le fichier une seule fois en mémoire : permet de le re-parser avec
+    un second moteur sans dépendre de la position du curseur."""
     try:
-        file.seek(0);fit=FitFile(file);fit.parse()
-        records,times_pts,hr_records=[],[],[]
-        start_global=elapsed_global=None
-        for msg in fit.get_messages("session"):
-            vals={d.name:d.value for d in msg}
-            if isinstance(vals.get("start_time"),datetime):start_global=vals["start_time"].replace(tzinfo=None)
-            if isinstance(vals.get("total_elapsed_time"),(int,float)):elapsed_global=float(vals["total_elapsed_time"])
-        for msg in fit.get_messages("record"):
-            vals={d.name:d.value for d in msg}
-            lat_r=vals.get("position_lat");lon_r=vals.get("position_long")
-            if lat_r is None or lon_r is None:continue
-            lat=lat_r*(180/2**31);lon=lon_r*(180/2**31)
-            ts=vals.get("timestamp");dt=ts.replace(tzinfo=None) if isinstance(ts,datetime) else None
-            alt=(vals.get("enhanced_altitude") or vals.get("altitude") or 0.0)
-            dist=float(vals.get("distance") or 0.0);hr=vals.get("heart_rate")
-            hr_records.append(int(hr) if hr is not None else None)
-            records.append((lat,lon,float(alt),dist));times_pts.append(dt)
-        if not records:return None
-        df=pd.DataFrame(records,columns=["lat","lon","elev","dist"])
-        valid_t=[t for t in times_pts if t is not None]
-        if len(valid_t)>=2:start_dt,end_dt=min(valid_t),max(valid_t)
-        elif start_global and elapsed_global:start_dt=start_global;end_dt=start_global+timedelta(seconds=elapsed_global)
-        else:
-            start_dt=datetime.now().replace(hour=12,minute=0,second=0,microsecond=0)-timedelta(days=1)
-            end_dt=start_dt+timedelta(minutes=5)
-        avgT,avgW,avgH=get_avg_weather(records[0][0],records[0][1],start_dt,end_dt,tz_name)
-        elev_arr=df["elev"].values
-        dup=float(np.sum(np.clip(np.diff(elev_arr),0,None))) if elev_arr.size>=2 else 0.0
-        ddn=float(-np.sum(np.clip(np.diff(elev_arr),None,0))) if elev_arr.size>=2 else 0.0
-        hr_analysis = analyze_hr_v3(hr_records)
-        return{"points":[{"lat":r[0],"lon":r[1],"elev":r[2],"dist":r[3],"time":t} for r,t in zip(records,times_pts)],
-               "distance":float(df["dist"].max()),"D_up":dup,"D_down":ddn,
-               "duration_hms":seconds_to_hms((end_dt-start_dt).total_seconds()),
-               "avg_temp":avgT,"avg_wind":avgW,"avg_humidity":avgH,"hr_analysis":hr_analysis}
-    except Exception as e:st.error(f"Erreur FIT:{e}");return None
+        file.seek(0)
+    except Exception:
+        pass
+    data = file.read() if hasattr(file, "read") else open(file, "rb").read()
+    if isinstance(data, str):
+        data = data.encode("latin-1")
+    return data
+
+def _fit_extract_fitparse(raw_bytes):
+    """Extraction via fitparse (moteur historique de l'app)."""
+    fit = FitFile(io.BytesIO(raw_bytes))
+    fit.parse()
+    records, times_pts, hr_records = [], [], []
+    start_global = elapsed_global = None
+    for msg in fit.get_messages("session"):
+        vals = {d.name: d.value for d in msg}
+        if isinstance(vals.get("start_time"), datetime):
+            start_global = vals["start_time"].replace(tzinfo=None)
+        if isinstance(vals.get("total_elapsed_time"), (int, float)):
+            elapsed_global = float(vals["total_elapsed_time"])
+    for msg in fit.get_messages("record"):
+        vals = {d.name: d.value for d in msg}
+        lat_r, lon_r = vals.get("position_lat"), vals.get("position_long")
+        if lat_r is None or lon_r is None:
+            continue
+        ts = vals.get("timestamp")
+        dt = ts.replace(tzinfo=None) if isinstance(ts, datetime) else None
+        alt = vals.get("enhanced_altitude") or vals.get("altitude") or 0.0
+        records.append((lat_r * SEMICIRCLE_TO_DEG, lon_r * SEMICIRCLE_TO_DEG,
+                        safe_float(alt, 0.0), safe_float(vals.get("distance"), 0.0)))
+        times_pts.append(dt)
+        hr = vals.get("heart_rate")
+        hr_records.append(int(hr) if hr is not None else None)
+    return records, times_pts, hr_records, start_global, elapsed_global
+
+def _fit_extract_fitdecode(raw_bytes):
+    """Extraction via fitdecode — tolérant aux champs de taille non standard
+    (il émet un simple warning là où fitparse s'arrête sur une exception)."""
+    records, times_pts, hr_records = [], [], []
+    start_global = elapsed_global = None
+    def gv(frame, name):
+        try:
+            return frame.get_value(name) if frame.has_field(name) else None
+        except Exception:
+            return None
+    kwargs = {}
+    if hasattr(fitdecode, "CrcCheck"):
+        kwargs["check_crc"] = fitdecode.CrcCheck.WARN   # CRC douteux ≠ fichier inutilisable
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # évite d'inonder la console Streamlit
+        with fitdecode.FitReader(io.BytesIO(raw_bytes), **kwargs) as fr:
+            for frame in fr:
+                if not isinstance(frame, fitdecode.FitDataMessage):
+                    continue
+                if frame.name == "session":
+                    stv = gv(frame, "start_time")
+                    if isinstance(stv, datetime):
+                        start_global = stv.replace(tzinfo=None)
+                    ev = gv(frame, "total_elapsed_time")
+                    if isinstance(ev, (int, float)):
+                        elapsed_global = float(ev)
+                    continue
+                if frame.name != "record":
+                    continue
+                lat_r, lon_r = gv(frame, "position_lat"), gv(frame, "position_long")
+                if lat_r is None or lon_r is None:
+                    continue
+                ts = gv(frame, "timestamp")
+                dt = ts.replace(tzinfo=None) if isinstance(ts, datetime) else None
+                alt = gv(frame, "enhanced_altitude")
+                if alt is None:
+                    alt = gv(frame, "altitude")
+                records.append((lat_r * SEMICIRCLE_TO_DEG, lon_r * SEMICIRCLE_TO_DEG,
+                                safe_float(alt, 0.0), safe_float(gv(frame, "distance"), 0.0)))
+                times_pts.append(dt)
+                hr = gv(frame, "heart_rate")
+                hr_records.append(int(hr) if hr is not None else None)
+    return records, times_pts, hr_records, start_global, elapsed_global
+
+def parse_fit_ref(file, tz_name=TZ_NAME_DEFAULT):
+    """Lit un FIT de référence. Essaie fitparse, puis bascule sur fitdecode si
+    fitparse refuse le fichier (champ de taille non standard, CRC, etc.)."""
+    try:
+        raw_bytes = _fit_read_bytes(file)
+    except Exception as e:
+        st.error(f"Erreur FIT : fichier illisible ({e})")
+        return None
+
+    records = times_pts = hr_records = None
+    start_global = elapsed_global = None
+    engine = None
+    err_fitparse = None
+    try:
+        records, times_pts, hr_records, start_global, elapsed_global = _fit_extract_fitparse(raw_bytes)
+        engine = "fitparse"
+    except Exception as e:
+        err_fitparse = e          # ex : Invalid field size 1 for type 'uint32'
+
+    if not records:
+        if not HAS_FITDECODE:
+            st.error(f"Erreur FIT : {err_fitparse}. Ce fichier utilise un encodage que fitparse "
+                     f"refuse ; installe fitdecode (`pip install fitdecode`) et recharge l'app — "
+                     f"la lecture basculera automatiquement dessus.")
+            return None
+        try:
+            records, times_pts, hr_records, start_global, elapsed_global = _fit_extract_fitdecode(raw_bytes)
+            engine = "fitdecode"
+        except Exception as e2:
+            st.error(f"Erreur FIT : illisible par fitparse ({err_fitparse}) et par fitdecode ({e2}).")
+            return None
+        if records and err_fitparse is not None:
+            st.caption(f"ℹ️ Fichier FIT non standard (fitparse : {err_fitparse}) — "
+                       f"lu avec fitdecode : {len(records)} points GPS récupérés.")
+
+    if not records:
+        st.error("Erreur FIT : aucun point GPS exploitable dans ce fichier "
+                 "(activité sans GPS, ou uniquement des tours/résumés).")
+        return None
+
+    df = pd.DataFrame(records, columns=["lat", "lon", "elev", "dist"])
+    valid_t = [t for t in times_pts if t is not None]
+    if len(valid_t) >= 2:
+        start_dt, end_dt = min(valid_t), max(valid_t)
+    elif start_global and elapsed_global:
+        start_dt = start_global
+        end_dt = start_global + timedelta(seconds=elapsed_global)
+    else:
+        start_dt = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        end_dt = start_dt + timedelta(minutes=5)
+
+    avgT, avgW, avgH = get_avg_weather(records[0][0], records[0][1], start_dt, end_dt, tz_name)
+    elev_arr = df["elev"].values
+    dup = float(np.sum(np.clip(np.diff(elev_arr), 0, None))) if elev_arr.size >= 2 else 0.0
+    ddn = float(-np.sum(np.clip(np.diff(elev_arr), None, 0))) if elev_arr.size >= 2 else 0.0
+
+    # Certains FIT (ou certains capteurs) n'écrivent pas le champ "distance" :
+    # on la recalcule alors depuis les coordonnées plutôt que de renvoyer 0 m.
+    dist_max = float(df["dist"].max())
+    if dist_max <= 1.0 and len(records) >= 2:
+        dist_max = sum(haversine_m(records[i-1][0], records[i-1][1], records[i][0], records[i][1])
+                       for i in range(1, len(records)))
+
+    return {"points": [{"lat": r[0], "lon": r[1], "elev": r[2], "dist": r[3], "time": t}
+                       for r, t in zip(records, times_pts)],
+            "distance": dist_max, "D_up": dup, "D_down": ddn,
+            "duration_hms": seconds_to_hms((end_dt - start_dt).total_seconds()),
+            "avg_temp": avgT, "avg_wind": avgW, "avg_humidity": avgH,
+            "hr_analysis": analyze_hr_v3(hr_records), "parser": engine}
 
 def parse_tcx_ref(file,tz_name=TZ_NAME_DEFAULT):
     try:file.seek(0);root=ET.parse(file).getroot()
