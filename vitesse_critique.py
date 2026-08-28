@@ -860,8 +860,12 @@ def load_activity(file):
                     except:return default
                 ts=fv("timestamp");hr=fv("heart_rate");spd=fv("speed")
                 dist=fv("distance");alt=fv("enhanced_altitude") or fv("altitude")
+                # v8.7 : cadence (souvent enregistrée par jambe → normalisée plus tard)
+                cad=fv("cadence");frac=fv("fractional_cadence")
+                cad_tot=(float(cad)+float(frac or 0.0)) if cad is not None else None
                 if ts is None:continue
-                rows.append({"timestamp":ts,"heart_rate":hr,"speed_ms":spd,"distance_m":dist,"altitude_m":alt})
+                rows.append({"timestamp":ts,"heart_rate":hr,"speed_ms":spd,"distance_m":dist,"altitude_m":alt,
+                             "cadence_spm":cad_tot})
         if not rows:return None
         df=pd.DataFrame(rows)
         df["timestamp"]=pd.to_datetime(df["timestamp"],utc=True,errors="coerce")
@@ -871,7 +875,18 @@ def load_activity(file):
         file.seek(0);gpx=gpxpy.parse(file);rows=[]
         for track in gpx.tracks:
             for seg in track.segments:
-                for pt in seg.points:rows.append({"timestamp":pt.time,"heart_rate":None,"speed_ms":None,"distance_m":None,"altitude_m":pt.elevation or 0.0})
+                for pt in seg.points:
+                    # v8.7 : FC / cadence éventuellement présentes dans les extensions Garmin
+                    _hr_g=_cad_g=None
+                    for _ext in (getattr(pt,"extensions",None) or []):
+                        for _el in list(_ext.iter()) if hasattr(_ext,"iter") else []:
+                            _tag=str(getattr(_el,"tag","")).lower()
+                            try:_val=float(_el.text)
+                            except:continue
+                            if _tag.endswith("hr"):_hr_g=_val
+                            elif _tag.endswith("cad"):_cad_g=_val
+                    rows.append({"timestamp":pt.time,"heart_rate":_hr_g,"speed_ms":None,"distance_m":None,
+                                 "altitude_m":pt.elevation or 0.0,"cadence_spm":_cad_g})
         if not rows:return None
         df=pd.DataFrame(rows);df["timestamp"]=pd.to_datetime(df["timestamp"],utc=True,errors="coerce")
         df=df.sort_values("timestamp").reset_index(drop=True);t0=df["timestamp"].iloc[0]
@@ -890,12 +905,16 @@ def load_activity(file):
             tim=tp.find("tcx:Time",ns);hr_el=tp.find(".//tcx:Value",ns)
             spd_el=tp.find("tcx:Extensions/tcx:TPX/tcx:Speed",ns) or tp.find(".//tcx:Speed",ns)
             dist_el=tp.find("tcx:DistanceMeters",ns);alt_el=tp.find("tcx:AltitudeMeters",ns)
+            # v8.7 : cadence de course (extension Garmin ns3:RunCadence, sinon Cadence)
+            cad_el=tp.find(".//{*}RunCadence")
+            if cad_el is None:cad_el=tp.find("tcx:Cadence",ns)
             try:ts=datetime.fromisoformat(tim.text.replace("Z","+00:00"))
             except:continue
             rows.append({"timestamp":ts,"heart_rate":int(hr_el.text) if hr_el is not None else None,
                          "speed_ms":float(spd_el.text) if spd_el is not None else None,
                          "distance_m":float(dist_el.text) if dist_el is not None else None,
-                         "altitude_m":float(alt_el.text) if alt_el is not None else None})
+                         "altitude_m":float(alt_el.text) if alt_el is not None else None,
+                         "cadence_spm":float(cad_el.text) if cad_el is not None else None})
         if not rows:return None
         df=pd.DataFrame(rows);df["timestamp"]=pd.to_datetime(df["timestamp"],utc=True,errors="coerce")
         df=df.sort_values("timestamp").reset_index(drop=True);t0=df["timestamp"].iloc[0]
@@ -908,10 +927,11 @@ def load_activity(file):
             if "dist" in c:renames[c]="distance_m"
             if "alt" in c or "elev" in c:renames[c]="altitude_m"
             if "time" in c or "elapsed" in c:renames[c]="elapsed_s"
+            if "cad" in c:renames[c]="cadence_spm"
         df.rename(columns=renames,inplace=True)
         if "elapsed_s" not in df.columns:df["elapsed_s"]=range(len(df))
     if df is None:return None
-    for col in["heart_rate","speed_ms","distance_m","altitude_m","elapsed_s"]:
+    for col in["heart_rate","speed_ms","distance_m","altitude_m","elapsed_s","cadence_spm"]:
         if col not in df.columns:df[col]=None
         df[col]=pd.to_numeric(df[col],errors="coerce")
     df=df.dropna(subset=["elapsed_s"]).reset_index(drop=True)
@@ -950,6 +970,416 @@ def analyze_speed_kinetics(df):
     slope,intercept,r,p,_=sp_stats.linregress(x,arr)
     return{"available":True,"speed_avg_ms":round(float(np.mean(arr)),3),
            "speed_max_ms":round(float(np.percentile(arr,95)),3),"slope":round(slope,5),"r_value":round(r,3)}
+
+# ══════════════════════════════════════════════════════════════
+# v8.7 — ANALYSE TRAIL DE SÉANCE (onglet ⚙️ Analyse entraînement)
+#   A. Biomécanique course / marche : nuage vitesse × pente coloré par la
+#      cadence, avec détection de la ZONE DE TRANSITION (bande de pentes où
+#      l'on bascule de la course à la marche) et répartition du temps.
+#   B. Évolution par terrain : découpe la sortie en portions Montée /
+#      Relief roulant / Descente, calcule la VAP (Vitesse Ajustée à la Pente,
+#      modèle Minetti déjà utilisé par l'app) de chaque portion, et l'exprime
+#      en % de la PREMIÈRE portion qualifiée de la même famille → mesure la
+#      perte de performance au fil de la sortie, gradient par gradient.
+# ══════════════════════════════════════════════════════════════
+
+def vap_cost_ratio(grade_pct):
+    """Rapport de coût énergétique pente / plat (Minetti). Sert à convertir une
+    vitesse réelle en VAP : v_plat_équivalente = v_réelle × ratio."""
+    return float(minetti_cost(float(grade_pct) / 100.0) / minetti_cost(0.0))
+
+def build_trail_samples(df, window_s=20.0, grid_step_s=2.0,
+                        alt_smooth_s=30.0, pause_speed_kmh=1.0):
+    """Ré-échantillonne la séance sur une grille temporelle régulière et calcule,
+    sur une fenêtre glissante, la vitesse réelle, la pente instantanée, la
+    cadence et la FC. Les pauses (vitesse ~nulle : ravito, arrêt photo) sont
+    marquées pour être exclues des analyses.
+    Retourne (DataFrame, infos) ou (None, {"error": ...})."""
+    if df is None or "elapsed_s" not in df.columns:
+        return None, {"error": "Pas de base temps exploitable."}
+    d = df.dropna(subset=["elapsed_s"]).sort_values("elapsed_s").reset_index(drop=True)
+    if len(d) < 20:
+        return None, {"error": "Trop peu de points dans le fichier."}
+    t = d["elapsed_s"].astype(float).values
+    t_max = float(t[-1])
+    if t_max < 300:
+        return None, {"error": "Séance trop courte (< 5 min) pour cette analyse."}
+
+    # --- distance cumulée : champ distance sinon intégration de la vitesse ---
+    dist = d["distance_m"].astype(float).values if "distance_m" in d.columns else np.full(len(d), np.nan)
+    if np.isnan(dist).all() or np.nanmax(dist) <= 1.0:
+        if "speed_ms" in d.columns and d["speed_ms"].notna().any():
+            spd_fill = pd.Series(d["speed_ms"].astype(float)).interpolate().fillna(0.0).values
+            dist = np.concatenate([[0.0], np.cumsum(spd_fill[1:] * np.diff(t))])
+        else:
+            return None, {"error": "Ni distance ni vitesse dans ce fichier — impossible de calculer l'allure."}
+    dist = pd.Series(dist).interpolate(limit_direction="both").fillna(0.0).values
+    dist = np.maximum.accumulate(dist)  # distance monotone (anti-glitch capteur)
+
+    if "altitude_m" in d.columns and d["altitude_m"].notna().any():
+        alt = pd.Series(d["altitude_m"].astype(float)).interpolate(limit_direction="both").fillna(0.0).values
+    else:
+        return None, {"error": "Pas d'altitude dans ce fichier — analyse de pente impossible."}
+
+    grid = np.arange(0.0, t_max, float(grid_step_s))
+    if len(grid) < 30:
+        return None, {"error": "Séance trop courte pour cette analyse."}
+    dist_g = np.interp(grid, t, dist)
+    alt_g = np.interp(grid, t, alt)
+    # lissage altitude (médiane puis moyenne) : le bruit baro/GPS crée des pentes fantômes
+    w_alt = max(3, int(round(float(alt_smooth_s) / float(grid_step_s))))
+    if w_alt % 2 == 0:
+        w_alt += 1
+    alt_s = pd.Series(alt_g).rolling(w_alt, center=True, min_periods=1).median()
+    alt_s = alt_s.rolling(w_alt, center=True, min_periods=1).mean().values
+
+    half = max(1, int(round(float(window_s) / float(grid_step_s) / 2.0)))
+    n = len(grid)
+    i0 = np.clip(np.arange(n) - half, 0, n - 1)
+    i1 = np.clip(np.arange(n) + half, 0, n - 1)
+    dd = dist_g[i1] - dist_g[i0]
+    dt = grid[i1] - grid[i0]
+    de = alt_s[i1] - alt_s[i0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed_ms = np.where(dt > 0, dd / np.maximum(dt, 1e-9), 0.0)
+        grade = np.where(dd > 2.0, de / np.maximum(dd, 1e-9) * 100.0, 0.0)
+    grade = np.clip(np.nan_to_num(grade), -45.0, 45.0)
+    speed_kmh = np.clip(np.nan_to_num(speed_ms) * 3.6, 0.0, 35.0)
+
+    out = pd.DataFrame({"t_s": grid, "speed_kmh": speed_kmh, "grade_pct": grade,
+                        "dist_m": dist_g, "alt_m": alt_s})
+
+    # --- cadence (spm) ---
+    cad_available = False
+    cad_doubled = False
+    if "cadence_spm" in d.columns and d["cadence_spm"].notna().any():
+        cad_raw = pd.to_numeric(d["cadence_spm"], errors="coerce").values
+        valid = cad_raw[(~np.isnan(cad_raw)) & (cad_raw > 20)]
+        if len(valid) >= max(20, 0.20 * len(d)):
+            cad_g = np.interp(grid, t, pd.Series(cad_raw).interpolate(limit_direction="both").fillna(0.0).values)
+            med = float(np.median(valid))
+            if med < 110.0:          # cadence par jambe (rpm) → pas/min
+                cad_g = cad_g * 2.0
+                cad_doubled = True
+            w_c = max(3, int(round(10.0 / float(grid_step_s))))
+            out["cadence_spm"] = pd.Series(cad_g).rolling(w_c, center=True, min_periods=1).median().values
+            cad_available = True
+    if not cad_available:
+        out["cadence_spm"] = np.nan
+
+    if "heart_rate" in d.columns and d["heart_rate"].notna().any():
+        hr_raw = pd.to_numeric(d["heart_rate"], errors="coerce")
+        out["hr"] = np.interp(grid, t, hr_raw.interpolate(limit_direction="both").fillna(0.0).values)
+    else:
+        out["hr"] = np.nan
+
+    out["moving"] = out["speed_kmh"] >= float(pause_speed_kmh)
+    infos = {"cadence_available": cad_available, "cadence_doubled": cad_doubled,
+             "grid_step_s": float(grid_step_s), "window_s": float(window_s),
+             "n_samples": int(len(out)), "moving_s": float(out["moving"].sum() * grid_step_s),
+             "total_s": float(t_max), "dist_km": float(dist_g[-1] / 1000.0)}
+    return out, infos
+
+def classify_walk_run(samples, infos, cadence_threshold=135.0, speed_walk_kmh=7.0,
+                      run_speed_override_kmh=13.0):
+    """Marque chaque échantillon comme marche probable ou course.
+    Méthode 1 (fiable) : cadence < seuil → marche (la cadence chute nettement
+    au passage en marche, même en forte pente).
+    Méthode 2 (repli, sans cadence) : vitesse < seuil → marche probable."""
+    s = samples.copy()
+    if infos.get("cadence_available") and s["cadence_spm"].notna().any():
+        walk = s["cadence_spm"] < float(cadence_threshold)
+        walk &= s["speed_kmh"] < float(run_speed_override_kmh)   # cadence manquante/erronée à vitesse élevée
+        method = "cadence"
+    else:
+        walk = s["speed_kmh"] < float(speed_walk_kmh)
+        method = "vitesse"
+    s["is_walk"] = walk & s["moving"]
+    s["is_run"] = (~walk) & s["moving"]
+    return s, method
+
+def fit_walk_logistic(grades, is_walk):
+    """Ajuste P(marche) = 1 / (1 + exp(-(a + b·pente)) sur les échantillons en
+    montée. Une régression logistique lisse la relation et évite qu'une tranche
+    de pente peu peuplée (peu d'échantillons, donc bruitée) ne fasse sauter la
+    zone de transition de plusieurs points de pente d'une sortie à l'autre."""
+    g = np.asarray(grades, dtype=float)
+    y = np.asarray(is_walk, dtype=float)
+    if len(g) < 50 or y.sum() < 10 or (len(y) - y.sum()) < 10:
+        return None
+    def resid(p):
+        z = np.clip(p[0] + p[1] * g, -30, 30)
+        return 1.0 / (1.0 + np.exp(-z)) - y
+    try:
+        res = least_squares(resid, [-3.0, 0.2], max_nfev=2000)
+    except Exception:
+        return None
+    a, b = float(res.x[0]), float(res.x[1])
+    if not np.isfinite(a) or not np.isfinite(b) or b <= 1e-4:
+        return None
+    return a, b
+
+def _grade_at_p(fit, p):
+    if fit is None:
+        return None
+    a, b = fit
+    return float((math.log(p / (1.0 - p)) - a) / b)
+
+def detect_transition_zone(samples, bin_width=1.0, p_lo=0.25, p_hi=0.75, min_pts_per_bin=15):
+    """Zone de pentes où l'athlète bascule de la course à la marche.
+    Deux lectures complémentaires :
+      • la courbe brute : % de temps passé en marche par tranche de pente ;
+      • une régression logistique sur les pentes positives, dont on tire les
+        pentes correspondant à 25 %, 50 % et 75 % de marche → bornes de la zone.
+    Compare aussi le point de bascule (50 %) du 1er tiers et du dernier tiers de
+    la sortie : son glissement vers des pentes plus faibles est un marqueur de
+    fatigue (on se met à marcher de plus en plus tôt)."""
+    s = samples[samples["moving"]].copy()
+    if s.empty:
+        return None
+    bins = np.arange(np.floor(s["grade_pct"].min()), np.ceil(s["grade_pct"].max()) + bin_width, bin_width)
+    if len(bins) < 4:
+        return None
+    s["bin"] = pd.cut(s["grade_pct"], bins, labels=False, include_lowest=True)
+    grp = s.groupby("bin").agg(p_walk=("is_walk", "mean"), n=("is_walk", "size"),
+                               grade=("grade_pct", "mean"), speed=("speed_kmh", "median")).reset_index()
+    min_n = max(int(min_pts_per_bin), int(0.004 * len(s)))
+    grp = grp[grp["n"] >= min_n].sort_values("grade").reset_index(drop=True)
+    if len(grp) < 4:
+        return None
+    grp["p_walk_smooth"] = grp["p_walk"].rolling(3, center=True, min_periods=1).mean()
+
+    up = s[s["grade_pct"] >= 0.0]
+    fit = fit_walk_logistic(up["grade_pct"].values, up["is_walk"].values)
+    lo, mid, hi = (_grade_at_p(fit, p_lo), _grade_at_p(fit, 0.5), _grade_at_p(fit, p_hi))
+    g_max = float(s["grade_pct"].max())
+    extrapolated = bool(hi is not None and hi > g_max)
+
+    def _mid_supported(sub, m, half=3.0, min_n=25, min_share=0.12):
+        """Le point de bascule n'a de sens que si l'on a VRAIMENT couru ET marché
+        autour de cette pente. Si le parcours n'offre que du plat couru et des
+        raidillons marchés (rien entre les deux), n'importe quelle valeur
+        intermédiaire ajuste les données aussi bien : on préfère alors ne rien
+        annoncer plutôt qu'un chiffre non contraint par la donnée."""
+        if m is None:
+            return False
+        near = sub[(sub["grade_pct"] >= m - half) & (sub["grade_pct"] <= m + half)]
+        if len(near) < min_n:
+            return False
+        share = float(near["is_walk"].mean())
+        return min_share <= share <= (1.0 - min_share)
+
+    mid_supported = _mid_supported(up, mid)
+
+    # glissement du point de bascule entre le début et la fin de la sortie
+    mid_start = mid_end = None
+    if fit is not None and len(up) >= 400:
+        t_split = up["t_s"].quantile([0.333, 0.667]).values
+        first = up[up["t_s"] <= t_split[0]]
+        last = up[up["t_s"] >= t_split[1]]
+        def _mid_of(sub):
+            """Point de bascule d'un tiers de sortie, borné à la plage de pentes
+            réellement rencontrée dans ce tiers et validé par le test de support."""
+            f = fit_walk_logistic(sub["grade_pct"].values, sub["is_walk"].values)
+            m = _grade_at_p(f, 0.5)
+            if m is None:
+                return None
+            g_min = float(sub["grade_pct"].quantile(0.02)); g_mx = float(sub["grade_pct"].quantile(0.98))
+            m = float(min(max(m, g_min), g_mx))
+            return m if _mid_supported(sub, m, min_n=15) else None
+        mid_start = _mid_of(first)
+        mid_end = _mid_of(last)
+
+    return {"bins": grp, "slope_lo": lo, "slope_mid": mid, "slope_hi": hi,
+            "p_lo": p_lo, "p_hi": p_hi, "fit": fit, "extrapolated": extrapolated,
+            "grade_max": g_max, "mid_start": mid_start, "mid_end": mid_end,
+            "mid_supported": bool(mid_supported)}
+
+def walk_run_summary(samples, grid_step_s):
+    """Répartition du temps en mouvement entre course et marche probable."""
+    s = samples[samples["moving"]]
+    n = len(s)
+    if n == 0:
+        return None
+    walk_s = float(s["is_walk"].sum() * grid_step_s)
+    run_s = float(s["is_run"].sum() * grid_step_s)
+    tot = max(1e-6, walk_s + run_s)
+    d_walk = float(np.sum(np.diff(np.concatenate([[0], s["dist_m"].values]))[s["is_walk"].values]))
+    return {"walk_s": walk_s, "run_s": run_s, "pct_walk": walk_s / tot * 100.0,
+            "pct_run": run_s / tot * 100.0,
+            "walk_speed_med": float(s.loc[s["is_walk"], "speed_kmh"].median()) if s["is_walk"].any() else None,
+            "run_speed_med": float(s.loc[s["is_run"], "speed_kmh"].median()) if s["is_run"].any() else None,
+            "walk_grade_med": float(s.loc[s["is_walk"], "grade_pct"].median()) if s["is_walk"].any() else None}
+
+def plot_biomecanique(samples, transition, summary, infos, method,
+                      cadence_threshold=135.0, speed_walk_kmh=7.0):
+    """Nuage vitesse réelle × pente, coloré par la cadence, + zone de transition."""
+    s = samples[samples["moving"]]
+    if len(s) > 6000:                       # allège le rendu sur les grosses sorties
+        s = s.sample(6000, random_state=0).sort_values("t_s")
+    fig, ax = plt.subplots(figsize=(11.5, 4.6))
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list(
+        "cad", ["#22c55e", "#3b82f6", "#8b5cf6", "#ec4899"])
+    if infos.get("cadence_available"):
+        c = s["cadence_spm"].values
+        vmin = float(np.nanpercentile(c, 2)); vmax = float(np.nanpercentile(c, 98))
+        sc = ax.scatter(s["grade_pct"], s["speed_kmh"], c=c, cmap=cmap,
+                        vmin=vmin, vmax=vmax, s=7, alpha=0.55, linewidths=0)
+        cb = fig.colorbar(sc, ax=ax, pad=0.085)
+        cb.set_label("Cadence (pas/min)", fontsize=8)
+        cb.ax.tick_params(labelsize=7)
+    else:
+        colors = np.where(s["is_walk"], "#22c55e", "#3b82f6")
+        ax.scatter(s["grade_pct"], s["speed_kmh"], c=colors, s=7, alpha=0.5, linewidths=0)
+        ax.scatter([], [], c="#3b82f6", s=25, label="Course")
+        ax.scatter([], [], c="#22c55e", s=25, label="Marche probable")
+
+    # médiane de vitesse par tranche de pente
+    if transition is not None:
+        gb = transition["bins"]
+        ax.plot(gb["grade"], gb["speed"], color="#f8fafc", lw=2.2, alpha=0.9, zorder=4)
+        ax.plot(gb["grade"], gb["speed"], color="#0f172a", lw=1.1, alpha=0.9, zorder=5,
+                label="Vitesse médiane par pente")
+        lo, hi = transition.get("slope_lo"), transition.get("slope_hi")
+        if lo is not None and hi is not None and hi > lo:
+            x_lo, x_hi = ax.get_xlim()
+            ax.axvspan(max(lo, x_lo), min(hi, x_hi), color="#64748b", alpha=0.26, zorder=1)
+            for xv in (lo, hi):
+                if x_lo <= xv <= x_hi:
+                    ax.axvline(xv, color="#475569", lw=1.2, ls="--", zorder=3)
+            y_top = ax.get_ylim()[1]
+            x_mid = min(max((lo + hi) / 2, x_lo + 1), x_hi - 1)
+            ax.annotate("zone de transition", xy=(x_mid, y_top * 0.97), ha="center",
+                        va="top", fontsize=8.5, color="#334155", fontweight="bold")
+            if x_lo <= lo <= x_hi:
+                ax.annotate(f"{lo:.0f} %", xy=(lo, y_top * 0.90), ha="right", va="top", fontsize=8, color="#334155")
+            if x_lo <= hi <= x_hi:
+                ax.annotate(f"{hi:.0f} %", xy=(hi, y_top * 0.90), ha="left", va="top", fontsize=8, color="#334155")
+        if transition.get("fit") is not None:      # courbe P(marche) sur axe droit
+            ax2 = ax.twinx()
+            gg = np.linspace(0, max(1.0, transition.get("grade_max", 30.0)), 120)
+            a, b = transition["fit"]
+            ax2.plot(gg, 100.0 / (1.0 + np.exp(-(a + b * gg))), color="#16a34a", lw=1.6, alpha=0.75)
+            ax2.set_ylim(0, 100); ax2.set_ylabel("P(marche) — %", fontsize=8, color="#16a34a")
+            ax2.tick_params(axis="y", labelsize=7, colors="#16a34a")
+    ax.axvline(0, color="gray", lw=0.8, alpha=0.6)
+    ax.set_xlabel("Pente (%)"); ax.set_ylabel("Vitesse réelle (km/h)")
+    title = "Biomécanique course / marche — répartition vitesse × pente (pauses exclues)"
+    ax.set_title(title, fontsize=10.5)
+    ax.grid(alpha=0.25)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
+    fig.tight_layout()
+    return fig
+
+# ── B. Évolution par terrain (VAP indexée sur la 1re portion de chaque famille) ──
+
+TERRAIN_FAMILIES = [("Montée", "#3b82f6", "M"), ("Relief roulant", "#94a3b8", "P"), ("Descente", "#0ea5e9", "D")]
+
+def segment_terrain_portions(samples, up_thr=4.0, down_thr=-4.0,
+                             min_dur_s=120.0, min_dist_m=300.0, class_smooth_s=60.0):
+    """Découpe la sortie en portions homogènes de terrain et calcule la VAP de
+    chacune. Le temps de référence est le temps en MOUVEMENT (pauses exclues),
+    pour que deux sorties avec des ravitos différents restent comparables."""
+    s = samples.copy()
+    step = float(s["t_s"].iloc[1] - s["t_s"].iloc[0]) if len(s) > 1 else 1.0
+    cls = np.where(s["grade_pct"] >= up_thr, 1, np.where(s["grade_pct"] <= down_thr, -1, 0)).astype(float)
+    w = max(3, int(round(float(class_smooth_s) / step)))
+    if w % 2 == 0:
+        w += 1
+    cls = pd.Series(cls).rolling(w, center=True, min_periods=1).median().round().fillna(0).values
+    s["cls"] = cls
+    s["moving_s_cum"] = np.cumsum(np.where(s["moving"], step, 0.0))
+
+    portions = []
+    _b = np.flatnonzero(np.diff(cls) != 0) + 1
+    _starts = np.concatenate([[0], _b]).astype(int)
+    _ends = np.concatenate([_b, [len(cls)]]).astype(int)
+    for start, i in zip(_starts, _ends):
+        seg = s.iloc[start:i]
+        seg_mov = seg[seg["moving"]]
+        dur = float(len(seg_mov) * step)
+        dist = float(seg["dist_m"].iloc[-1] - seg["dist_m"].iloc[0])
+        if dur >= float(min_dur_s) and dist >= float(min_dist_m) and len(seg_mov) >= 5:
+            ratios = np.array([vap_cost_ratio(g) for g in seg_mov["grade_pct"].values])
+            vap_kmh = float(np.mean(seg_mov["speed_kmh"].values * ratios))
+            d_elev = np.diff(seg["alt_m"].values)
+            fam = {1: "Montée", -1: "Descente", 0: "Relief roulant"}[int(seg["cls"].iloc[0])]
+            portions.append({
+                "famille": fam,
+                "t_start_s": float(seg["moving_s_cum"].iloc[0]),
+                "t_mid_s": float((seg_mov["moving_s_cum"].iloc[0] + seg_mov["moving_s_cum"].iloc[-1]) / 2.0),
+                "t_end_s": float(seg_mov["moving_s_cum"].iloc[-1]),
+                "dur_s": dur, "dist_m": dist,
+                "d_plus": float(np.sum(np.clip(d_elev, 0, None))),
+                "d_moins": float(-np.sum(np.clip(d_elev, None, 0))),
+                "grade_med": float(seg_mov["grade_pct"].median()),
+                "speed_kmh": float(dist / max(1.0, dur) * 3.6),
+                "vap_kmh": vap_kmh,
+                "hr": float(seg_mov["hr"].mean()) if seg_mov["hr"].notna().any() else None,
+                "pct_walk": float(seg_mov["is_walk"].mean() * 100.0) if "is_walk" in seg_mov.columns else None,
+            })
+    # indexation : la 1re portion qualifiée de chaque famille = 100 %
+    refs = {}
+    for p in portions:
+        if p["famille"] not in refs:
+            refs[p["famille"]] = p["vap_kmh"]
+        p["vap_ref_kmh"] = refs[p["famille"]]
+        p["index_pct"] = p["vap_kmh"] / max(1e-6, refs[p["famille"]]) * 100.0
+    counters = {}
+    for p in portions:
+        pref = {"Montée": "M", "Relief roulant": "P", "Descente": "D"}[p["famille"]]
+        counters[pref] = counters.get(pref, 0) + 1
+        p["label"] = f"{pref}{counters[pref]}"
+    return portions
+
+def terrain_trends(portions):
+    """Pente de dégradation (points d'index perdus par heure) et dernière portion
+    comparable, par famille de terrain."""
+    out = {}
+    for fam, color, pref in TERRAIN_FAMILIES:
+        fam_p = [p for p in portions if p["famille"] == fam]
+        if len(fam_p) < 2:
+            out[fam] = {"n": len(fam_p), "slope_pts_per_h": None,
+                        "last_pct": fam_p[-1]["index_pct"] if fam_p else None,
+                        "last_label": fam_p[-1]["label"] if fam_p else None, "r2": None,
+                        "vap_ref": fam_p[0]["vap_kmh"] if fam_p else None}
+            continue
+        x = np.array([p["t_mid_s"] / 3600.0 for p in fam_p])
+        y = np.array([p["index_pct"] for p in fam_p])
+        slope, intercept, r, _, _ = sp_stats.linregress(x, y)
+        out[fam] = {"n": len(fam_p), "slope_pts_per_h": float(slope), "r2": float(r ** 2),
+                    "last_pct": float(y[-1]), "last_label": fam_p[-1]["label"],
+                    "vap_ref": float(fam_p[0]["vap_kmh"]), "intercept": float(intercept)}
+    return out
+
+def plot_terrain_evolution(portions, trends):
+    """Index de VAP (% de la 1re portion de la même famille) au fil de la sortie."""
+    fig, ax = plt.subplots(figsize=(11.5, 4.4))
+    for fam, color, pref in TERRAIN_FAMILIES:
+        fam_p = [p for p in portions if p["famille"] == fam]
+        if not fam_p:
+            continue
+        x = [p["t_mid_s"] / 3600.0 for p in fam_p]
+        y = [p["index_pct"] for p in fam_p]
+        ax.plot(x, y, "-o", color=color, lw=1.8, ms=6, label=f"{fam} (n={len(fam_p)})")
+        for p in fam_p:
+            ax.annotate(f"{p['label']}\n{p['index_pct']:.0f}%", xy=(p["t_mid_s"] / 3600.0, p["index_pct"]),
+                        xytext=(0, 9), textcoords="offset points", ha="center", fontsize=6.5, color=color)
+        tr = trends.get(fam, {})
+        if tr.get("slope_pts_per_h") is not None and len(fam_p) >= 3:
+            xs = np.linspace(min(x), max(x), 20)
+            ax.plot(xs, tr["intercept"] + tr["slope_pts_per_h"] * xs, ls="--", lw=1.2, color=color, alpha=0.55)
+    ax.axhline(100, color="#334155", lw=1.2, ls=":", label="Niveau de référence (1re portion)")
+    y0, y1 = ax.get_ylim()
+    ax.set_ylim(y0 - 2, max(y1, 100) + 6)     # marge pour les étiquettes de portions
+    ax.set_xlabel("Temps d'effort depuis le départ (h, pauses exclues)")
+    ax.set_ylabel("VAP en % de la 1re portion")
+    ax.set_title("Évolution par terrain — VAP indexée sur la première portion de chaque famille", fontsize=10.5)
+    ax.grid(alpha=0.25); ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    return fig
 
 def compute_vc(distances_m,durations_s):
     T=np.array(durations_s,dtype=float);D=np.array(distances_m,dtype=float)
@@ -3886,6 +4316,180 @@ with main_tabs[2]:
                     ax_pace.set_yticklabels([pace_str(t) for t in yticks if t > 0], fontsize=8)
                     fig_pace.tight_layout()
                     st.pyplot(fig_pace); plt.close(fig_pace)
+
+            st.markdown("---")
+            st.subheader("🏔️ Analyse trail — course / marche & tenue de la performance")
+            st.caption("Deux lectures d'une sortie trail : (1) à partir de quelle pente tu bascules de la course "
+                       "à la marche, (2) comment ta VAP (Vitesse Ajustée à la Pente) se dégrade au fil de la "
+                       "sortie, séparément en montée, sur le plat et en descente. Pauses exclues dans les deux cas.")
+
+            with st.expander("⚙️ Réglages de l'analyse trail", expanded=False):
+                tc1, tc2, tc3 = st.columns(3)
+                trail_window_s = tc1.slider("Fenêtre vitesse / pente (s)", 10, 60, 20, 5, key="trail_win",
+                                            help="Fenêtre glissante de calcul. Plus large = moins de bruit GPS, "
+                                                 "mais transitions course/marche moins nettes.")
+                trail_alt_smooth = tc2.slider("Lissage altitude (s)", 10, 90, 30, 5, key="trail_alt")
+                trail_pause_kmh = tc3.slider("Seuil de pause (km/h)", 0.5, 3.0, 1.0, 0.5, key="trail_pause",
+                                             help="En dessous : ravito, arrêt photo… exclu de toute l'analyse.")
+                tc4, tc5 = st.columns(2)
+                trail_cad_thr = tc4.slider("Seuil cadence marche / course (pas/min)", 100, 165, 135, 1,
+                                           key="trail_cad",
+                                           help="En dessous de ce seuil de cadence, l'échantillon est classé "
+                                                "« marche ». 130-140 convient à la plupart des coureurs.")
+                trail_walk_kmh = tc5.slider("Seuil vitesse marche (km/h) — si pas de cadence", 3.0, 10.0, 7.0, 0.5,
+                                            key="trail_walkspd")
+                tc6, tc7, tc8 = st.columns(3)
+                trail_up_thr = tc6.slider("Pente mini d'une montée (%)", 2.0, 12.0, 4.0, 0.5, key="trail_up")
+                trail_dn_thr = tc7.slider("Pente maxi d'une descente (%)", -12.0, -2.0, -4.0, 0.5, key="trail_dn")
+                trail_min_dur = tc8.slider("Durée mini d'une portion (min)", 1, 15, 2, 1, key="trail_mindur")
+                trail_min_dist = st.slider("Distance mini d'une portion (m)", 100, 2000, 300, 50, key="trail_mindist",
+                                           help="Une portion doit durer ET mesurer assez pour être comparable aux "
+                                                "autres. Monte ces deux seuils si le découpage est trop haché.")
+
+            samples_tr, infos_tr = build_trail_samples(
+                df_train, window_s=trail_window_s, alt_smooth_s=trail_alt_smooth,
+                pause_speed_kmh=trail_pause_kmh)
+
+            if samples_tr is None:
+                st.info(f"Analyse trail indisponible — {infos_tr.get('error', 'données insuffisantes')}")
+            else:
+                samples_tr, wr_method = classify_walk_run(
+                    samples_tr, infos_tr, cadence_threshold=trail_cad_thr, speed_walk_kmh=trail_walk_kmh)
+                tz_tr = detect_transition_zone(samples_tr)
+                wr_sum = walk_run_summary(samples_tr, infos_tr["grid_step_s"])
+
+                # ── A. Biomécanique course / marche ──────────────────────────
+                st.markdown("#### 🦵 Biomécanique course / marche")
+                if wr_method == "cadence":
+                    st.caption("Classement course / marche basé sur la **cadence** (méthode fiable)."
+                               + (" Cadence lue par jambe puis doublée en pas/min."
+                                  if infos_tr.get("cadence_doubled") else ""))
+                else:
+                    st.warning("⚠️ Pas de cadence exploitable dans ce fichier — classement de repli basé sur la "
+                               "seule **vitesse**. À prendre comme un ordre de grandeur : une marche rapide en "
+                               "faux plat et un footing lent en côte ne se distinguent pas.")
+                if wr_sum:
+                    bc1, bc2, bc3, bc4 = st.columns(4)
+                    bc1.metric("Course", f"{wr_sum['pct_run']:.0f} %", delta=seconds_to_hms(wr_sum["run_s"]),
+                               delta_color="off")
+                    bc2.metric("Marche probable", f"{wr_sum['pct_walk']:.0f} %",
+                               delta=seconds_to_hms(wr_sum["walk_s"]), delta_color="off")
+                    if tz_tr and tz_tr.get("slope_lo") is not None and tz_tr.get("slope_hi") is not None:
+                        bc3.metric("Zone de transition",
+                                   f"{tz_tr['slope_lo']:.0f} → {tz_tr['slope_hi']:.0f} %")
+                        bc4.metric("Bascule (50 % de marche)", f"{tz_tr['slope_mid']:.0f} %")
+                    else:
+                        bc3.metric("Zone de transition", "—")
+                        bc4.metric("Bascule (50 % de marche)", "—")
+                fig_bio = plot_biomecanique(samples_tr, tz_tr, wr_sum, infos_tr, wr_method,
+                                            cadence_threshold=trail_cad_thr, speed_walk_kmh=trail_walk_kmh)
+                st.pyplot(fig_bio); plt.close(fig_bio)
+
+                if tz_tr and tz_tr.get("slope_lo") is not None and tz_tr.get("slope_hi") is not None:
+                    _extra = (" ⚠️ La borne haute est extrapolée : la sortie ne contient pas de pentes assez "
+                              "raides pour l'observer directement."
+                              if tz_tr.get("extrapolated") else "")
+                    if not tz_tr.get("mid_supported", True):
+                        _extra += (" ⚠️ Peu de données autour de ce point de bascule (parcours en tout ou rien : "
+                                   "du plat couru, des raidillons marchés, rien entre les deux) — l'estimation "
+                                   "est peu contrainte sur cette sortie.")
+                    st.info(f"🚶 **Zone de transition : {tz_tr['slope_lo']:.0f} % → {tz_tr['slope_hi']:.0f} %.** "
+                            f"En dessous de {tz_tr['slope_lo']:.0f} % tu cours l'essentiel du temps ; au-dessus de "
+                            f"{tz_tr['slope_hi']:.0f} % tu marches presque toujours ; le basculement se fait vers "
+                            f"**{tz_tr['slope_mid']:.0f} %** de pente.{_extra}")
+                    if tz_tr.get("mid_start") is not None and tz_tr.get("mid_end") is not None:
+                        _drift = tz_tr["mid_end"] - tz_tr["mid_start"]
+                        if _drift <= -1.5:
+                            st.warning(f"📉 Glissement au fil de la sortie : point de bascule à "
+                                       f"**{tz_tr['mid_start']:.0f} %** sur le 1er tiers → **{tz_tr['mid_end']:.0f} %** "
+                                       f"sur le dernier ({_drift:+.0f} points). Tu passes en marche sur des pentes de "
+                                       f"plus en plus faibles : marqueur de fatigue musculaire/énergétique.")
+                        elif _drift >= 1.5:
+                            st.success(f"📈 Point de bascule à **{tz_tr['mid_start']:.0f} %** sur le 1er tiers → "
+                                       f"**{tz_tr['mid_end']:.0f} %** sur le dernier ({_drift:+.0f} points) : tu cours "
+                                       f"des pentes plus raides en fin de sortie (départ prudent, ou terrain plus "
+                                       f"roulant en seconde partie).")
+                        else:
+                            st.caption(f"Point de bascule stable sur la sortie : {tz_tr['mid_start']:.0f} % "
+                                       f"(1er tiers) → {tz_tr['mid_end']:.0f} % (dernier tiers).")
+                    if wr_sum and wr_sum.get("walk_speed_med") and wr_sum.get("run_speed_med"):
+                        st.caption(f"Vitesse médiane en marche : **{wr_sum['walk_speed_med']:.1f} km/h** "
+                                   f"(pente médiane {wr_sum['walk_grade_med']:.0f} %) · en course : "
+                                   f"**{wr_sum['run_speed_med']:.1f} km/h**.")
+                else:
+                    st.caption("Pas assez de contraste course / marche sur cette sortie pour situer une zone de "
+                               "transition (sortie trop roulante, ou cadence peu exploitable).")
+
+                # ── B. Évolution par terrain (VAP indexée) ───────────────────
+                st.markdown("#### 📉 Évolution par terrain — baisse de performance au fil de la sortie")
+                st.caption("Chaque portion qualifiée est comparée à la **première portion de la même famille** "
+                           "(1re descente, 1er relief roulant, 1re montée = 100 %). La comparaison se fait en VAP "
+                           "— vitesse ramenée à son équivalent sur le plat via le coût énergétique de Minetti — "
+                           "pour que deux montées de pentes différentes restent comparables.")
+                portions_tr = segment_terrain_portions(
+                    samples_tr, up_thr=trail_up_thr, down_thr=trail_dn_thr,
+                    min_dur_s=trail_min_dur * 60.0, min_dist_m=trail_min_dist)
+                if len(portions_tr) < 2:
+                    st.info("Pas assez de portions qualifiées pour comparer (sortie trop courte ou trop hachée). "
+                            "Baisse la durée/distance minimale d'une portion dans les réglages ci-dessus.")
+                else:
+                    trends_tr = terrain_trends(portions_tr)
+                    tcols = st.columns(3)
+                    for _col, (_fam, _color, _pref) in zip(tcols, TERRAIN_FAMILIES):
+                        _tr = trends_tr.get(_fam, {})
+                        if not _tr or _tr.get("last_pct") is None:
+                            _col.metric(_fam, "—", help="Aucune portion qualifiée de ce type.")
+                            continue
+                        _col.metric(f"{_fam} — dernière portion ({_tr['last_label']})",
+                                    f"{_tr['last_pct']:.1f} %",
+                                    delta=f"{_tr['last_pct'] - 100:+.1f} pts",
+                                    delta_color="normal")
+                        if _tr.get("slope_pts_per_h") is not None:
+                            _col.caption(f"{_tr['n']} portions · tendance **{_tr['slope_pts_per_h']:+.1f} pts/h** "
+                                         f"(R²={_tr['r2']:.2f}) · VAP de référence {_tr['vap_ref']:.2f} km/h")
+                        else:
+                            _col.caption(f"{_tr['n']} portion — pas de tendance calculable (il en faut au moins 2).")
+                    fig_terr = plot_terrain_evolution(portions_tr, trends_tr)
+                    st.pyplot(fig_terr); plt.close(fig_terr)
+
+                    _worst = None
+                    for _fam, _c, _p in TERRAIN_FAMILIES:
+                        _tr = trends_tr.get(_fam, {})
+                        if _tr.get("last_pct") is not None and _tr.get("n", 0) >= 2:
+                            if _worst is None or _tr["last_pct"] < _worst[1]["last_pct"]:
+                                _worst = (_fam, _tr)
+                    if _worst:
+                        _f, _t = _worst
+                        st.info(f"**{_f} · plus grand écart observé** — dernière portion comparable "
+                                f"({_t['last_label']}) : **{_t['last_pct']:.1f} %** du niveau de référence, soit "
+                                f"**{_t['last_pct'] - 100:+.1f} points**.")
+
+                    rows_tr = []
+                    for p in portions_tr:
+                        rows_tr.append({
+                            "Portion": p["label"], "Terrain": p["famille"],
+                            "Début (effort)": seconds_to_hms(p["t_start_s"]),
+                            "Durée": seconds_to_hms(p["dur_s"]),
+                            "Dist (km)": round(p["dist_m"] / 1000.0, 2),
+                            "D+ (m)": round(p["d_plus"]), "D- (m)": round(p["d_moins"]),
+                            "Pente méd. (%)": round(p["grade_med"], 1),
+                            "Vitesse réelle (km/h)": round(p["speed_kmh"], 2),
+                            "Allure réelle": pace_str(3600.0 / max(0.1, p["speed_kmh"])) + "/km",
+                            "VAP (km/h)": round(p["vap_kmh"], 2),
+                            "VAP (allure)": pace_str(3600.0 / max(0.1, p["vap_kmh"])) + "/km",
+                            "% réf. famille": round(p["index_pct"], 1),
+                            "FC moy.": round(p["hr"]) if p.get("hr") else "—",
+                            "% marche": round(p["pct_walk"]) if p.get("pct_walk") is not None else "—",
+                        })
+                    df_tr = pd.DataFrame(rows_tr)
+                    st.dataframe(df_tr, use_container_width=True, hide_index=True)
+                    st.download_button("⬇️ Portions de terrain (CSV)",
+                                       data=df_tr.to_csv(index=False).encode("utf-8"),
+                                       file_name=f"portions_terrain_{train_file.name.split('.')[0]}.csv",
+                                       mime="text/csv", key="dl_portions_terrain")
+                    st.caption("⚠️ La VAP repose sur un modèle de coût énergétique (Minetti) : elle compare des "
+                               "efforts, pas des chronos. Une baisse d'index peut aussi venir du terrain "
+                               "(technicité, sol gras, nuit) ou d'un choix de gestion, pas seulement de la fatigue.")
 
             st.markdown("---")
             st.subheader("📐 Analyse d'intervalles")
