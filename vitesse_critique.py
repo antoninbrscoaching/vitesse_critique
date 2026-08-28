@@ -5,17 +5,17 @@
 #     Phase 1 (parcours) reste pilotée par le profil terrain / JSON de
 #     cohorte comme avant. Phase 2 (optionnelle, décochée par défaut)
 #     AJOUTE une fatigue personnelle plus tardive, détectée sur tes
-#     propres références (section 2️⃣), par-dessus la phase 1 — au lieu
+#     propres références (section 2), par-dessus la phase 1 — au lieu
 #     de la remplacer comme le faisait la v8.4. Le R² du point de rupture
 #     est affiché à côté du réglage pour juger de sa fiabilité.
 #
 # NOUVEAUTÉS v8.4 :
 #   - Signature de fatigue personnelle (seuil/taux) désormais calculée
-#     AUTOMATIQUEMENT depuis tes propres courses de référence (section 2️⃣
+#     AUTOMATIQUEMENT depuis tes propres courses de référence (section 2
 #     de l'onglet Prédiction, FIT/TCX importés) — plus besoin de passer par
 #     l'onglet 🧪 Tests d'endurance + VC ni de cliquer sur un bouton
 #     séparé. La détection tourne dans le même passage de script que le
-#     reste de la section 4️⃣, donc pas de décalage d'un run à l'autre.
+#     reste de la section 4, donc pas de décalage d'un run à l'autre.
 #     L'onglet Vitesse Critique reste dédié à l'analyse des tests
 #     d'effort/entraînement, sans lien avec la prédiction de course.
 # NOUVEAUTÉS v8.2 :
@@ -29,13 +29,13 @@
 #     parcours réel — sans ce patch, un parcours type UTMB pouvait être
 #     largement sous-estimé en temps.
 #   - Détection du point de rupture sur tests à effort maximal (onglet VC,
-#     section 4️⃣) : pour chaque test importé en FIT/TCX, détecte le moment où
+#     section 4) : pour chaque test importé en FIT/TCX, détecte le moment où
 #     l'allure décroche le plus nettement, en % de la durée totale. Comparer
 #     ce % entre tests de durées différentes permet de repérer une signature
 #     de fatigue propre à l'athlète, utilisable comme point de départ pour le
 #     seuil de fatigue en course longue.
 #   - Import direct de profils calibrés (JSON) dans l'onglet Prédiction,
-#     section 4️⃣ : plus besoin de repasser par l'onglet Cohorte pour
+#     section 4 : plus besoin de repasser par l'onglet Cohorte pour
 #     appliquer un profil déjà calibré — le fichier profils_calibres.json
 #     (exporté depuis l'onglet Cohorte ou depuis l'artefact de calibration)
 #     se dépose directement ici et les coefficients s'appliquent aussitôt.
@@ -117,17 +117,139 @@ from scipy.optimize import least_squares
 st.set_page_config(page_title="Coach Running — Suite complète", layout="wide", page_icon="🏃")
 TZ_NAME_DEFAULT = "Europe/Paris"
 
-st.markdown("""
+# ══════════════════════════════════════════════════════════════
+# v8.8 — CHARTE GRAPHIQUE (fond noir, texte blanc, accents rouges)
+# Uniquement du rendu : aucun calcul, aucun seuil, aucune fonctionnalité
+# n'est modifié par ce bloc.
+# ══════════════════════════════════════════════════════════════
+C_BG        = "#0B0B0E"   # fond de page
+C_SURFACE   = "#111116"   # fond des graphiques et des cartes
+C_SURFACE_2 = "#17171E"   # fond des blocs secondaires (sidebar, expanders)
+C_LINE      = "#23232C"   # bordures / grille
+C_TEXT      = "#F5F5F7"   # texte principal
+C_TEXT_MUT  = "#A5AAB3"   # texte secondaire
+C_RED       = "#E63946"   # accent principal
+C_RED_SOFT  = "#FF7A83"   # accent secondaire (seuil n°2, bandes)
+C_WHITE     = "#D9D4CB"   # série neutre claire
+C_GREY      = "#7F8C99"   # série neutre froide
+C_DIM       = "#4A4F58"   # traces brutes / éléments très en retrait
+# Ordre FIXE des séries catégorielles (jamais recyclé au-delà de 8) :
+# séparation CVD vérifiée (ΔE ≥ 19 sur toutes les paires adjacentes, fond #111116).
+CHART_CYCLE = [C_RED, C_WHITE, C_GREY, C_RED_SOFT, "#B9B2A6", "#5C6875", "#FFB3B8", "#8E8579"]
+
+plt.rcParams.update({
+    "figure.facecolor": C_SURFACE, "savefig.facecolor": C_SURFACE,
+    "axes.facecolor": C_SURFACE, "axes.edgecolor": C_LINE, "axes.linewidth": 1.0,
+    "axes.labelcolor": C_TEXT_MUT, "axes.titlecolor": C_TEXT,
+    "axes.titlesize": 11.5, "axes.titleweight": "600", "axes.titlelocation": "left",
+    "axes.titlepad": 12, "axes.labelsize": 9.5, "axes.labelpad": 7,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "axes.axisbelow": True,
+    "grid.color": C_LINE, "grid.linewidth": 0.8, "grid.alpha": 0.9,
+    "text.color": C_TEXT, "xtick.color": C_TEXT_MUT, "ytick.color": C_TEXT_MUT,
+    "xtick.labelsize": 8.5, "ytick.labelsize": 8.5,
+    "xtick.major.size": 0, "ytick.major.size": 0,
+    "legend.facecolor": C_SURFACE_2, "legend.edgecolor": C_LINE, "legend.framealpha": 0.95,
+    "legend.labelcolor": C_TEXT, "legend.fontsize": 8.5, "legend.borderpad": 0.6,
+    "figure.autolayout": False, "font.size": 9.5,
+    "axes.prop_cycle": plt.cycler(color=CHART_CYCLE),
+})
+
+def chart_title(ax, title, subtitle=None):
+    """Titre de graphique en deux niveaux (titre blanc + sous-titre gris)."""
+    ax.set_title(title, color=C_TEXT, fontsize=11.5, fontweight="600", loc="left", pad=(22 if subtitle else 12))
+    if subtitle:
+        ax.annotate(subtitle, xy=(0, 1.0), xycoords="axes fraction", xytext=(0, 12),
+                    textcoords="offset points", fontsize=8.5, color=C_TEXT_MUT, ha="left", va="bottom")
+
+def kpi_row(items):
+    """Rangée de cartes chiffre-clé : libellé discret, grande valeur blanche,
+    filet rouge. items = [(libellé, valeur, précision|None), ...]"""
+    cards = "".join(
+        f'<div class="kpi-card"><div class="kpi-label">{lbl}</div>'
+        f'<div class="kpi-value">{val}</div>'
+        f'<div class="kpi-sub">{sub or "&nbsp;"}</div></div>'
+        for lbl, val, sub in items)
+    st.markdown(f'<div class="kpi-row">{cards}</div>', unsafe_allow_html=True)
+
+st.markdown(f"""
 <style>
-.param-box {background:#f8f9fa;border-left:4px solid #1f77b4;border-radius:4px;padding:8px 12px;margin-bottom:8px;font-size:0.88rem;}
-.param-up{color:#d62728;font-weight:600;}.param-down{color:#2ca02c;font-weight:600;}
-.highlight-box{background:#e8f0fe;border:1px solid #6c8ebf;border-radius:6px;padding:12px 16px;margin:8px 0;color:#1a3a5c;}
-.test-card{background:#ffffff;border:1px solid #dee2e6;border-radius:8px;padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.07);}
-.test-card h4{margin:0 0 8px 0;color:#1f77b4;font-size:1rem;}
-.result-metric{text-align:center;font-size:1.4rem;font-weight:700;}
-.sidebar-label{background:#e8f4fd;border-radius:4px;padding:6px 10px;font-size:0.80rem;color:#1f77b4;margin-bottom:10px;}
-.interval-card{background:#f0f4ff;border:1px solid #b0c4de;border-radius:8px;padding:10px 14px;margin-bottom:8px;}
-.terrain-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:0.78rem;font-weight:600;margin-bottom:6px;}
+:root {{
+  --bg:{C_BG}; --surface:{C_SURFACE}; --surface2:{C_SURFACE_2}; --line:{C_LINE};
+  --text:{C_TEXT}; --muted:{C_TEXT_MUT}; --red:{C_RED};
+}}
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{background:var(--bg);}}
+[data-testid="stSidebar"] {{background:var(--surface); border-right:1px solid var(--line);}}
+html, body, .stApp, p, li, label, span, div {{color:var(--text);}}
+h1, h2, h3, h4, h5 {{color:var(--text); font-weight:650; letter-spacing:-0.01em;}}
+h1 {{font-size:1.85rem;}} h2 {{font-size:1.25rem;}} h3 {{font-size:1.05rem;}}
+h2::after {{content:""; display:block; width:44px; height:3px; background:var(--red);
+            border-radius:2px; margin-top:8px;}}
+[data-testid="stCaptionContainer"], .stCaption, small {{color:var(--muted) !important;}}
+
+/* Onglets */
+.stTabs [data-baseweb="tab-list"] {{gap:2px; border-bottom:1px solid var(--line);}}
+.stTabs [data-baseweb="tab"] {{background:transparent; color:var(--muted); border-radius:8px 8px 0 0;
+    padding:10px 16px; font-size:0.92rem;}}
+.stTabs [aria-selected="true"] {{background:var(--surface); color:var(--text) !important;
+    box-shadow:inset 0 -2px 0 var(--red);}}
+
+/* Cartes chiffres-clés */
+.kpi-row {{display:flex; flex-wrap:wrap; gap:10px; margin:6px 0 14px 0;}}
+.kpi-card {{flex:1 1 150px; background:var(--surface); border:1px solid var(--line);
+    border-radius:12px; padding:13px 16px 12px 16px; position:relative; overflow:hidden;}}
+.kpi-card::before {{content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--red);}}
+.kpi-label {{font-size:0.68rem; text-transform:uppercase; letter-spacing:0.09em; color:var(--muted);
+    margin-bottom:6px;}}
+.kpi-value {{font-size:1.55rem; font-weight:700; color:var(--text); line-height:1.15;
+    font-variant-numeric:tabular-nums;}}
+.kpi-sub {{font-size:0.72rem; color:var(--muted); margin-top:3px;}}
+
+/* Métriques natives Streamlit */
+[data-testid="stMetric"] {{background:var(--surface); border:1px solid var(--line);
+    border-radius:12px; padding:12px 16px;}}
+[data-testid="stMetricLabel"] p {{color:var(--muted) !important; font-size:0.72rem !important;
+    text-transform:uppercase; letter-spacing:0.07em;}}
+[data-testid="stMetricValue"] {{color:var(--text); font-variant-numeric:tabular-nums;}}
+
+/* Blocs de texte */
+.param-box{{background:var(--surface); border-left:3px solid var(--red); border-radius:8px;
+    padding:9px 13px; margin-bottom:8px; font-size:0.86rem; color:var(--muted);}}
+.param-up{{color:{C_RED}; font-weight:600;}} .param-down{{color:{C_WHITE}; font-weight:600;}}
+.highlight-box{{background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--red);
+    border-radius:10px; padding:13px 17px; margin:10px 0; color:var(--text); font-size:0.90rem;}}
+.test-card{{background:var(--surface); border:1px solid var(--line); border-radius:12px;
+    padding:15px 17px; margin-bottom:12px;}}
+.test-card h4{{margin:0 0 10px 0; color:var(--text); font-size:1rem;}}
+.result-metric{{text-align:center; font-size:1.4rem; font-weight:700; color:var(--text);}}
+.sidebar-label{{background:var(--surface2); border-left:3px solid var(--red); border-radius:8px;
+    padding:8px 11px; font-size:0.78rem; color:var(--muted); margin-bottom:12px;}}
+.interval-card{{background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    padding:11px 15px; margin-bottom:8px;}}
+.terrain-badge{{display:inline-block; padding:4px 12px; border-radius:20px; font-size:0.76rem;
+    font-weight:600; margin-bottom:6px;}}
+.note-box{{background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    padding:11px 15px; margin:8px 0; font-size:0.86rem; color:var(--muted);}}
+.note-box b, .note-box strong {{color:var(--text);}}
+.note-red{{border-left:3px solid var(--red);}}
+
+/* Contrôles */
+.stButton>button, .stDownloadButton>button {{background:var(--surface); color:var(--text);
+    border:1px solid var(--line); border-radius:9px; padding:6px 15px; font-weight:550;}}
+.stButton>button:hover, .stDownloadButton>button:hover {{border-color:var(--red); color:var(--text);}}
+.stButton>button[kind="primary"] {{background:var(--red); border-color:var(--red); color:#fff;}}
+[data-testid="stExpander"] {{background:var(--surface); border:1px solid var(--line); border-radius:12px;}}
+[data-testid="stExpander"] summary {{color:var(--text);}}
+[data-testid="stFileUploaderDropzone"] {{background:var(--surface); border:1px dashed var(--line);}}
+[data-testid="stDataFrame"] {{border:1px solid var(--line); border-radius:10px;}}
+hr {{border-color:var(--line);}}
+
+/* Encarts st.info / st.warning / st.success / st.error */
+[data-testid="stAlert"], [data-testid="stAlertContainer"], [data-testid="stNotification"] {{
+    background:var(--surface) !important; border:1px solid var(--line) !important;
+    border-left:3px solid var(--red) !important; border-radius:10px; color:var(--text) !important;}}
+[data-testid="stAlert"] p, [data-testid="stAlertContainer"] p {{color:var(--text) !important;}}
+[data-testid="stAlert"] svg {{fill:var(--red);}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1213,69 +1335,101 @@ def walk_run_summary(samples, grid_step_s):
 
 def plot_biomecanique(samples, transition, summary, infos, method,
                       cadence_threshold=135.0, speed_walk_kmh=7.0):
-    """Nuage vitesse réelle × pente, coloré par la cadence, + zone de transition."""
+    """Deux panneaux partageant l'axe des pentes (jamais deux échelles sur un même
+    axe) : en haut le nuage vitesse réelle × pente coloré par la cadence, en bas
+    la probabilité de marche et la zone de transition."""
     s = samples[samples["moving"]]
     if len(s) > 6000:                       # allège le rendu sur les grosses sorties
         s = s.sample(6000, random_state=0).sort_values("t_s")
-    fig, ax = plt.subplots(figsize=(11.5, 4.6))
+    fig, (ax, axp) = plt.subplots(
+        2, 1, figsize=(11.5, 6.0), sharex=True,
+        gridspec_kw={"height_ratios": [3.0, 1.0], "hspace": 0.12})
+
+    lo = hi = mid = None
+    if transition is not None:
+        lo, hi, mid = transition.get("slope_lo"), transition.get("slope_hi"), transition.get("slope_mid")
+
+    # ── panneau haut : nuage vitesse × pente ──────────────────────────────
     from matplotlib.colors import LinearSegmentedColormap
     cmap = LinearSegmentedColormap.from_list(
-        "cad", ["#22c55e", "#3b82f6", "#8b5cf6", "#ec4899"])
+        "cad", [C_RED, "#C4707A", C_GREY, C_WHITE, "#FFFFFF"])
     if infos.get("cadence_available"):
         c = s["cadence_spm"].values
         vmin = float(np.nanpercentile(c, 2)); vmax = float(np.nanpercentile(c, 98))
         sc = ax.scatter(s["grade_pct"], s["speed_kmh"], c=c, cmap=cmap,
-                        vmin=vmin, vmax=vmax, s=7, alpha=0.55, linewidths=0)
-        cb = fig.colorbar(sc, ax=ax, pad=0.085)
-        cb.set_label("Cadence (pas/min)", fontsize=8)
-        cb.ax.tick_params(labelsize=7)
+                        vmin=vmin, vmax=vmax, s=7, alpha=0.65, linewidths=0)
+        cb = fig.colorbar(sc, ax=[ax, axp], pad=0.015, fraction=0.028, aspect=34)
+        cb.set_label("Cadence (pas/min)", fontsize=8, color=C_TEXT_MUT)
+        cb.ax.tick_params(labelsize=7, colors=C_TEXT_MUT)
+        cb.outline.set_edgecolor(C_LINE)
     else:
-        colors = np.where(s["is_walk"], "#22c55e", "#3b82f6")
-        ax.scatter(s["grade_pct"], s["speed_kmh"], c=colors, s=7, alpha=0.5, linewidths=0)
-        ax.scatter([], [], c="#3b82f6", s=25, label="Course")
-        ax.scatter([], [], c="#22c55e", s=25, label="Marche probable")
+        ax.scatter(s.loc[s["is_run"], "grade_pct"], s.loc[s["is_run"], "speed_kmh"],
+                   c=C_WHITE, s=7, alpha=0.55, linewidths=0, label="Course")
+        ax.scatter(s.loc[s["is_walk"], "grade_pct"], s.loc[s["is_walk"], "speed_kmh"],
+                   c=C_RED, s=7, alpha=0.55, linewidths=0, label="Marche probable")
 
-    # médiane de vitesse par tranche de pente
     if transition is not None:
         gb = transition["bins"]
-        ax.plot(gb["grade"], gb["speed"], color="#f8fafc", lw=2.2, alpha=0.9, zorder=4)
-        ax.plot(gb["grade"], gb["speed"], color="#0f172a", lw=1.1, alpha=0.9, zorder=5,
+        ax.plot(gb["grade"], gb["speed"], color=C_SURFACE, lw=4.0, zorder=4)      # liseré de fond
+        ax.plot(gb["grade"], gb["speed"], color=C_TEXT, lw=2.0, zorder=5,
                 label="Vitesse médiane par pente")
-        lo, hi = transition.get("slope_lo"), transition.get("slope_hi")
-        if lo is not None and hi is not None and hi > lo:
-            x_lo, x_hi = ax.get_xlim()
-            ax.axvspan(max(lo, x_lo), min(hi, x_hi), color="#64748b", alpha=0.26, zorder=1)
+    ax.axvline(0, color=C_LINE, lw=1.0)
+    ax.set_ylabel("Vitesse réelle (km/h)")
+    ax.set_ylim(bottom=0)
+    chart_title(ax, "Biomécanique course / marche",
+                "Un point toutes les 2 s, hors pauses · couleur = cadence · la zone rouge est la bascule vers la marche")
+    if not infos.get("cadence_available"):
+        ax.legend(loc="lower left", markerscale=2.4)
+    elif transition is not None:
+        ax.legend(loc="lower left")
+
+    # ── panneau bas : probabilité de marche ───────────────────────────────
+    if transition is not None and transition.get("fit") is not None:
+        a, b = transition["fit"]
+        gg = np.linspace(0, max(1.0, transition.get("grade_max", 30.0)), 160)
+        pw = 100.0 / (1.0 + np.exp(-(a + b * gg)))
+        axp.fill_between(gg, 0, pw, color=C_RED, alpha=0.18, linewidth=0)
+        axp.plot(gg, pw, color=C_RED, lw=2.0)
+    gbins = transition["bins"] if transition is not None else None
+    if gbins is not None:
+        axp.plot(gbins["grade"], gbins["p_walk"] * 100.0, ls="none", marker="o", ms=3.5,
+                 color=C_TEXT_MUT, alpha=0.75, label="Mesuré par tranche de pente")
+        axp.legend(loc="upper left", fontsize=7.5, borderpad=0.4)
+    axp.axhline(50, color=C_LINE, lw=1.0, ls=":")
+    axp.set_ylim(0, 105); axp.set_yticks([0, 50, 100])
+    axp.set_yticklabels(["0 %", "50 %", "100 %"])
+    axp.set_ylabel("Temps passé\nen marche")
+    axp.set_xlabel("Pente (%)")
+
+    # ── zone de transition, reportée sur les deux panneaux ────────────────
+    if lo is not None and hi is not None and hi > lo:
+        x_lo, x_hi = ax.get_xlim()
+        for _a in (ax, axp):
+            _a.axvspan(max(lo, x_lo), min(hi, x_hi), color=C_RED, alpha=0.10, zorder=0)
             for xv in (lo, hi):
                 if x_lo <= xv <= x_hi:
-                    ax.axvline(xv, color="#475569", lw=1.2, ls="--", zorder=3)
-            y_top = ax.get_ylim()[1]
-            x_mid = min(max((lo + hi) / 2, x_lo + 1), x_hi - 1)
-            ax.annotate("zone de transition", xy=(x_mid, y_top * 0.97), ha="center",
-                        va="top", fontsize=8.5, color="#334155", fontweight="bold")
-            if x_lo <= lo <= x_hi:
-                ax.annotate(f"{lo:.0f} %", xy=(lo, y_top * 0.90), ha="right", va="top", fontsize=8, color="#334155")
-            if x_lo <= hi <= x_hi:
-                ax.annotate(f"{hi:.0f} %", xy=(hi, y_top * 0.90), ha="left", va="top", fontsize=8, color="#334155")
-        if transition.get("fit") is not None:      # courbe P(marche) sur axe droit
-            ax2 = ax.twinx()
-            gg = np.linspace(0, max(1.0, transition.get("grade_max", 30.0)), 120)
-            a, b = transition["fit"]
-            ax2.plot(gg, 100.0 / (1.0 + np.exp(-(a + b * gg))), color="#16a34a", lw=1.6, alpha=0.75)
-            ax2.set_ylim(0, 100); ax2.set_ylabel("P(marche) — %", fontsize=8, color="#16a34a")
-            ax2.tick_params(axis="y", labelsize=7, colors="#16a34a")
-    ax.axvline(0, color="gray", lw=0.8, alpha=0.6)
-    ax.set_xlabel("Pente (%)"); ax.set_ylabel("Vitesse réelle (km/h)")
-    title = "Biomécanique course / marche — répartition vitesse × pente (pauses exclues)"
-    ax.set_title(title, fontsize=10.5)
-    ax.grid(alpha=0.25)
-    if ax.get_legend_handles_labels()[0]:
-        ax.legend(fontsize=8, loc="lower left", framealpha=0.85)
-    fig.tight_layout()
+                    _a.axvline(xv, color=C_RED, lw=1.1, ls="--", alpha=0.75, zorder=2)
+        y_top = ax.get_ylim()[1]
+        x_mid = min(max((lo + hi) / 2, x_lo + 2), x_hi - 2)
+        ax.annotate("ZONE DE TRANSITION", xy=(x_mid, y_top * 0.985), ha="center", va="top",
+                    fontsize=8, color=C_RED, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.35", fc=C_SURFACE, ec="none"))
+        ax.annotate(f"{lo:.0f} %  →  {hi:.0f} %", xy=(x_mid, y_top * 0.90), ha="center", va="top",
+                    fontsize=8.5, color=C_TEXT)
+        if mid is not None:
+            axp.annotate(f"bascule\n{mid:.0f} %", xy=(mid, 50), xytext=(0, 14),
+                         textcoords="offset points", ha="center", va="bottom",
+                         fontsize=7.5, color=C_TEXT)
+        ax.annotate("je cours", xy=(x_lo + (lo - x_lo) * 0.45, ax.get_ylim()[1] * 0.10),
+                    ha="center", fontsize=8.5, color=C_TEXT_MUT)
+        if hi < x_hi:
+            ax.annotate("je marche", xy=(hi + (x_hi - hi) * 0.5, ax.get_ylim()[1] * 0.10),
+                        ha="center", fontsize=8.5, color=C_TEXT_MUT)
     return fig
 
 # ── B. Évolution par terrain (VAP indexée sur la 1re portion de chaque famille) ──
 
-TERRAIN_FAMILIES = [("Montée", "#3b82f6", "M"), ("Relief roulant", "#94a3b8", "P"), ("Descente", "#0ea5e9", "D")]
+TERRAIN_FAMILIES = [("Montée", C_RED, "M"), ("Relief roulant", C_GREY, "P"), ("Descente", C_WHITE, "D")]
 
 def segment_terrain_portions(samples, up_thr=4.0, down_thr=-4.0,
                              min_dur_s=120.0, min_dist_m=300.0, class_smooth_s=60.0):
@@ -1355,29 +1509,55 @@ def terrain_trends(portions):
     return out
 
 def plot_terrain_evolution(portions, trends):
-    """Index de VAP (% de la 1re portion de la même famille) au fil de la sortie."""
-    fig, ax = plt.subplots(figsize=(11.5, 4.4))
+    """Index de VAP (% de la 1re portion de la même famille) au fil de la sortie.
+    Étiquettes sélectives : uniquement la dernière portion de chaque famille — le
+    détail complet est dans le tableau sous le graphique."""
+    fig, ax = plt.subplots(figsize=(11.5, 4.8))
+    ends = []
     for fam, color, pref in TERRAIN_FAMILIES:
         fam_p = [p for p in portions if p["famille"] == fam]
         if not fam_p:
             continue
         x = [p["t_mid_s"] / 3600.0 for p in fam_p]
         y = [p["index_pct"] for p in fam_p]
-        ax.plot(x, y, "-o", color=color, lw=1.8, ms=6, label=f"{fam} (n={len(fam_p)})")
-        for p in fam_p:
-            ax.annotate(f"{p['label']}\n{p['index_pct']:.0f}%", xy=(p["t_mid_s"] / 3600.0, p["index_pct"]),
-                        xytext=(0, 9), textcoords="offset points", ha="center", fontsize=6.5, color=color)
         tr = trends.get(fam, {})
         if tr.get("slope_pts_per_h") is not None and len(fam_p) >= 3:
             xs = np.linspace(min(x), max(x), 20)
-            ax.plot(xs, tr["intercept"] + tr["slope_pts_per_h"] * xs, ls="--", lw=1.2, color=color, alpha=0.55)
-    ax.axhline(100, color="#334155", lw=1.2, ls=":", label="Niveau de référence (1re portion)")
-    y0, y1 = ax.get_ylim()
-    ax.set_ylim(y0 - 2, max(y1, 100) + 6)     # marge pour les étiquettes de portions
+            ax.plot(xs, tr["intercept"] + tr["slope_pts_per_h"] * xs, ls="--", lw=1.1,
+                    color=color, alpha=0.45, zorder=3)
+        ax.plot(x, y, "-", color=color, lw=2.0, zorder=4, label=f"{fam} ({len(fam_p)} portions)")
+        ax.plot(x, y, "o", color=color, ms=7, mec=C_SURFACE, mew=1.6, zorder=5)
+        if len(fam_p) > 1:
+            ends.append((x[-1], y[-1], f"{fam_p[-1]['label']} · {y[-1]:.0f} %", color))
+
+    y_vals = [p["index_pct"] for p in portions]
+    y_min = min(y_vals + [100.0]); y_max = max(y_vals + [100.0])
+    span = max(6.0, y_max - y_min)
+    y0, y1 = y_min - span * 0.22, y_max + span * 0.18
+    ax.set_ylim(y0, y1)
+    ax.axhspan(y0, 100, color=C_RED, alpha=0.05, zorder=0)          # sous la référence
+    ax.axhline(100, color=C_TEXT_MUT, lw=1.2, ls=":", zorder=2)
+    ax.annotate("niveau de référence — 1re portion de chaque terrain = 100 %",
+                xy=(0.995, 100), xycoords=("axes fraction", "data"), xytext=(0, 7),
+                textcoords="offset points", ha="right", va="bottom", fontsize=7.5, color=C_TEXT_MUT)
+
+    # étiquettes de fin, écartées verticalement pour rester lisibles
+    x_max = max([p["t_mid_s"] / 3600.0 for p in portions])
+    ax.set_xlim(left=-0.05, right=x_max * 1.20 + 0.05)
+    ends.sort(key=lambda e: e[1], reverse=True)
+    offsets = [18, 0, -18][:len(ends)] if len(ends) > 1 else [0]
+    for (xe, ye, txt, col), dy in zip(ends, offsets):
+        ax.annotate(txt, xy=(xe, ye), xytext=(12, dy), textcoords="offset points",
+                    ha="left", va="center", fontsize=8.5, color=col, fontweight="600",
+                    bbox=dict(boxstyle="round,pad=0.28", fc=C_SURFACE, ec="none", alpha=0.9),
+                    arrowprops=dict(arrowstyle="-", color=col, alpha=0.35, lw=0.9,
+                                    shrinkA=2, shrinkB=4))
     ax.set_xlabel("Temps d'effort depuis le départ (h, pauses exclues)")
     ax.set_ylabel("VAP en % de la 1re portion")
-    ax.set_title("Évolution par terrain — VAP indexée sur la première portion de chaque famille", fontsize=10.5)
-    ax.grid(alpha=0.25); ax.legend(fontsize=8, loc="best")
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _p: f"{v:.0f} %"))
+    chart_title(ax, "Tenue de la performance par type de terrain",
+                "VAP = vitesse ramenée à son équivalent sur le plat · chaque terrain comparé à sa propre première portion")
+    ax.legend(loc="lower left", ncol=3)
     fig.tight_layout()
     return fig
 
@@ -2521,7 +2701,7 @@ def get_all_terrain_profiles():
     """Fusionne les 4 profils génériques v8.1 avec les profils calibrés par
     course (sauvegardés depuis l'onglet 👥 Analyse de cohorte, en session ou
     importés via JSON — soit depuis là, soit directement depuis l'onglet
-    Prédiction section 4️⃣). Les profils calibrés ont la priorité en cas de
+    Prédiction section 4). Les profils calibrés ont la priorité en cas de
     clé identique (ne devrait pas arriver en pratique, noms distincts)."""
     merged = dict(TERRAIN_PROFILES)
     merged.update(st.session_state.get("custom_terrain_profiles", {}))
@@ -2616,7 +2796,7 @@ SURFACE_OPTIONS = {
 # duplication de logique de calibration).
 # ══════════════════════════════════════════════════════════════
 
-COHORT_PALETTE = ["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#db2777","#0891b2","#65a30d"]
+COHORT_PALETTE = list(CHART_CYCLE)
 
 _DIST_RE = re.compile(r"^(\d+[.,]?\d*)\s*km$")
 _ELEV_CUM_RE = re.compile(r"^(\d+)\s*m\+$")
@@ -2776,7 +2956,7 @@ def plot_cohort_pace_chart(athletes_list, checkpoints_list):
         ax.plot(x, y, color=a["color"], lw=2, marker="o" if len(x) < 60 else None, ms=3,
                 ls="--" if a.get("dashed") else "-", label=a["name"])
     for cp in checkpoints_list:
-        ax.axvline(cp["km"], color="#f59e0b", lw=1, ls=":", alpha=0.6)
+        ax.axvline(cp["km"], color=C_RED, lw=1, ls=":", alpha=0.6)
     ax.invert_yaxis()
     ax.set_xlabel("Distance (km)"); ax.set_ylabel("Allure")
     yticks = ax.get_yticks()
@@ -2796,11 +2976,11 @@ def plot_cohort_cp_chart(athletes_list, checkpoints_list):
         ax.plot(x, y, color=a["color"], lw=2, marker="o", ms=5, ls="--" if a.get("dashed") else "-", label=a["name"])
     ymin, ymax = ax.get_ylim()
     for idx, cp in enumerate(checkpoints_list):
-        ax.axvline(cp["km"], color="#94a3b8", lw=0.5, ls=":", alpha=0.4, zorder=0)
+        ax.axvline(cp["km"], color=C_TEXT_MUT, lw=0.5, ls=":", alpha=0.4, zorder=0)
         y_offset = 8 if idx % 2 == 0 else 26  # alterne la hauteur pour limiter le chevauchement
         ax.annotate(f"{cp['name']}\nkm {cp['km']:.1f}", xy=(cp["km"], ymax),
                     xytext=(0, y_offset), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=7, color="#475569")
+                    ha="center", va="bottom", fontsize=7, color=C_TEXT_MUT)
     ax.set_xlabel("Distance (km)"); ax.set_ylabel("Temps cumulé")
     yticks = ax.get_yticks()
     ax.set_yticks(yticks)
@@ -2903,7 +3083,7 @@ with main_tabs[0]:
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
-        mode=st.radio("Mode d'interface",["🟢 Simple (recommandé)","🔵 Expert (tous les curseurs)"],horizontal=True,key="pred_mode")
+        mode=st.radio("Mode d'interface",["Simple (recommandé)","Expert (tous les curseurs)"],horizontal=True,key="pred_mode")
     EXPERT="Expert" in mode
 
     st.markdown("---")
@@ -2915,14 +3095,14 @@ with main_tabs[0]:
 
     # ── v8.1 : suggestion auto. du profil terrain (étape 1/2 — sans GPX) ──
     # Doit être placé AVANT l'instanciation du widget terrain_profil_radio
-    # (section 4️⃣) dans ce même run, sinon Streamlit lève une
+    # (section 4) dans ce même run, sinon Streamlit lève une
     # StreamlitAPIException ("cannot be modified after widget is instantiated").
     if st.session_state.get("_last_mode_activite_for_suggestion") != mode_activite:
         st.session_state["_last_mode_activite_for_suggestion"] = mode_activite
         st.session_state["terrain_profil_radio"] = "🛣️ Route / Plat" if not IS_TRAIL else "🏔️ Trail modéré"
 
     st.markdown("---")
-    st.header("1️⃣  Parcours GPX")
+    st.header("01 · Parcours GPX")
     gpx_file=st.file_uploader("📂 Importer le GPX de la course cible",type=["gpx"],key="gpx_main")
     points=None;dem_elevations=None
 
@@ -2941,7 +3121,7 @@ with main_tabs[0]:
 
             # ── v8.1 : suggestion auto. du profil terrain (étape 2/2 — affinée sur D+/km réel) ──
             # Mêmes garanties d'ordre que l'étape 1 : ce bloc s'exécute en
-            # section 1️⃣, donc toujours avant le widget terrain_profil_radio (section 4️⃣).
+            # section 1, donc toujours avant le widget terrain_profil_radio (section 4).
             _dplus_per_km_tmp = dup_tmp / max(tot_tmp/1000.0, 0.001)
             if IS_TRAIL:
                 if _dplus_per_km_tmp < 30: _suggested_profile = "🏞️ Trail roulant / peu technique"
@@ -2954,7 +3134,7 @@ with main_tabs[0]:
                 st.session_state["terrain_profil_radio"] = _suggested_profile
             st.info(f"🤖 Profil de terrain suggéré : **{_suggested_profile}** "
                     f"(D+ = {_dplus_per_km_tmp:.0f} m/km sur {tot_tmp/1000:.1f} km) — "
-                    f"appliqué automatiquement, modifiable dans la section 4️⃣ si besoin.")
+                    f"appliqué automatiquement, modifiable dans la section 4 si besoin.")
 
             if IS_TRAIL:
                 st.markdown("---")
@@ -2967,7 +3147,7 @@ with main_tabs[0]:
                 if tech_global.get("global_score", 0) > 0:
                     score=tech_global["global_score"]; label=tech_global["label"]
                     pct_tech=tech_global.get("pct_technique",0)
-                    badge_css=("background:#fee2e2;color:#991b1b" if score>0.65 else "background:#fef3c7;color:#92400e" if score>0.40 else "background:#d1fae5;color:#065f46")
+                    badge_css=(("background:rgba(230,57,70,0.18);color:"+C_RED+";border:1px solid rgba(230,57,70,0.45)") if score>0.65 else ("background:"+C_SURFACE_2+";color:"+C_RED_SOFT+";border:1px solid "+C_LINE) if score>0.40 else ("background:"+C_SURFACE_2+";color:"+C_TEXT_MUT+";border:1px solid "+C_LINE))
                     st.markdown(f'<span style="{badge_css};border-radius:6px;padding:3px 10px;font-size:0.82rem;font-weight:700;">{label} — score {score:.2f}/1.00</span>',unsafe_allow_html=True)
                     c1,c2,c3,c4=st.columns(4)
                     c1.metric("Score technique global",f"{score:.2f}/1.00"); c2.metric("Segments techniques",f"{pct_tech:.0f}%")
@@ -2980,10 +3160,10 @@ with main_tabs[0]:
                             st.dataframe(df_tech[[c for c in cols_show if c in df_tech.columns]],use_container_width=True,hide_index=True)
                             fig_tech,ax_tech=plt.subplots(figsize=(11,3))
                             km_mids=[(s["km_start"]+s["km_end"])/2 for s in tech_segs]; scores=[s["tech_score"] for s in tech_segs]
-                            colors_t=["#22c55e" if s<0.25 else "#eab308" if s<0.5 else "#f97316" if s<0.75 else "#ef4444" for s in scores]
+                            colors_t=[C_DIM if s<0.25 else C_GREY if s<0.5 else C_RED_SOFT if s<0.75 else C_RED for s in scores]
                             ax_tech.bar(km_mids,scores,width=0.85,color=colors_t,alpha=0.85)
-                            ax_tech.axhline(0.5,color="orange",lw=1,ls="--",label="Seuil technique")
-                            ax_tech.axhline(0.75,color="red",lw=1,ls="--",label="Seuil très technique")
+                            ax_tech.axhline(0.5,color=C_RED,lw=1,ls="--",label="Seuil technique")
+                            ax_tech.axhline(0.75,color=C_RED,lw=1,ls="--",label="Seuil très technique")
                             ax_tech.set_xlabel("Distance (km)"); ax_tech.set_ylabel("Score technique")
                             ax_tech.set_title("Score de technicité par km"); ax_tech.legend(); ax_tech.set_ylim(0,1); ax_tech.grid(alpha=0.3); fig_tech.tight_layout()
                             st.pyplot(fig_tech); plt.close(fig_tech)
@@ -3028,7 +3208,7 @@ with main_tabs[0]:
                 SURFACE_OPTIONS["🤖 Détecté automatiquement (OSM)"]=osm.get("surface_mult_osm",1.06)
 
     st.markdown("---")
-    st.header("2️⃣  Courses de référence")
+    st.header("02 · Courses de référence")
     st.info("Calibrent le modèle sur l'athlète. Minimum conseillé : **3 références** variées. Chargez des fichiers FIT/TCX pour inclure la FC.")
 
     if "n_refs" not in st.session_state:st.session_state.n_refs=3
@@ -3103,7 +3283,7 @@ with main_tabs[0]:
                         if ref_breakpoint and ref_breakpoint.get("r2",0)>=0.3:
                             st.caption(f"🔍 Rupture d'allure détectée à {ref_breakpoint['pct_break']:.0f}% de cette "
                                        f"course (dégradation {ref_breakpoint['drop_pct']:+.0f}%, R²={ref_breakpoint['r2']:.2f}) "
-                                       f"— disponible en option pour la fatigue en section 4️⃣ (voir le R² avant de "
+                                       f"— disponible en option pour la fatigue en section 4 (voir le R² avant de "
                                        f"t'y fier : sous 0.6, le signal reste faible).")
             else:
                 if EXPERT:
@@ -3132,7 +3312,7 @@ with main_tabs[0]:
     # ruptures d'allure détectées ci-dessus sur tes propres références (aucune action
     # séparée requise, aucune dépendance à l'onglet 🧪 Tests d'endurance + VC).
     # Seuil de détection à 0.3 (affichage), mais le signal reste faible en dessous de
-    # 0.6 — la case reste décochée par défaut dans ce cas (voir section 4️⃣). Attention
+    # 0.6 — la case reste décochée par défaut dans ce cas (voir section 4). Attention
     # en particulier au transfert marathon → ultra-trail : le "mur" du marathon (déplétion
     # glycogénique ~30-35km) et la fatigue d'un ultra de plusieurs heures ne sont pas le
     # même phénomène physiologique, même quand la rupture est nette dans les données.
@@ -3154,7 +3334,7 @@ with main_tabs[0]:
 
 
     st.markdown("---")
-    st.header("3️⃣  Recalibration des références vers les conditions idéales")
+    st.header("03 · Recalibration des références vers les conditions idéales")
     st.markdown('<div class="highlight-box"><strong>Pourquoi recalibrer ?</strong><br>Une course réalisée par 30°C et 80% d\'humidité vaut <em>physiologiquement mieux</em> qu\'un temps identique par 10°C et temps sec.</div>',unsafe_allow_html=True)
     use_recalibrated=st.checkbox("✅ Recalibrer les références vers les conditions idéales (fortement recommandé)",value=True)
     opt_temp=10.0;use_wbgt=True;elev_ref_power=0.65;temp_ref_power=0.80
@@ -3202,10 +3382,10 @@ with main_tabs[0]:
                  "de tes références.")
         if _use_hr_regression:
             st.caption("Basé uniquement sur les FC observées lors des courses de référence — pas de valeurs normatives.")
-            # Priorité au temps RÉELLEMENT calculé (section 6️⃣, si déjà lancé) plutôt qu'à
+            # Priorité au temps RÉELLEMENT calculé (section 6, si déjà lancé) plutôt qu'à
             # l'estimation grossière (allure moyenne des références × distance GPX) — cette
             # dernière ne sert plus que de repli tant qu'aucun calcul n'a encore été fait.
-            # Comme cette section 3️⃣ s'exécute avant la section 6️⃣ dans le script, le résultat
+            # Comme cette section 3 s'exécute avant la section 6 dans le script, le résultat
             # utilisé est celui du dernier calcul lancé (léger décalage d'un run, comme pour
             # k_up_val ailleurs dans l'app) — se met à jour automatiquement après le calcul.
             _res_prev = st.session_state.get("res")
@@ -3224,7 +3404,7 @@ with main_tabs[0]:
                 _dist_km_est = tot_tmp / 1000.0 if (gpx_file and points) else 21.097
                 _dur_target_s = _allure_moy * _dist_km_est
             st.caption(f"⏱️ Durée cible utilisée : **{seconds_to_hms(_dur_target_s)}** ({_dur_source})"
-                       + ("" if _res_prev else " — lance le calcul en section 6️⃣ pour utiliser le temps réellement prédit."))
+                       + ("" if _res_prev else " — lance le calcul en section 6 pour utiliser le temps réellement prédit."))
             hr_pred = predict_hr_zone(refs_with_hr, _dur_target_s)
             if hr_pred:
                 hc1, hc2, hc3, hc4 = st.columns(4)
@@ -3243,15 +3423,15 @@ with main_tabs[0]:
                     fig_hr_pred, ax_hr_p = plt.subplots(figsize=(7, 3.5))
                     durs_h = [r["dur_s"]/60.0 for r in refs_with_hr]
                     hrs_h  = [r["hr_avg"] for r in refs_with_hr]
-                    ax_hr_p.scatter(durs_h, hrs_h, s=80, color="#d62728", zorder=5, label="FC moy. observée")
+                    ax_hr_p.scatter(durs_h, hrs_h, s=80, color=C_RED, zorder=5, label="FC moy. observée")
                     if hr_pred.get("model") == "regression":
                         d_line = np.linspace(max(1, min(durs_h)*0.8), max(max(durs_h)*1.2, _dur_target_s/60*1.1), 80)
                         hr_line = [hr_pred["slope"]*math.log(max(1,d*60))+hr_pred["intercept"] for d in d_line]
-                        ax_hr_p.plot(d_line, hr_line, color="#1f77b4", lw=2, ls="--", label="Régression log(durée)")
+                        ax_hr_p.plot(d_line, hr_line, color=C_WHITE, lw=2, ls="--", label="Régression log(durée)")
                         sigma_viz = (hr_pred['hr_target_range'][1]-hr_pred['hr_target_range'][0])/2
-                        ax_hr_p.fill_between(d_line,[h-sigma_viz for h in hr_line],[h+sigma_viz for h in hr_line],alpha=0.12,color="#1f77b4")
-                    ax_hr_p.axvline(_dur_target_s/60, color="#f97316", lw=2, ls=":", label=f"Course cible ({_dur_target_s/60:.0f} min)")
-                    ax_hr_p.scatter([_dur_target_s/60],[hr_pred["hr_target_avg"]],s=150,color="#f97316",marker="*",zorder=6,label=f"FC cible {hr_pred['hr_target_avg']} bpm")
+                        ax_hr_p.fill_between(d_line,[h-sigma_viz for h in hr_line],[h+sigma_viz for h in hr_line],alpha=0.12,color=C_WHITE)
+                    ax_hr_p.axvline(_dur_target_s/60, color=C_RED, lw=2, ls=":", label=f"Course cible ({_dur_target_s/60:.0f} min)")
+                    ax_hr_p.scatter([_dur_target_s/60],[hr_pred["hr_target_avg"]],s=150,color=C_RED,marker="*",zorder=6,label=f"FC cible {hr_pred['hr_target_avg']} bpm")
                     ax_hr_p.set_xlabel("Durée de la course (min)"); ax_hr_p.set_ylabel("FC moyenne (bpm)")
                     ax_hr_p.set_title("Régression FC personnelle — données athlète uniquement")
                     ax_hr_p.legend(fontsize=8); ax_hr_p.grid(alpha=0.3); fig_hr_pred.tight_layout()
@@ -3261,7 +3441,7 @@ with main_tabs[0]:
 
 
     st.markdown("---")
-    st.header("4️⃣  Paramètres du modèle")
+    st.header("04 · Paramètres du modèle")
 
     with st.expander("🌡️ Température & Humidité",expanded=False):
         # v8.1 — calibré sur 1245 segments coureurs (top10) de 12 ultra-trails réels :
@@ -3352,7 +3532,7 @@ with main_tabs[0]:
         if IS_TRAIL and tech_global_ui.get("global_score",0)>0 and terrain_profil=="🏔️ Trail modéré":
             adj_up=tech_global_ui.get("k_up_adj",1.0);adj_dn=tech_global_ui.get("k_down_adj",1.0)
             sugg_k_up=round(_d["k_up"]*adj_up,1);sugg_k_dn=round(_d["k_down"]*adj_dn,1)
-            st.markdown(f'<div style="background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;padding:6px 12px;font-size:0.82rem;">🤖 <b>Suggestion auto (terrain score {tech_global_ui["global_score"]:.2f})</b> : k_up → <b>{sugg_k_up}</b> · k_down → <b>{sugg_k_dn}</b></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="note-box note-red">🤖 <b>Suggestion auto (terrain score {tech_global_ui["global_score"]:.2f})</b> : k_up → <b>{sugg_k_up}</b> · k_down → <b>{sugg_k_dn}</b></div>',unsafe_allow_html=True)
             if st.button("✅ Appliquer coefficients détectés automatiquement",key="apply_tech_coeffs"):
                 st.session_state["tp_k_up"]=sugg_k_up; st.session_state["tp_k_down"]=sugg_k_dn; st.rerun()
 
@@ -3401,9 +3581,9 @@ with main_tabs[0]:
         g0_up=float(_d.get("g0_up",3.0));g0_down=2.5;max_up=float(max_cap);max_down=-0.06
         st.session_state["k_up_val"]=k_up;st.session_state["k_down_val"]=k_down
         st.session_state["g0_up_val"]=g0_up;st.session_state["g0_down_val"]=g0_down
-        _terrain_colors={"🛣️ Route / Plat":"#0C447C","🏔️ Trail modéré":"#3B6D11","⛰️ Ultra-trail montagneux":"#993C1D"}
+        _terrain_colors={"🛣️ Route / Plat":C_GREY,"🏔️ Trail modéré":C_WHITE,"⛰️ Ultra-trail montagneux":C_RED}
         _col=_terrain_colors.get(terrain_profil,"#444")
-        st.markdown(f'<div style="background:rgba(0,0,0,0.04);border-left:3px solid {_col};border-radius:4px;padding:6px 12px;font-size:0.82rem;margin-top:6px;"><b>{terrain_profil}</b> · k_up={k_up:.0f} · k_down={k_down:.0f} · Minetti={minetti_weight:.2f} · Plafond={max_cap:.0%} · Surface <b>{surface_sel.split()[0]} ×{surface_mult:.2f}</b></div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="note-box" style="border-left:3px solid {_col};"><b>{terrain_profil}</b> · k_up={k_up:.0f} · k_down={k_down:.0f} · Minetti={minetti_weight:.2f} · Plafond={max_cap:.0%} · Surface <b>{surface_sel.split()[0]} ×{surface_mult:.2f}</b></div>',unsafe_allow_html=True)
 
     with st.expander("🥾 Marche en forte pente (VAM)", expanded=True):
         st.caption(
@@ -3471,7 +3651,7 @@ with main_tabs[0]:
             # à CE parcours calibrée sur des coureurs réels (JSON de cohorte) — stabilisation
             # post-départ + effort cumulé du terrain. La phase 2 vient se superposer plus
             # loin dans la course pour représenter TA fatigue profonde personnelle, détectée
-            # sur tes propres références (section 2️⃣). Une référence courte/route (marathon)
+            # sur tes propres références (section 2). Une référence courte/route (marathon)
             # n'a pas le même mécanisme physiologique qu'un ultra, mais reste informative sur
             # ta façon de gérer un effort soutenu — à utiliser en connaissance de cause.
             st.markdown("##### Phase 2 — ta fatigue personnelle (s'ajoute à la phase 1)")
@@ -3485,7 +3665,7 @@ with main_tabs[0]:
                 _consistency = f" · cohérence ±{_auto_fat_std:.0f} pts" if _auto_fat_std is not None else ""
                 _r2_txt = f" · R²={_auto_fat_r2max:.2f}" if _auto_fat_r2max is not None else ""
                 st.caption(f"{_auto_fat_n}/{_auto_fat_total} référence(s) exploitable(s) (R²≥0.3) parmi celles "
-                           f"importées en section 2️⃣ — moyenne utilisée si plusieurs.")
+                           f"importées en section 2 — moyenne utilisée si plusieurs.")
                 dual_fatigue = st.checkbox(
                     f"🔒 Ajouter ma fatigue personnelle détectée (rupture à {_auto_fat_thr}% · dégradation "
                     f"{_auto_fat_rate}%{_consistency}{_r2_txt})",
@@ -3513,7 +3693,7 @@ with main_tabs[0]:
                                f"**{fatigue_threshold2}%**, puis accélère jusqu'à **+{fatigue_rate+fatigue_rate2:.0f}%** "
                                f"cumulé à l'arrivée.")
             else:
-                st.caption("Aucune rupture d'allure exploitable détectée sur tes références (section 2️⃣) pour "
+                st.caption("Aucune rupture d'allure exploitable détectée sur tes références (section 2) pour "
                            "l'instant — importe une référence en FIT/TCX pour activer cette option.")
 
     with st.expander("🎚️ Sensibilité aux conditions selon l'allure",expanded=False):
@@ -3532,7 +3712,7 @@ with main_tabs[0]:
         smooth_window_km=st.slider("Fenêtre lissage (km)",1,9,3,2) if show_smooth_pace else 3
 
     st.markdown("---")
-    st.header("5️⃣  Paramètres de la course cible")
+    st.header("05 · Paramètres de la course cible")
     c1,c2=st.columns(2)
     date_course=c1.date_input("📅 Date de course",value=date.today())
     heure_course=c2.time_input("⏰ Heure de départ",value=time(9,0),step=60)  # step=60s → saisie HH:MM:SS possible
@@ -3583,7 +3763,7 @@ with main_tabs[0]:
                 c1.metric("Erreur absolue moyenne",f"{seconds_to_hms(mae)} ({mae:.0f}s)")
                 c2.metric("MAPE",f"{mape:.2f} %")
 
-    st.header("6️⃣  Calcul & Résultats")
+    st.header("06 · Calcul & Résultats")
     if st.button("▶️ Calculer la prédiction",type="primary"):
         if not gpx_file or points is None:st.error("⚠️ Importe un fichier GPX (section 1).")
         elif not any(safe_float(r.get("distance",0))>0 and hms_to_seconds(r.get("temps","0"))>0 for r in refs_raw):
@@ -3681,19 +3861,19 @@ with main_tabs[0]:
                     try:parts=str(v).split(":");pv.append(int(parts[0])+int(parts[1])/60.0)
                     except:pv.append(float("nan"))
                 x=list(range(1,len(pv)+1))
-                ax.plot(x,pv,lw=1.5,alpha=0.35,color="steelblue",label="Allure brute")
+                ax.plot(x,pv,lw=1.5,alpha=0.35,color=C_WHITE,label="Allure brute")
                 if "Allure lissée (min/km)" in df_out.columns:
                     ps=[]
                     for v in df_out["Allure lissée (min/km)"].values:
                         try:parts=str(v).split(":");ps.append(int(parts[0])+int(parts[1])/60.0)
                         except:ps.append(float("nan"))
-                    ax.plot(x,ps,lw=2.5,color="firebrick",label="Allure lissée")
+                    ax.plot(x,ps,lw=2.5,color=C_RED,label="Allure lissée")
                 if apply_fatigue and fatigue_rate>0 and len(x)>0:
                     thresh_km=fatigue_threshold/100.0*len(x)
-                    ax.axvline(thresh_km,color="orange",lw=1.5,ls="--",alpha=0.7,label=f"Seuil phase 1 ({fatigue_threshold}%)")
+                    ax.axvline(thresh_km,color=C_RED,lw=1.5,ls="--",alpha=0.7,label=f"Seuil phase 1 ({fatigue_threshold}%)")
                     if dual_fatigue and fatigue_threshold2:
                         thresh2_km=fatigue_threshold2/100.0*len(x)
-                        ax.axvline(thresh2_km,color="darkred",lw=1.5,ls="--",alpha=0.7,label=f"Seuil phase 2 perso ({fatigue_threshold2}%)")
+                        ax.axvline(thresh2_km,color=C_RED_SOFT,lw=1.5,ls="--",alpha=0.7,label=f"Seuil phase 2 perso ({fatigue_threshold2}%)")
                 ax.invert_yaxis();ax.set_xlabel("Kilomètre");ax.set_ylabel("Allure (min/km)")
                 ax.set_title("Allure prévisionnelle km par km");ax.legend();ax.grid(alpha=0.3)
                 st.pyplot(fig);plt.close(fig)
@@ -3704,8 +3884,8 @@ with main_tabs[0]:
                 if "Mult Vent" in df_out.columns:ax2.plot(x,df_out["Mult Vent"].values,label="Vent",lw=2)
                 if "Mult Fatigue" in df_out.columns:ax2.plot(x,df_out["Mult Fatigue"].values,label="Fatigue",lw=2,ls=":")
                 if apply_fatigue and fatigue_rate>0:
-                    ax2.axvline(fatigue_threshold/100.0*len(x),color="orange",lw=1.5,ls="--",alpha=0.7,label=f"Seuil {fatigue_threshold}%")
-                ax2.axhline(1.0,color="gray",lw=0.8);ax2.set_xlabel("Kilomètre")
+                    ax2.axvline(fatigue_threshold/100.0*len(x),color=C_RED,lw=1.5,ls="--",alpha=0.7,label=f"Seuil {fatigue_threshold}%")
+                ax2.axhline(1.0,color=C_DIM,lw=0.8);ax2.set_xlabel("Kilomètre")
                 ax2.set_ylabel("Multiplicateur");ax2.set_title("Décomposition des facteurs")
                 ax2.legend();ax2.grid(alpha=0.3);st.pyplot(fig2);plt.close(fig2)
             with res_t3:st.dataframe(df_out,use_container_width=True)
@@ -3784,16 +3964,16 @@ with main_tabs[0]:
                 y_s=np.convolve(y_padded,np.ones(w_e)/w_e,mode='valid')
                 if y_s.size>y_gps.size:y_s=y_s[:y_gps.size]
                 elif y_s.size<y_gps.size:y_s=np.pad(y_s,(0,y_gps.size-y_s.size),mode='edge')
-                ax3.fill_between(x_km,y_s.min()-5,y_s,alpha=0.15,color="steelblue")
-                ax3.plot(x_km,y_s,lw=2.5,label="Altitude GPS lissée",color="steelblue")
-                ax3.plot(x_km,y_gps,lw=0.8,alpha=0.2,color="gray",label="GPS brut")
+                ax3.fill_between(x_km,y_s.min()-5,y_s,alpha=0.15,color=C_WHITE)
+                ax3.plot(x_km,y_s,lw=2.5,label="Altitude GPS lissée",color=C_WHITE)
+                ax3.plot(x_km,y_gps,lw=0.8,alpha=0.2,color=C_DIM,label="GPS brut")
             else:
-                ax3.fill_between(x_km,y_gps.min()-5,y_gps,alpha=0.15,color="steelblue")
-                ax3.plot(x_km,y_gps,lw=2.5,label="Altitude GPS",color="steelblue")
+                ax3.fill_between(x_km,y_gps.min()-5,y_gps,alpha=0.15,color=C_WHITE)
+                ax3.plot(x_km,y_gps,lw=2.5,label="Altitude GPS",color=C_WHITE)
             if dem_elevations is not None and len(dem_elevations)==len(points):
                 y_dem=np.array([e if e is not None else 0.0 for e in dem_elevations])
-                ax3.plot(x_km,y_dem,lw=2,ls="--",label="DEM corrigé",color="forestgreen")
-            cp_colors_profile={"🥤 Ravitaillement":"#00c864","⏱ Point de passage":"#6496ff","🏔 Sommet":"#ffc800","🔻 Col":"#c864ff","🏁 Intermédiaire":"#ffffff","⚠️ Point clé":"#ff5050"}
+                ax3.plot(x_km,y_dem,lw=2,ls="--",label="DEM corrigé",color=C_RED)
+            cp_colors_profile={"🥤 Ravitaillement":C_WHITE,"⏱ Point de passage":C_GREY,"🏔 Sommet":C_RED,"🔻 Col":C_RED_SOFT,"🏁 Intermédiaire":C_TEXT_MUT,"⚠️ Point clé":C_RED}
             for cp in sorted(checkpoints,key=lambda x:x["dist_km"]):
                 cp_x=cp["dist_km"];cp_y=float(np.interp(cp_x*1000,cum_d_map,y_gps))
                 col_p=cp_colors_profile.get(cp["type"],"#ffcc00")
@@ -3803,10 +3983,10 @@ with main_tabs[0]:
             if IS_TRAIL:
                 for seg in st.session_state.get("tech_segs",[]):
                     if seg.get("tech_score",0)>0.45:
-                        color_tech="#ef4444" if seg["tech_score"]>0.70 else "#f97316"
+                        color_tech=C_RED if seg["tech_score"]>0.70 else C_RED_SOFT
                         ax3.axvspan(seg["km_start"],seg["km_end"],alpha=0.12,color=color_tech,label="_nolegend_")
-            ax3.scatter([x_km[0]],[y_gps[0]],s=80,color="lime",zorder=6,marker="^",label="Départ")
-            ax3.scatter([x_km[-1]],[y_gps[-1]],s=80,color="red",zorder=6,marker="s",label="Arrivée")
+            ax3.scatter([x_km[0]],[y_gps[0]],s=80,color=C_WHITE,zorder=6,marker="^",label="Départ")
+            ax3.scatter([x_km[-1]],[y_gps[-1]],s=80,color=C_RED,zorder=6,marker="s",label="Arrivée")
             ax3.set_xlabel("Distance (km)");ax3.set_ylabel("Altitude (m)")
             ax3.set_title(f"Profil d'altitude — {total_dist_km:.1f} km")
             ax3.legend(fontsize=8);ax3.grid(alpha=0.25);fig3.tight_layout()
@@ -3884,7 +4064,7 @@ with main_tabs[1]:
     st.title("🧪 Tests d'endurance + Vitesse Critique")
     st.caption("Évalue ta capacité aérobie, ta VC, ton D' et tes équivalences sur toutes distances.")
 
-    st.header("1️⃣ Performances de référence")
+    st.header("01 · Performances de référence")
     st.info("Entre ici les chronos de tes courses ou tests (a minima 2 données pour la VC). Format hh:mm:ss.")
 
     if "n_refs_vc" not in st.session_state:
@@ -3976,7 +4156,7 @@ with main_tabs[1]:
                             d_up_v = float(parsed_vc_i["D_up"])
                         secs_v = float(hms_to_seconds(dur_i))
                         hr_ref_vc = parsed_vc_i.get("hr_analysis")
-                        # v8.2 — conserve les points pour la détection de rupture (section 4️⃣)
+                        # v8.2 — conserve les points pour la détection de rupture (section 4)
                         st.session_state[f"vc_points_{i}"] = (
                             seg_i if pts_i and (start_td_i.total_seconds() > 0 or end_td_i.total_seconds() < 86399) else pts_i)
                         st.session_state[f"vc_label_{i}"] = f"Réf {i} ({dist_v/1000:.1f} km, {dur_i})"
@@ -4017,7 +4197,7 @@ with main_tabs[1]:
     genre_vc = st.selectbox("Genre (pour les standards)", ["H", "F"], key="genre_vc")
 
     st.markdown("---")
-    st.header("2️⃣ Modèle Riegel + Vitesse Critique")
+    st.header("02 · Modèle Riegel + Vitesse Critique")
 
     K_riegel = st.slider("Coefficient Riegel (K)", 0.85, 1.15, 1.06, 0.01,
                           help="K=1.06 est la valeur universelle. Plus K est élevé, plus la fatigue est pénalisante sur les longues distances.")
@@ -4080,16 +4260,16 @@ with main_tabs[1]:
         fig_vc, ax_vc = plt.subplots(figsize=(11, 4))
         t_arr = np.linspace(60, 18000, 300)
         v_riegel = [a_r * (t/1000.0)**K_r / t * 1000.0 * 3.6 if a_r > 0 else 0 for t in t_arr]
-        ax_vc.plot(t_arr/60, v_riegel, lw=2, color="steelblue", label=f"Riegel K={K_r:.3f}")
+        ax_vc.plot(t_arr/60, v_riegel, lw=2, color=C_WHITE, label=f"Riegel K={K_r:.3f}")
         if vc_ms > 0:
             v_vc_line = [vc_ms * 3.6 + (d_prime / t * 3.6 if d_prime and t > 0 else 0) for t in t_arr]
-            ax_vc.plot(t_arr/60, v_vc_line, lw=2, ls="--", color="firebrick",
+            ax_vc.plot(t_arr/60, v_vc_line, lw=2, ls="--", color=C_RED,
                        label=f"Modèle D' (VC={vc_ms*3.6:.2f} km/h, D'={round(d_prime)}m)")
-            ax_vc.axhline(vc_ms * 3.6, color="orange", lw=1.5, ls=":", label="VC")
+            ax_vc.axhline(vc_ms * 3.6, color=C_RED, lw=1.5, ls=":", label="VC")
         for r in refs_fit_vc:
             if r["distance"] > 0 and r["temps"] > 0:
                 v_ref = r["distance"] / r["temps"] * 3.6
-                ax_vc.scatter([r["temps"]/60], [v_ref], s=80, zorder=5, color="forestgreen")
+                ax_vc.scatter([r["temps"]/60], [v_ref], s=80, zorder=5, color=C_RED)
                 ax_vc.annotate(f"{r['distance']/1000:.1f}km", (r["temps"]/60, v_ref),
                                textcoords="offset points", xytext=(5, 5), fontsize=8)
         ax_vc.set_xlabel("Durée (min)"); ax_vc.set_ylabel("Vitesse (km/h)")
@@ -4111,7 +4291,7 @@ with main_tabs[1]:
                 c2.metric("MAPE", f"{mape_r:.2f} %")
 
     st.markdown("---")
-    st.header("3️⃣ Test GAZOZ / Masque ventilatoire (analyse SV1/SV2)")
+    st.header("03 · Test GAZOZ / Masque ventilatoire (analyse SV1/SV2)")
     st.caption("Charge ici le CSV exporté depuis la sonde ZoneX/Cosmed/VO₂Master.")
 
     gazoz_file = st.file_uploader("📂 CSV ZoneX (Ventilation, VO₂, VCO₂, FC, Cadence…)",
@@ -4165,8 +4345,8 @@ with main_tabs[1]:
                 x = df_pal["palier"].values; y = df_pal[y_col].values
                 ax.plot(x, y, lw=2, color=color, marker="o", ms=5)
                 ax.set_xlabel("Palier"); ax.set_ylabel(label); ax.set_title(label); ax.grid(alpha=0.3)
-                if sv1: ax.axvline(sv1["palier"], color="green", lw=1.5, ls="--", label="SV1")
-                if sv2: ax.axvline(sv2["palier"], color="red",   lw=1.5, ls="--", label="SV2")
+                if sv1: ax.axvline(sv1["palier"], color=C_WHITE, lw=1.5, ls="--", label="SV1")
+                if sv2: ax.axvline(sv2["palier"], color=C_RED,   lw=1.5, ls="--", label="SV2")
                 ax.legend(fontsize=7)
             _ax_palier(axes[0], "VE",   "VE (L/min)",     "#1f77b4")
             _ax_palier(axes[1], "RQ",   "Quotient Resp.", "#d62728")
@@ -4175,13 +4355,13 @@ with main_tabs[1]:
             plt.tight_layout(); st.pyplot(fig_gz); plt.close(fig_gz)
 
     st.markdown("---")
-    st.header("4️⃣ Détection du point de rupture (tests à effort maximal)")
+    st.header("04 · Détection du point de rupture (tests à effort maximal)")
     st.caption(
-        "Pour chaque référence importée via fichier FIT/TCX (section 1️⃣ ci-dessus), détecte le moment où "
+        "Pour chaque référence importée via fichier FIT/TCX (section 1 ci-dessus), détecte le moment où "
         "l'allure décroche le plus nettement — une rupture à un seul changement de régime (allure stable, puis "
         "allure dégradée). Comparer ce point en % de la durée totale entre plusieurs tests de durées différentes "
         "peut révéler une signature de fatigue récurrente propre à l'athlète, utilisable comme point de départ "
-        "pour le seuil de fatigue en course longue (onglet 🏃 Prédiction, section 4️⃣).")
+        "pour le seuil de fatigue en course longue (onglet 🏃 Prédiction, section 4).")
 
     _bp_rows = []
     for _i in range(1, st.session_state.n_refs_vc + 1):
@@ -4201,7 +4381,7 @@ with main_tabs[1]:
                          "Dégradation": f"{_bp['drop_pct']:+.1f}%", "Qualité (R²)": round(_bp["r2"], 2)})
 
     if not _bp_rows:
-        st.info("Importe au moins un test via fichier FIT/TCX (section 1️⃣ ci-dessus, ≥1 min) pour activer cette "
+        st.info("Importe au moins un test via fichier FIT/TCX (section 1 ci-dessus, ≥1 min) pour activer cette "
                 "analyse — les références saisies à la main (sans fichier) n'ont pas de courbe d'allure à analyser.")
     else:
         df_bp = pd.DataFrame(_bp_rows)
@@ -4285,9 +4465,9 @@ with main_tabs[2]:
                         t_series = df_train.loc[hr_series.index, "elapsed_s"].values / 60.0
                         hr_smooth = smooth_hr(hr_series).values
                         fig_hr_t, ax_hr_t = plt.subplots(figsize=(11, 3))
-                        ax_hr_t.plot(t_series, hr_series.values, lw=0.7, alpha=0.25, color="gray", label="FC brute")
-                        ax_hr_t.plot(t_series, hr_smooth, lw=2, color="#e377c2", label="FC lissée")
-                        ax_hr_t.axhline(hr_stats_train["fc_avg"], color="steelblue", lw=1, ls="--",
+                        ax_hr_t.plot(t_series, hr_series.values, lw=0.7, alpha=0.25, color=C_DIM, label="FC brute")
+                        ax_hr_t.plot(t_series, hr_smooth, lw=2, color=C_RED, label="FC lissée")
+                        ax_hr_t.axhline(hr_stats_train["fc_avg"], color=C_WHITE, lw=1, ls="--",
                                         label=f"FC moy. {hr_stats_train['fc_avg']} bpm")
                         ax_hr_t.set_xlabel("Temps (min)"); ax_hr_t.set_ylabel("FC (bpm)")
                         ax_hr_t.set_title("Fréquence cardiaque au fil du temps")
@@ -4307,8 +4487,8 @@ with main_tabs[2]:
                     pace_vals = 1000.0 / spd.values
                     pace_smooth = pd.Series(pace_vals).rolling(15, center=True, min_periods=1).median().values
                     fig_pace, ax_pace = plt.subplots(figsize=(11, 3))
-                    ax_pace.plot(t_spd, pace_vals, lw=0.6, alpha=0.2, color="gray")
-                    ax_pace.plot(t_spd, pace_smooth, lw=2, color="steelblue", label="Allure lissée")
+                    ax_pace.plot(t_spd, pace_vals, lw=0.6, alpha=0.2, color=C_DIM)
+                    ax_pace.plot(t_spd, pace_smooth, lw=2, color=C_WHITE, label="Allure lissée")
                     ax_pace.invert_yaxis()
                     ax_pace.set_xlabel("Temps (min)"); ax_pace.set_ylabel("Allure (s/km)")
                     ax_pace.set_title("Allure au fil du temps"); ax_pace.grid(alpha=0.3); ax_pace.legend(fontsize=8)
@@ -4369,18 +4549,17 @@ with main_tabs[2]:
                                "seule **vitesse**. À prendre comme un ordre de grandeur : une marche rapide en "
                                "faux plat et un footing lent en côte ne se distinguent pas.")
                 if wr_sum:
-                    bc1, bc2, bc3, bc4 = st.columns(4)
-                    bc1.metric("Course", f"{wr_sum['pct_run']:.0f} %", delta=seconds_to_hms(wr_sum["run_s"]),
-                               delta_color="off")
-                    bc2.metric("Marche probable", f"{wr_sum['pct_walk']:.0f} %",
-                               delta=seconds_to_hms(wr_sum["walk_s"]), delta_color="off")
-                    if tz_tr and tz_tr.get("slope_lo") is not None and tz_tr.get("slope_hi") is not None:
-                        bc3.metric("Zone de transition",
-                                   f"{tz_tr['slope_lo']:.0f} → {tz_tr['slope_hi']:.0f} %")
-                        bc4.metric("Bascule (50 % de marche)", f"{tz_tr['slope_mid']:.0f} %")
-                    else:
-                        bc3.metric("Zone de transition", "—")
-                        bc4.metric("Bascule (50 % de marche)", "—")
+                    _has_tz = bool(tz_tr and tz_tr.get("slope_lo") is not None and tz_tr.get("slope_hi") is not None)
+                    kpi_row([
+                        ("Course", f"{wr_sum['pct_run']:.0f} %", "soit " + seconds_to_hms(wr_sum["run_s"])),
+                        ("Marche probable", f"{wr_sum['pct_walk']:.0f} %", "soit " + seconds_to_hms(wr_sum["walk_s"])),
+                        ("Zone de transition",
+                         f"{tz_tr['slope_lo']:.0f} → {tz_tr['slope_hi']:.0f} %" if _has_tz else "—",
+                         "pentes où tu bascules" if _has_tz else "non identifiable"),
+                        ("Bascule 50 % marche",
+                         f"{tz_tr['slope_mid']:.0f} %" if _has_tz else "—",
+                         "1 pas sur 2 en marche" if _has_tz else "—"),
+                    ])
                 fig_bio = plot_biomecanique(samples_tr, tz_tr, wr_sum, infos_tr, wr_method,
                                             cadence_threshold=trail_cad_thr, speed_walk_kmh=trail_walk_kmh)
                 st.pyplot(fig_bio); plt.close(fig_bio)
@@ -4434,21 +4613,19 @@ with main_tabs[2]:
                             "Baisse la durée/distance minimale d'une portion dans les réglages ci-dessus.")
                 else:
                     trends_tr = terrain_trends(portions_tr)
-                    tcols = st.columns(3)
-                    for _col, (_fam, _color, _pref) in zip(tcols, TERRAIN_FAMILIES):
+                    _kpis = []
+                    for _fam, _color, _pref in TERRAIN_FAMILIES:
                         _tr = trends_tr.get(_fam, {})
                         if not _tr or _tr.get("last_pct") is None:
-                            _col.metric(_fam, "—", help="Aucune portion qualifiée de ce type.")
+                            _kpis.append((_fam, "—", "aucune portion qualifiée"))
                             continue
-                        _col.metric(f"{_fam} — dernière portion ({_tr['last_label']})",
-                                    f"{_tr['last_pct']:.1f} %",
-                                    delta=f"{_tr['last_pct'] - 100:+.1f} pts",
-                                    delta_color="normal")
                         if _tr.get("slope_pts_per_h") is not None:
-                            _col.caption(f"{_tr['n']} portions · tendance **{_tr['slope_pts_per_h']:+.1f} pts/h** "
-                                         f"(R²={_tr['r2']:.2f}) · VAP de référence {_tr['vap_ref']:.2f} km/h")
+                            _sub = (f"{_tr['last_pct'] - 100:+.1f} pts vs référence · "
+                                    f"{_tr['slope_pts_per_h']:+.1f} pts/h · {_tr['n']} portions")
                         else:
-                            _col.caption(f"{_tr['n']} portion — pas de tendance calculable (il en faut au moins 2).")
+                            _sub = f"{_tr['n']} portion — tendance non calculable"
+                        _kpis.append((f"{_fam} — {_tr['last_label']}", f"{_tr['last_pct']:.0f} %", _sub))
+                    kpi_row(_kpis)
                     fig_terr = plot_terrain_evolution(portions_tr, trends_tr)
                     st.pyplot(fig_terr); plt.close(fig_terr)
 
@@ -4540,7 +4717,7 @@ with main_tabs[2]:
                     st.dataframe(pd.DataFrame(rows_int), use_container_width=True, hide_index=True)
 
                     fig_int, ax_int = plt.subplots(figsize=(11, 4))
-                    colors_int = plt.cm.tab10.colors
+                    colors_int = CHART_CYCLE
                     for ci_int, r in enumerate(valid_ints):
                         if "df" not in r: continue
                         df_i = r["df"]
@@ -4550,7 +4727,7 @@ with main_tabs[2]:
                         if len(hr_i) < 5: continue
                         t_i = df_i.loc[hr_i.index, "elapsed_s"].values
                         hr_sm_i = smooth_hr(hr_i).values
-                        ax_int.plot(t_i, hr_sm_i, lw=2, color=colors_int[ci_int % 10], label=r["name"])
+                        ax_int.plot(t_i, hr_sm_i, lw=2, color=colors_int[ci_int % len(colors_int)], label=r["name"])
                     ax_int.set_xlabel("Temps dans l'intervalle (s)")
                     ax_int.set_ylabel("FC (bpm)")
                     ax_int.set_title("FC comparée entre intervalles")
@@ -4626,8 +4803,8 @@ with main_tabs[3]:
                 tmoy = (w["tmax"] + w["tmin"]) / 2.0
                 d_t = tmoy - 10.0
                 weather_pen_cohort = min(0.20, d_t * 0.008) if d_t > 0 else max(-0.06, d_t * 0.004)
-                bg = "#fef2f2" if weather_pen_cohort > 0.08 else "#fffbeb" if weather_pen_cohort > 0.03 else "#f0fdf4"
-                st.markdown(f'<div style="margin-top:8px;padding:10px 14px;border-radius:8px;background:{bg};font-size:13px;">'
+                bg = C_SURFACE
+                st.markdown(f'<div class="note-box note-red" style="background:{bg};">'
                             f'T° moy. estimée <strong>{tmoy:.1f}°C</strong> — référence optimale 10°C — '
                             f'impact estimé <strong>{weather_pen_cohort*100:+.1f}%</strong> sur les temps</div>', unsafe_allow_html=True)
 
@@ -4952,7 +5129,7 @@ with main_tabs[3]:
                             k: v for k, v in _fit_result.items() if k not in ("r2", "n_segments", "n_athletes")
                         }
                         st.success(f"Profil « {cohort_profile_name} » sauvegardé — sélectionnable dans l'onglet "
-                                   f"🏃 Prédiction de course, section 4️⃣ Paramètres du modèle.")
+                                   f"🏃 Prédiction de course, section 4 Paramètres du modèle.")
 
                 _custom_profiles = st.session_state.get("custom_terrain_profiles", {})
                 if _custom_profiles:
@@ -4969,7 +5146,7 @@ with main_tabs[3]:
                         file_name="profils_calibres.json", key="cohort_export_profiles")
                     st.caption("⚠️ Ces profils sont en mémoire de session uniquement — exporte-les en JSON pour "
                                "les retrouver lors d'une prochaine session (à réimporter ci-dessous, ou directement "
-                               "dans l'onglet 🏃 Prédiction, section 4️⃣).")
+                               "dans l'onglet 🏃 Prédiction, section 4).")
 
                 cohort_import_file = st.file_uploader("⬆️ Importer des profils calibrés (JSON)", type=["json"], key="cohort_import_profiles")
                 if cohort_import_file and st.session_state.get("_last_imported_profile_file") != cohort_import_file.name:
