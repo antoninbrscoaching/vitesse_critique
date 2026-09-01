@@ -109,6 +109,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 import xml.etree.ElementTree as ET
 import requests
 import io
+import os
+import sqlite3
+import hashlib
+import secrets
 import warnings
 import json as _json
 from scipy import stats as sp_stats
@@ -3061,9 +3065,410 @@ def build_prediction_cohort(athlete, profile_key, apply_fatigue, apply_temp, tem
 
 
 # ══════════════════════════════════════════════════════════════
+# v8.9 — HISTORIQUE & COMPTES (SQLite local, aucun service externe)
+#
+#   • Comptes coach : inscription / connexion, mot de passe haché (PBKDF2-
+#     SHA256, 240 000 itérations, sel aléatoire par utilisateur). Chaque coach
+#     ne voit que SES athlètes et SES données.
+#   • Un athlète appartient à un coach ; tests VC, séances et courses/plans
+#     sont rattachés à un athlète et horodatés.
+#   • Rien n'est écrasé : réenregistrer un test crée une NOUVELLE ligne, ce qui
+#     permet de suivre l'évolution dans le temps.
+#
+# Toutes les données restent dans le fichier coach_data.db, à côté du script.
+# Sauvegarde = copier ce fichier. Aucune donnée ne sort de la machine.
+# ══════════════════════════════════════════════════════════════
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coach_data.db")
+AUTH_ENABLED = True          # passe à False pour un usage strictement personnel sans écran de connexion
+PBKDF2_ROUNDS = 240_000
+
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+def db_init():
+    with db_conn() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            pw_hash TEXT NOT NULL,
+            pw_salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS athletes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS vc_tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id INTEGER NOT NULL REFERENCES athletes(id) ON DELETE CASCADE,
+            date TEXT NOT NULL, label TEXT DEFAULT '',
+            vc_ms REAL, d_prime REAL, r2 REAL, k_riegel REAL, a_riegel REAL,
+            n_refs INTEGER, refs_json TEXT, notes TEXT DEFAULT '', created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id INTEGER NOT NULL REFERENCES athletes(id) ON DELETE CASCADE,
+            date TEXT NOT NULL, name TEXT DEFAULT '', seance_type TEXT DEFAULT '',
+            file_name TEXT DEFAULT '',
+            duration_s REAL, distance_m REAL, d_plus REAL,
+            hr_avg REAL, hr_max REAL, hr_drift REAL,
+            pct_walk REAL, trans_lo REAL, trans_mid REAL, trans_hi REAL,
+            vap_slope_montee REAL, vap_last_montee REAL,
+            portions_json TEXT, intervals_json TEXT, extra_json TEXT,
+            notes TEXT DEFAULT '', created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS races (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id INTEGER NOT NULL REFERENCES athletes(id) ON DELETE CASCADE,
+            date TEXT NOT NULL, name TEXT DEFAULT '', kind TEXT DEFAULT 'plan',
+            gpx_name TEXT DEFAULT '', distance_km REAL, d_plus REAL,
+            predicted_s REAL, actual_s REAL,
+            params_json TEXT, splits_json TEXT, checkpoints_json TEXT, gpx_xml TEXT,
+            notes TEXT DEFAULT '', created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_vc_athlete   ON vc_tests(athlete_id, date);
+        CREATE INDEX IF NOT EXISTS idx_wk_athlete   ON workouts(athlete_id, date);
+        CREATE INDEX IF NOT EXISTS idx_race_athlete ON races(athlete_id, date);
+        """)
+
+def _db_now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def hash_password(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    h = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return h.hex(), salt.hex()
+
+def create_user(email, name, password):
+    email = str(email).strip().lower()
+    if not email or "@" not in email:
+        return None, "Adresse e-mail invalide."
+    if len(str(password)) < 8:
+        return None, "Mot de passe trop court (8 caractères minimum)."
+    h, s = hash_password(password)
+    try:
+        with db_conn() as c:
+            cur = c.execute("INSERT INTO users(email,name,pw_hash,pw_salt,created_at) VALUES(?,?,?,?,?)",
+                            (email, str(name).strip() or email.split("@")[0], h, s, _db_now()))
+            return int(cur.lastrowid), None
+    except sqlite3.IntegrityError:
+        return None, "Un compte existe déjà avec cette adresse."
+
+def verify_user(email, password):
+    with db_conn() as c:
+        row = c.execute("SELECT * FROM users WHERE email=?", (str(email).strip().lower(),)).fetchone()
+    if row is None:
+        return None, "Compte inconnu."
+    h, _ = hash_password(password, row["pw_salt"])
+    if not secrets.compare_digest(h, row["pw_hash"]):
+        return None, "Mot de passe incorrect."
+    return {"id": int(row["id"]), "email": row["email"], "name": row["name"]}, None
+
+def change_password(user_id, old_pw, new_pw):
+    with db_conn() as c:
+        row = c.execute("SELECT * FROM users WHERE id=?", (int(user_id),)).fetchone()
+        if row is None:
+            return "Compte introuvable."
+        h, _ = hash_password(old_pw, row["pw_salt"])
+        if not secrets.compare_digest(h, row["pw_hash"]):
+            return "Ancien mot de passe incorrect."
+        if len(str(new_pw)) < 8:
+            return "Nouveau mot de passe trop court (8 caractères minimum)."
+        nh, ns = hash_password(new_pw)
+        c.execute("UPDATE users SET pw_hash=?, pw_salt=? WHERE id=?", (nh, ns, int(user_id)))
+    return None
+
+def count_users():
+    with db_conn() as c:
+        return int(c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"])
+
+# ── Athlètes ──────────────────────────────────────────────────────────────
+def list_athletes(user_id):
+    with db_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM athletes WHERE user_id=? ORDER BY name", (int(user_id),))]
+
+def create_athlete(user_id, name, notes=""):
+    name = str(name).strip()
+    if not name:
+        return None, "Nom d'athlète vide."
+    try:
+        with db_conn() as c:
+            cur = c.execute("INSERT INTO athletes(user_id,name,notes,created_at) VALUES(?,?,?,?)",
+                            (int(user_id), name, notes, _db_now()))
+            return int(cur.lastrowid), None
+    except sqlite3.IntegrityError:
+        return None, "Cet athlète existe déjà."
+
+def athlete_belongs_to(athlete_id, user_id):
+    with db_conn() as c:
+        r = c.execute("SELECT 1 FROM athletes WHERE id=? AND user_id=?",
+                      (int(athlete_id), int(user_id))).fetchone()
+    return r is not None
+
+def delete_athlete(athlete_id, user_id):
+    if not athlete_belongs_to(athlete_id, user_id):
+        return False
+    with db_conn() as c:
+        c.execute("DELETE FROM athletes WHERE id=?", (int(athlete_id),))
+    return True
+
+# ── Enregistrements ───────────────────────────────────────────────────────
+def save_vc_test(athlete_id, date_str, label, vc_ms, d_prime, r2, k, a, refs, notes=""):
+    with db_conn() as c:
+        cur = c.execute("""INSERT INTO vc_tests(athlete_id,date,label,vc_ms,d_prime,r2,k_riegel,a_riegel,
+                           n_refs,refs_json,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (int(athlete_id), str(date_str), str(label), _db_float(vc_ms), _db_float(d_prime), _db_float(r2),
+                         _db_float(k), _db_float(a), len(refs or []), _json.dumps(refs or [], ensure_ascii=False),
+                         str(notes), _db_now()))
+        return int(cur.lastrowid)
+
+def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
+                 portions=None, intervals=None, extra=None, notes=""):
+    s = summary or {}
+    with db_conn() as c:
+        cur = c.execute("""INSERT INTO workouts(athlete_id,date,name,seance_type,file_name,duration_s,distance_m,
+                           d_plus,hr_avg,hr_max,hr_drift,pct_walk,trans_lo,trans_mid,trans_hi,
+                           vap_slope_montee,vap_last_montee,portions_json,intervals_json,extra_json,notes,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (int(athlete_id), str(date_str), str(name), str(seance_type), str(file_name),
+                         _db_float(s.get("duration_s")), _db_float(s.get("distance_m")), _db_float(s.get("d_plus")),
+                         _db_float(s.get("hr_avg")), _db_float(s.get("hr_max")), _db_float(s.get("hr_drift")),
+                         _db_float(s.get("pct_walk")), _db_float(s.get("trans_lo")), _db_float(s.get("trans_mid")),
+                         _db_float(s.get("trans_hi")), _db_float(s.get("vap_slope_montee")), _db_float(s.get("vap_last_montee")),
+                         _json.dumps(portions or [], ensure_ascii=False),
+                         _json.dumps(intervals or [], ensure_ascii=False),
+                         _json.dumps(extra or {}, ensure_ascii=False), str(notes), _db_now()))
+        return int(cur.lastrowid)
+
+def save_race(athlete_id, date_str, name, kind, gpx_name, distance_km, d_plus,
+              predicted_s, actual_s, params, splits, checkpoints=None, notes="", gpx_xml=None):
+    with db_conn() as c:
+        cur = c.execute("""INSERT INTO races(athlete_id,date,name,kind,gpx_name,distance_km,d_plus,
+                           predicted_s,actual_s,params_json,splits_json,checkpoints_json,gpx_xml,notes,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (int(athlete_id), str(date_str), str(name), str(kind), str(gpx_name),
+                         _db_float(distance_km), _db_float(d_plus), _db_float(predicted_s), _db_float(actual_s),
+                         _json.dumps(params or {}, ensure_ascii=False, default=str),
+                         _json.dumps(splits or [], ensure_ascii=False, default=str),
+                         _json.dumps(checkpoints or [], ensure_ascii=False, default=str),
+                         gpx_xml, str(notes), _db_now()))
+        return int(cur.lastrowid)
+
+def _db_float(v):
+    """Convertit en float pour SQLite, None si non convertible (jamais d'exception)."""
+    try:
+        if v is None:
+            return None
+        f = float(v)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except Exception:
+        return None
+
+def list_records(table, athlete_id):
+    if table not in ("vc_tests", "workouts", "races"):
+        return []
+    with db_conn() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM {table} WHERE athlete_id=? ORDER BY date DESC, id DESC", (int(athlete_id),))]
+
+def get_record(table, rec_id):
+    if table not in ("vc_tests", "workouts", "races"):
+        return None
+    with db_conn() as c:
+        r = c.execute(f"SELECT * FROM {table} WHERE id=?", (int(rec_id),)).fetchone()
+    return dict(r) if r else None
+
+def delete_record(table, rec_id, user_id):
+    """Suppression vérifiée : on ne peut effacer qu'un enregistrement rattaché à
+    un athlète du coach connecté."""
+    if table not in ("vc_tests", "workouts", "races"):
+        return False
+    with db_conn() as c:
+        row = c.execute(f"""SELECT t.id FROM {table} t JOIN athletes a ON a.id=t.athlete_id
+                            WHERE t.id=? AND a.user_id=?""", (int(rec_id), int(user_id))).fetchone()
+        if row is None:
+            return False
+        c.execute(f"DELETE FROM {table} WHERE id=?", (int(rec_id),))
+    return True
+
+def update_record_notes(table, rec_id, user_id, notes):
+    if table not in ("vc_tests", "workouts", "races"):
+        return False
+    with db_conn() as c:
+        row = c.execute(f"""SELECT t.id FROM {table} t JOIN athletes a ON a.id=t.athlete_id
+                            WHERE t.id=? AND a.user_id=?""", (int(rec_id), int(user_id))).fetchone()
+        if row is None:
+            return False
+        c.execute(f"UPDATE {table} SET notes=? WHERE id=?", (str(notes), int(rec_id)))
+    return True
+
+def update_race_actual(race_id, user_id, actual_hms):
+    """Renseigne a posteriori le temps réellement réalisé sur une course."""
+    secs = hms_to_seconds(actual_hms)
+    with db_conn() as c:
+        row = c.execute("""SELECT r.id FROM races r JOIN athletes a ON a.id=r.athlete_id
+                           WHERE r.id=? AND a.user_id=?""", (int(race_id), int(user_id))).fetchone()
+        if row is None:
+            return False
+        c.execute("UPDATE races SET actual_s=?, kind='resultat' WHERE id=?", (float(secs), int(race_id)))
+    return True
+
+def athlete_counts(athlete_id):
+    with db_conn() as c:
+        return {t: int(c.execute(f"SELECT COUNT(*) n FROM {t} WHERE athlete_id=?",
+                                 (int(athlete_id),)).fetchone()["n"])
+                for t in ("vc_tests", "workouts", "races")}
+
+def export_athlete_json(athlete_id):
+    """Export complet d'un athlète (sauvegarde ou transfert vers une autre machine)."""
+    with db_conn() as c:
+        ath = c.execute("SELECT * FROM athletes WHERE id=?", (int(athlete_id),)).fetchone()
+        if ath is None:
+            return None
+        data = {"athlete": dict(ath), "exported_at": _db_now(), "app_version": "v8.9"}
+        for t in ("vc_tests", "workouts", "races"):
+            data[t] = [dict(r) for r in c.execute(
+                f"SELECT * FROM {t} WHERE athlete_id=? ORDER BY date", (int(athlete_id),))]
+    return data
+
+def import_athlete_json(user_id, payload, new_name=None):
+    """Réimporte un export JSON sous un nouvel athlète du coach connecté."""
+    if not isinstance(payload, dict) or "athlete" not in payload:
+        return None, "Fichier d'export non reconnu."
+    name = new_name or (payload["athlete"].get("name", "Athlète importé") + " (importé)")
+    aid, err = create_athlete(user_id, name, payload["athlete"].get("notes", ""))
+    if aid is None:
+        return None, err
+    n = 0
+    with db_conn() as c:
+        for t in ("vc_tests", "workouts", "races"):
+            for rec in payload.get(t, []):
+                rec = {k: v for k, v in dict(rec).items() if k not in ("id", "athlete_id")}
+                cols = ",".join(rec.keys()); ph = ",".join("?" * len(rec))
+                try:
+                    c.execute(f"INSERT INTO {t}(athlete_id,{cols}) VALUES(?,{ph})",
+                              [aid] + list(rec.values()))
+                    n += 1
+                except sqlite3.Error:
+                    continue
+    return {"athlete_id": aid, "n": n}, None
+
+db_init()
+
+# ── Session : utilisateur courant / athlète courant ───────────────────────
+def current_user():
+    return st.session_state.get("_auth_user")
+
+def current_athlete_id():
+    return st.session_state.get("_athlete_id")
+
+def current_athlete_name():
+    return st.session_state.get("_athlete_name", "")
+
+def history_ready():
+    """Vrai si un coach est connecté ET un athlète sélectionné : les boutons
+    d'enregistrement ne s'affichent que dans ce cas."""
+    return current_user() is not None and current_athlete_id() is not None
+
+def render_account_sidebar():
+    """Panneau Compte + Athlète, en haut de la barre latérale."""
+    user = current_user()
+    if user is None:
+        st.markdown('<div class="sidebar-label">👤 Compte coach</div>', unsafe_allow_html=True)
+        if count_users() == 0:
+            st.caption("Aucun compte sur cette instance — crée le premier ci-dessous.")
+        tab_in, tab_up = st.tabs(["Connexion", "Créer un compte"])
+        with tab_in:
+            with st.form("login_form"):
+                em = st.text_input("E-mail", key="login_email")
+                pw = st.text_input("Mot de passe", type="password", key="login_pw")
+                if st.form_submit_button("Se connecter"):
+                    u, err = verify_user(em, pw)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["_auth_user"] = u
+                        st.rerun()
+        with tab_up:
+            with st.form("signup_form"):
+                em2 = st.text_input("E-mail", key="signup_email")
+                nm2 = st.text_input("Nom", key="signup_name")
+                pw2 = st.text_input("Mot de passe (8 caractères min.)", type="password", key="signup_pw")
+                if st.form_submit_button("Créer le compte"):
+                    uid, err = create_user(em2, nm2, pw2)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["_auth_user"] = {"id": uid, "email": str(em2).strip().lower(),
+                                                          "name": nm2 or em2}
+                        st.rerun()
+        st.caption("Sans connexion, l'app fonctionne normalement — seuls l'historique et "
+                   "l'enregistrement des analyses sont désactivés.")
+        return
+
+    st.markdown(f'<div class="sidebar-label">👤 {user["name"]}</div>', unsafe_allow_html=True)
+    athletes = list_athletes(user["id"])
+    names = [a["name"] for a in athletes]
+    if athletes:
+        idx = names.index(current_athlete_name()) if current_athlete_name() in names else 0
+        sel = st.selectbox("Athlète suivi", names, index=idx, key="athlete_select")
+        chosen = next(a for a in athletes if a["name"] == sel)
+        st.session_state["_athlete_id"] = chosen["id"]
+        st.session_state["_athlete_name"] = chosen["name"]
+        cnt = athlete_counts(chosen["id"])
+        st.caption(f"{cnt['vc_tests']} test(s) VC · {cnt['workouts']} séance(s) · {cnt['races']} course(s)")
+    else:
+        st.caption("Crée un athlète pour commencer à enregistrer.")
+        st.session_state["_athlete_id"] = None
+    with st.expander("➕ Nouvel athlète"):
+        with st.form("new_athlete_form", clear_on_submit=True):
+            nm = st.text_input("Nom de l'athlète")
+            if st.form_submit_button("Créer"):
+                aid, err = create_athlete(user["id"], nm)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state["_athlete_id"] = aid
+                    st.session_state["_athlete_name"] = nm.strip()
+                    st.rerun()
+    with st.expander("🔐 Compte"):
+        with st.form("pw_form", clear_on_submit=True):
+            o = st.text_input("Mot de passe actuel", type="password")
+            n1 = st.text_input("Nouveau mot de passe", type="password")
+            if st.form_submit_button("Changer le mot de passe"):
+                err = change_password(user["id"], o, n1)
+                st.error(err) if err else st.success("Mot de passe mis à jour.")
+        if st.button("Se déconnecter"):
+            for k in ("_auth_user", "_athlete_id", "_athlete_name"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+def save_gate(context_label):
+    """Message affiché à la place d'un bouton d'enregistrement quand il manque
+    un compte ou un athlète."""
+    if current_user() is None:
+        st.caption(f"🔒 Connecte-toi (barre latérale) pour enregistrer {context_label} dans l'historique.")
+    else:
+        st.caption(f"🔒 Crée ou sélectionne un athlète (barre latérale) pour enregistrer {context_label}.")
+
+# ══════════════════════════════════════════════════════════════
 # UI PRINCIPALE
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
+    render_account_sidebar()
+    st.markdown("---")
     st.markdown('<div class="sidebar-label">⚙️ Paramètres — onglets Tests & Entraînement</div>',unsafe_allow_html=True)
     sb_opt_temp=st.slider("Température optimale (°C)",5.0,20.0,10.0,0.5,key="sb_opt_temp")
     sb_k_up=st.number_input("Coefficient montée (k_up)",value=22.0,step=0.5,key="sb_k_up")
@@ -3072,14 +3477,35 @@ with st.sidebar:
     sb_k_temp_cold=st.number_input("Sensibilité froid",value=0.0012,step=0.0002,format="%.4f",key="sb_ktc")
     st.caption("Ces paramètres n'affectent que les onglets 🧪 et ⚙️")
 
-main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","⚙️ Analyse entraînement","👥 Analyse de cohorte"])
+main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","⚙️ Analyse entraînement","👥 Analyse de cohorte","📚 Historique"])
 
 # ══════════════════════════════════════════════════════════════
 # ONGLET 0 — PRÉDICTION DE COURSE
 # ══════════════════════════════════════════════════════════════
 with main_tabs[0]:
+    # v8.9 — un plan rechargé depuis l'historique réinjecte ses paramètres dans les
+    # widgets AVANT leur création (Streamlit interdit de les modifier après).
+    _pending_plan = st.session_state.pop("_pending_plan_params", None)
+    if _pending_plan:
+        for _pk in ("tp_k_up", "tp_k_down", "tp_down_cap", "tp_minetti_weight", "tp_elev_smooth_window",
+                    "tp_grade_power", "tp_base_cap", "tp_extra_per_pct", "tp_max_cap",
+                    "tp_fatigue_threshold", "tp_fatigue_rate", "tp_fatigue_threshold2", "tp_fatigue_rate2"):
+            if _pending_plan.get(_pk) is not None:
+                st.session_state[_pk] = _pending_plan[_pk]
+        if _pending_plan.get("terrain_profil"):
+            st.session_state["terrain_profil_radio"] = _pending_plan["terrain_profil"]
+            # neutralise la resynchronisation automatique du profil, qui écraserait
+            # les coefficients qu'on vient de restaurer
+            st.session_state["_prev_terrain_profil"] = _pending_plan["terrain_profil"]
+        if _pending_plan.get("surface_sel"):
+            st.session_state["surface_sel"] = _pending_plan["surface_sel"]
+        st.session_state["_plan_reloaded_banner"] = _pending_plan.get("_race_name", "plan")
     st.title("🏃 Prédiction de course — Coach & Athlète")
-    st.caption("v8.5 — Filtre GPS · Padding lissage · Profil route · VC FIT/TCX · Prédiction FC · Import JSON direct · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
+    if st.session_state.get("_plan_reloaded_banner"):
+        st.markdown(f'<div class="note-box note-red">♻️ Paramètres rechargés depuis l\'historique : '
+                    f'<b>{st.session_state.pop("_plan_reloaded_banner")}</b>. Vérifie la date et l\'heure de '
+                    f'départ en section 05, puis relance le calcul en section 06.</div>', unsafe_allow_html=True)
+    st.caption("v8.9 — Comptes coach & historique athlète · Analyse trail course/marche · Charte sombre · Filtre GPS · VC FIT/TCX · Prédiction FC · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -3105,6 +3531,25 @@ with main_tabs[0]:
     st.header("01 · Parcours GPX")
     gpx_file=st.file_uploader("📂 Importer le GPX de la course cible",type=["gpx"],key="gpx_main")
     points=None;dem_elevations=None
+    # v8.9 — parcours rechargé depuis l'historique : évite de réimporter le GPX
+    class _StoredGPX(io.StringIO):
+        """Fichier GPX en mémoire, réhydraté depuis la base (même interface qu'un
+        fichier importé : .name + .seek/.read)."""
+        def __init__(self, name, xml):
+            super().__init__(xml); self.name = name
+    if gpx_file is None and st.session_state.get("_stored_gpx"):
+        _sg = st.session_state["_stored_gpx"]
+        gpx_file = _StoredGPX(_sg["name"], _sg["xml"])
+        st.caption(f"📂 Parcours rechargé depuis l'historique : **{_sg['name']}** — "
+                   "importe un GPX ci-dessus pour le remplacer.")
+        if st.button("✖️ Oublier ce parcours", key="forget_stored_gpx"):
+            st.session_state.pop("_stored_gpx", None); st.rerun()
+    elif gpx_file is not None:
+        try:
+            _raw_gpx = gpx_file.getvalue()
+            st.session_state["_gpx_xml"] = _raw_gpx.decode("utf-8", errors="ignore") if isinstance(_raw_gpx, bytes) else str(_raw_gpx)
+        except Exception:
+            st.session_state["_gpx_xml"] = None
 
     if gpx_file:
         _gpx,points=parse_gpx_points(gpx_file)
@@ -3804,6 +4249,28 @@ with main_tabs[0]:
                     st.session_state["res"]=res
                     st.session_state["refs_fit_vc"]=res.get("refs_fit",[])
                     st.session_state["K_riegel_vc"]=res.get("K",1.06)
+                    # v8.9 — paramètres du calcul, conservés pour l'enregistrement du plan
+                    st.session_state["_pred_params"]={
+                        "terrain_profil":terrain_profil,"surface_sel":surface_sel,"surface_mult":surface_mult,
+                        "tp_k_up":k_up,"tp_k_down":k_down,"tp_down_cap":down_cap,"tp_minetti_weight":minetti_weight,
+                        "tp_elev_smooth_window":elev_smooth_window,"tp_grade_power":grade_power,
+                        "tp_base_cap":base_cap,"tp_extra_per_pct":extra_per_pct,"tp_max_cap":max_cap,
+                        "apply_grade":apply_grade,"use_minetti":use_minetti,
+                        "apply_vam":apply_vam,"vam_threshold_pct":vam_threshold_pct,"vam_rate_m_per_h":vam_rate_m_per_h,
+                        "apply_fatigue":apply_fatigue,"tp_fatigue_threshold":fatigue_threshold,
+                        "tp_fatigue_rate":fatigue_rate,"fatigue_mode":fatigue_mode,"dual_fatigue":dual_fatigue,
+                        "tp_fatigue_threshold2":fatigue_threshold2,"tp_fatigue_rate2":fatigue_rate2,
+                        "opt_temp":opt_temp,"use_wbgt":use_wbgt,"use_recalibrated":use_recalibrated,
+                        "apply_altitude":apply_altitude,"altitude_ref_m":altitude_ref_m,
+                        "apply_wind":apply_wind,"apply_ultra":apply_ultra,"ultra_amp":ultra_amp,
+                        "date_course":str(date_course),"heure_course":str(heure_course),
+                        "force_dist":bool(force_dist),"dist_forcee":dist_forcee,
+                        "force_temps":bool(force_temps),"temps_objectif":temps_objectif if force_temps else None,
+                        "mode_activite":mode_activite,
+                        "references":[{"distance":safe_float(r.get("distance")),
+                                       "temps":r.get("duration_hms_file") or r.get("temps")} for r in refs_raw],
+                        "K":res.get("K"),"K_raw":res.get("K_raw"),
+                    }
                 except Exception as e:
                     import traceback;st.error(f"Erreur:{e}");st.code(traceback.format_exc())
 
@@ -3889,6 +4356,37 @@ with main_tabs[0]:
                 ax2.set_ylabel("Multiplicateur");ax2.set_title("Décomposition des facteurs")
                 ax2.legend();ax2.grid(alpha=0.3);st.pyplot(fig2);plt.close(fig2)
             with res_t3:st.dataframe(df_out,use_container_width=True)
+
+        # ── v8.9 : enregistrement du plan dans l'historique ──────────────
+        st.markdown("---")
+        st.markdown("#### 💾 Enregistrer ce plan de course")
+        if history_ready():
+            _gpx_name_save = getattr(gpx_file, "name", "") if gpx_file is not None else \
+                             st.session_state.get("_stored_gpx", {}).get("name", "")
+            with st.form("save_race_form"):
+                _sr1, _sr2 = st.columns(2)
+                _race_name = _sr1.text_input("Nom de la course",
+                                             value=(_gpx_name_save.rsplit(".", 1)[0] if _gpx_name_save else "Course"))
+                _race_date = _sr2.date_input("Date de la course", value=date_course, key="save_race_date")
+                _race_notes = st.text_area("Notes (stratégie, objectif, ravitaillements…)", key="save_race_notes")
+                _keep_gpx = st.checkbox("Conserver le parcours GPX avec le plan (permet de le recharger sans "
+                                        "réimporter le fichier)", value=True, key="save_race_gpx")
+                if st.form_submit_button("💾 Enregistrer dans l'historique"):
+                    _cols_keep = [c for c in ["Km", "Pente (%)", "D+ seg (m)", "D+ cum (m)", "Temps seg (s)",
+                                              "Allure (min/km)", "Allure lissée (min/km)", "Temps cumulé"]
+                                  if c in df_out.columns]
+                    _params_save = dict(st.session_state.get("_pred_params", {}))
+                    _params_save["_race_name"] = _race_name
+                    _rid = save_race(current_athlete_id(), _race_date.isoformat(), _race_name, "plan",
+                                     _gpx_name_save, _dist_simulated_km, res.get("d_plus_total"),
+                                     res.get("total_s"), None, _params_save,
+                                     df_out[_cols_keep].to_dict("records"),
+                                     st.session_state.get("checkpoints", []), _race_notes,
+                                     st.session_state.get("_gpx_xml") if _keep_gpx else None)
+                    st.success(f"✅ Plan « {_race_name} » enregistré pour {current_athlete_name()} "
+                               f"(#{_rid}) — retrouve-le dans l'onglet 📚 Historique.")
+        else:
+            save_gate("ce plan de course")
 
 
     if gpx_file and points:
@@ -4237,6 +4735,27 @@ with main_tabs[1]:
         if r2_vc is not None and r2_vc < 0.90:
             st.warning("⚠️ R² faible — vérifier la cohérence des références ou exclure des outliers.")
 
+        # ── v8.9 : enregistrement du test dans l'historique ─────────────
+        st.markdown("#### 💾 Enregistrer ce test")
+        if history_ready():
+            with st.form("save_vc_form"):
+                _sv1, _sv2 = st.columns(2)
+                _vc_date = _sv1.date_input("Date du test", value=date.today(), key="save_vc_date")
+                _vc_label = _sv2.text_input("Libellé", value="Test VC", key="save_vc_label")
+                _vc_notes = st.text_area("Notes (conditions, forme du jour, protocole…)", key="save_vc_notes")
+                if st.form_submit_button("💾 Enregistrer dans l'historique"):
+                    _refs_save = [{"distance": r.get("distance"), "temps": r.get("temps"),
+                                   "D_up": r.get("D_up", 0)} for r in refs_fit_vc]
+                    _tid = save_vc_test(current_athlete_id(), _vc_date.isoformat(), _vc_label,
+                                        vc_ms, d_prime, r2_vc, K_r, a_r, _refs_save, _vc_notes)
+                    st.success(f"✅ Test enregistré pour {current_athlete_name()} (#{_tid}) — "
+                               f"l'évolution de la VC est dans l'onglet 📚 Historique.")
+            st.caption("Chaque enregistrement crée une nouvelle ligne : un nouveau test n'efface jamais "
+                       "les précédents.")
+        else:
+            save_gate("ce test de vitesse critique")
+        st.markdown("---")
+
         st.subheader("🏆 Équivalences et prédictions sur distances standard")
         results_pred, best_dist = predict_performances(vc_ms, d_prime, refs_fit_vc, K_r, genre=genre_vc)
 
@@ -4537,6 +5056,18 @@ with main_tabs[2]:
                     samples_tr, infos_tr, cadence_threshold=trail_cad_thr, speed_walk_kmh=trail_walk_kmh)
                 tz_tr = detect_transition_zone(samples_tr)
                 wr_sum = walk_run_summary(samples_tr, infos_tr["grid_step_s"])
+                # v8.9 — résumé conservé pour l'enregistrement de la séance
+                st.session_state["_trail_summary"] = {
+                    "pct_walk": (wr_sum or {}).get("pct_walk"),
+                    "walk_speed_med": (wr_sum or {}).get("walk_speed_med"),
+                    "run_speed_med": (wr_sum or {}).get("run_speed_med"),
+                    "trans_lo": (tz_tr or {}).get("slope_lo"), "trans_mid": (tz_tr or {}).get("slope_mid"),
+                    "trans_hi": (tz_tr or {}).get("slope_hi"),
+                    "mid_start": (tz_tr or {}).get("mid_start"), "mid_end": (tz_tr or {}).get("mid_end"),
+                    "methode_marche": wr_method,
+                    "d_plus": float(np.sum(np.clip(np.diff(samples_tr["alt_m"].values), 0, None))),
+                }
+                st.session_state["_trail_portions"] = []
 
                 # ── A. Biomécanique course / marche ──────────────────────────
                 st.markdown("#### 🦵 Biomécanique course / marche")
@@ -4613,6 +5144,22 @@ with main_tabs[2]:
                             "Baisse la durée/distance minimale d'une portion dans les réglages ci-dessus.")
                 else:
                     trends_tr = terrain_trends(portions_tr)
+                    # v8.9 — tendances et portions conservées pour l'historique
+                    st.session_state["_trail_summary"].update({
+                        "vap_slope_montee": (trends_tr.get("Montée") or {}).get("slope_pts_per_h"),
+                        "vap_last_montee": (trends_tr.get("Montée") or {}).get("last_pct"),
+                        "vap_slope_roulant": (trends_tr.get("Relief roulant") or {}).get("slope_pts_per_h"),
+                        "vap_last_roulant": (trends_tr.get("Relief roulant") or {}).get("last_pct"),
+                        "vap_slope_descente": (trends_tr.get("Descente") or {}).get("slope_pts_per_h"),
+                        "vap_last_descente": (trends_tr.get("Descente") or {}).get("last_pct"),
+                    })
+                    st.session_state["_trail_portions"] = [
+                        {"Portion": p["label"], "Terrain": p["famille"],
+                         "Début (effort)": seconds_to_hms(p["t_start_s"]), "Durée": seconds_to_hms(p["dur_s"]),
+                         "Dist (km)": round(p["dist_m"] / 1000.0, 2), "D+ (m)": round(p["d_plus"]),
+                         "Pente méd. (%)": round(p["grade_med"], 1),
+                         "Vitesse (km/h)": round(p["speed_kmh"], 2), "VAP (km/h)": round(p["vap_kmh"], 2),
+                         "% réf. famille": round(p["index_pct"], 1)} for p in portions_tr]
                     _kpis = []
                     for _fam, _color, _pref in TERRAIN_FAMILIES:
                         _tr = trends_tr.get(_fam, {})
@@ -4636,10 +5183,10 @@ with main_tabs[2]:
                             if _worst is None or _tr["last_pct"] < _worst[1]["last_pct"]:
                                 _worst = (_fam, _tr)
                     if _worst:
-                        _f, _t = _worst
-                        st.info(f"**{_f} · plus grand écart observé** — dernière portion comparable "
-                                f"({_t['last_label']}) : **{_t['last_pct']:.1f} %** du niveau de référence, soit "
-                                f"**{_t['last_pct'] - 100:+.1f} points**.")
+                        _worst_fam, _worst_tr = _worst
+                        st.info(f"**{_worst_fam} · plus grand écart observé** — dernière portion comparable "
+                                f"({_worst_tr['last_label']}) : **{_worst_tr['last_pct']:.1f} %** du niveau de "
+                                f"référence, soit **{_worst_tr['last_pct'] - 100:+.1f} points**.")
 
                     rows_tr = []
                     for p in portions_tr:
@@ -4741,6 +5288,61 @@ with main_tabs[2]:
                                data=csv_train,
                                file_name=f"seance_{train_file.name.split('.')[0]}.csv",
                                mime="text/csv")
+
+            # ── v8.9 : enregistrement de la séance dans l'historique ─────
+            st.markdown("---")
+            st.subheader("💾 Enregistrer cette séance")
+            if history_ready():
+                _ts = st.session_state.get("_trail_summary", {})
+                _hr_s = hr_stats_train if isinstance(hr_stats_train, dict) else {}
+                with st.form("save_workout_form"):
+                    _sw1, _sw2, _sw3 = st.columns(3)
+                    _wk_date = _sw1.date_input("Date de la séance", value=date.today(), key="save_wk_date")
+                    _wk_name = _sw2.text_input("Nom de la séance",
+                                               value=train_file.name.rsplit(".", 1)[0], key="save_wk_name")
+                    _wk_type = _sw3.selectbox("Type de séance",
+                                              ["Sortie longue", "Endurance fondamentale", "Fractionné court",
+                                               "Fractionné long", "Seuil", "Côtes / VAM", "Test",
+                                               "Course", "Récupération", "Autre"], key="save_wk_type")
+                    _wk_notes = st.text_area("Notes / ressenti", key="save_wk_notes")
+                    _wk_incl = st.checkbox("Inclure le détail des portions de terrain et des intervalles",
+                                           value=True, key="save_wk_incl")
+                    if st.form_submit_button("💾 Enregistrer dans l'historique"):
+                        _summary_wk = {
+                            "duration_s": dur_s_train, "distance_m": dist_m_train,
+                            "d_plus": _ts.get("d_plus"),
+                            "hr_avg": _hr_s.get("fc_avg"), "hr_max": _hr_s.get("fc_max"),
+                            "hr_drift": _hr_s.get("drift_abs"),
+                            "pct_walk": _ts.get("pct_walk"), "trans_lo": _ts.get("trans_lo"),
+                            "trans_mid": _ts.get("trans_mid"), "trans_hi": _ts.get("trans_hi"),
+                            "vap_slope_montee": _ts.get("vap_slope_montee"),
+                            "vap_last_montee": _ts.get("vap_last_montee"),
+                        }
+                        _intervals_save = []
+                        for _ri in st.session_state.get("int_results", []):
+                            if not _ri.get("valid"):
+                                continue
+                            _hri = _ri.get("hr", {}) or {}
+                            _intervals_save.append({
+                                "Intervalle": _ri.get("name"), "Durée": seconds_to_hms(_ri.get("dur_s", 0)),
+                                "Distance (m)": round(_ri["dist_m"]) if _ri.get("dist_m") else None,
+                                "Allure": (pace_str(_ri["dur_s"] / (_ri["dist_m"] / 1000.0)) + "/km")
+                                          if _ri.get("dist_m") else "—",
+                                "FC moy": _hri.get("fc_avg"), "FC max": _hri.get("fc_max"),
+                                "Dérive FC": _hri.get("drift_abs"),
+                            })
+                        _wid = save_workout(
+                            current_athlete_id(), _wk_date.isoformat(), _wk_name, _wk_type,
+                            train_file.name, _summary_wk,
+                            st.session_state.get("_trail_portions", []) if _wk_incl else [],
+                            _intervals_save if _wk_incl else [],
+                            {k: v for k, v in _ts.items() if k not in _summary_wk}, _wk_notes)
+                        st.success(f"✅ Séance « {_wk_name} » enregistrée pour {current_athlete_name()} "
+                                   f"(#{_wid}) — comparaison dans l'onglet 📚 Historique.")
+                st.caption("Les intervalles sont enregistrés tels que découpés ci-dessus : lance "
+                           "« Analyser les intervalles » avant d'enregistrer pour les inclure.")
+            else:
+                save_gate("cette séance")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -5160,3 +5762,282 @@ with main_tabs[3]:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Fichier JSON invalide : {e}")
+
+# ══════════════════════════════════════════════════════════════
+# v8.9 — ONGLET HISTORIQUE
+# Lecture seule sur la base : aucun calcul n'est refait ici, on relit ce qui a
+# été enregistré au moment de l'analyse.
+# ══════════════════════════════════════════════════════════════
+with main_tabs[4]:
+    st.title("📚 Historique")
+    _user = current_user()
+    if _user is None:
+        st.markdown('<div class="highlight-box">Connecte-toi dans la barre latérale pour retrouver '
+                    'l\'historique de tes athlètes : tests de vitesse critique, séances et courses '
+                    'restent enregistrés d\'une session à l\'autre.</div>', unsafe_allow_html=True)
+        st.caption(f"Les données sont stockées localement dans `{os.path.basename(DB_PATH)}`, "
+                   "à côté du script. Aucune donnée n'est envoyée ailleurs.")
+    elif current_athlete_id() is None:
+        st.info("Crée un athlète dans la barre latérale pour commencer à enregistrer des analyses.")
+    else:
+        _aid = current_athlete_id()
+        _aname = current_athlete_name()
+        _vc = list_records("vc_tests", _aid)
+        _wk = list_records("workouts", _aid)
+        _rc = list_records("races", _aid)
+        st.caption(f"Athlète : **{_aname}** · {len(_vc)} test(s) VC · {len(_wk)} séance(s) · {len(_rc)} course(s)")
+
+        _last_vc = _vc[0] if _vc else None
+        kpi_row([
+            ("Dernière VC", f"{_last_vc['vc_ms']*3.6:.2f} km/h" if (_last_vc and _last_vc.get("vc_ms")) else "—",
+             f"{_last_vc['date']} · {pace_str(1000.0/_last_vc['vc_ms'])}/km" if (_last_vc and _last_vc.get("vc_ms")) else "aucun test enregistré"),
+            ("Tests VC", str(len(_vc)), "évolution suivie dans le temps"),
+            ("Séances", str(len(_wk)), "analyses trail & intervalles"),
+            ("Courses & plans", str(len(_rc)), "prédictions enregistrées"),
+        ])
+
+        h_t1, h_t2, h_t3, h_t4 = st.tabs(["📈 Vitesse critique", "🏃 Séances", "🏁 Courses & plans", "🗄️ Données"])
+
+        # ── Historique VC ────────────────────────────────────────────────
+        with h_t1:
+            if not _vc:
+                st.info("Aucun test enregistré. Onglet 🧪 Tests d'endurance + VC → calcule ta VC → "
+                        "« Enregistrer ce test ».")
+            else:
+                df_vc = pd.DataFrame([{
+                    "Date": r["date"], "Test": r["label"] or "—",
+                    "VC (km/h)": round(r["vc_ms"] * 3.6, 2) if r["vc_ms"] else None,
+                    "Allure VC": pace_str(1000.0 / r["vc_ms"]) + "/km" if r["vc_ms"] else "—",
+                    "D' (m)": round(r["d_prime"]) if r["d_prime"] else None,
+                    "R²": round(r["r2"], 3) if r["r2"] else None,
+                    "K Riegel": round(r["k_riegel"], 3) if r["k_riegel"] else None,
+                    "Réfs": r["n_refs"], "Notes": r["notes"] or "", "id": r["id"],
+                } for r in _vc])
+                st.dataframe(df_vc.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+                _plot = [r for r in _vc if r.get("vc_ms")]
+                if len(_plot) >= 2:
+                    _plot = sorted(_plot, key=lambda r: r["date"])
+                    _x = [datetime.strptime(r["date"], "%Y-%m-%d") for r in _plot]
+                    fig_vc_h, (axa, axb) = plt.subplots(2, 1, figsize=(11.5, 5.2), sharex=True,
+                                                        gridspec_kw={"height_ratios": [2, 1], "hspace": 0.15})
+                    axa.plot(_x, [r["vc_ms"] * 3.6 for r in _plot], "-o", color=C_RED, lw=2, ms=7,
+                             mec=C_SURFACE, mew=1.6)
+                    for _xi, _r in zip(_x, _plot):
+                        axa.annotate(f"{_r['vc_ms']*3.6:.2f}", xy=(_xi, _r["vc_ms"] * 3.6), xytext=(0, 9),
+                                     textcoords="offset points", ha="center", fontsize=7.5, color=C_TEXT_MUT)
+                    axa.set_ylabel("VC (km/h)")
+                    chart_title(axa, "Évolution de la vitesse critique",
+                                f"{_aname} · {len(_plot)} tests enregistrés")
+                    axb.plot(_x, [r["d_prime"] or 0 for r in _plot], "-o", color=C_WHITE, lw=1.8, ms=6,
+                             mec=C_SURFACE, mew=1.5)
+                    axb.set_ylabel("D' (m)"); axb.set_xlabel("Date du test")
+                    fig_vc_h.autofmt_xdate(rotation=0, ha="center")
+                    fig_vc_h.tight_layout()
+                    st.pyplot(fig_vc_h); plt.close(fig_vc_h)
+                    _delta = (_plot[-1]["vc_ms"] - _plot[0]["vc_ms"]) * 3.6
+                    _days = max(1, (_x[-1] - _x[0]).days)
+                    st.markdown(f'<div class="note-box note-red">Entre le <b>{_plot[0]["date"]}</b> et le '
+                                f'<b>{_plot[-1]["date"]}</b> ({_days} jours), la VC évolue de '
+                                f'<b>{_delta:+.2f} km/h</b> ({_delta/max(1e-6,_plot[0]["vc_ms"]*3.6)*100:+.1f} %).'
+                                f'</div>', unsafe_allow_html=True)
+                else:
+                    st.caption("Un second test enregistré fera apparaître la courbe d'évolution.")
+
+                with st.expander("🗑️ Supprimer un test"):
+                    _opts = {f"{r['date']} — {r['label'] or 'test'} (#{r['id']})": r["id"] for r in _vc}
+                    _sel = st.selectbox("Test à supprimer", list(_opts.keys()), key="hist_del_vc")
+                    if st.button("Supprimer définitivement", key="hist_del_vc_btn"):
+                        if delete_record("vc_tests", _opts[_sel], _user["id"]):
+                            st.success("Test supprimé."); st.rerun()
+
+        # ── Historique séances ───────────────────────────────────────────
+        with h_t2:
+            if not _wk:
+                st.info("Aucune séance enregistrée. Onglet ⚙️ Analyse entraînement → charge un fichier → "
+                        "« Enregistrer cette séance ».")
+            else:
+                df_wk = pd.DataFrame([{
+                    "Date": r["date"], "Séance": r["name"] or r["file_name"] or "—",
+                    "Type": r["seance_type"] or "—",
+                    "Durée": seconds_to_hms(r["duration_s"]) if r["duration_s"] else "—",
+                    "Dist (km)": round(r["distance_m"] / 1000.0, 2) if r["distance_m"] else None,
+                    "D+ (m)": round(r["d_plus"]) if r["d_plus"] else None,
+                    "FC moy": round(r["hr_avg"]) if r["hr_avg"] else None,
+                    "Dérive FC": round(r["hr_drift"], 1) if r["hr_drift"] is not None else None,
+                    "% marche": round(r["pct_walk"]) if r["pct_walk"] is not None else None,
+                    "Bascule (%)": round(r["trans_mid"], 1) if r["trans_mid"] is not None else None,
+                    "VAP montée fin (%)": round(r["vap_last_montee"]) if r["vap_last_montee"] is not None else None,
+                    "Tenue (pts/h)": round(r["vap_slope_montee"], 1) if r["vap_slope_montee"] is not None else None,
+                    "id": r["id"],
+                } for r in _wk])
+                _types = ["(toutes)"] + sorted({r["seance_type"] for r in _wk if r["seance_type"]})
+                _ft = st.selectbox("Filtrer par type de séance", _types, key="hist_wk_type")
+                df_show = df_wk if _ft == "(toutes)" else df_wk[df_wk["Type"] == _ft]
+                st.dataframe(df_show.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+                _num_cols = {"Bascule course→marche (%)": "trans_mid", "% du temps en marche": "pct_walk",
+                             "Dérive cardiaque (bpm)": "hr_drift",
+                             "VAP montée en fin de séance (% de la 1re)": "vap_last_montee",
+                             "FC moyenne (bpm)": "hr_avg"}
+                _metric = st.selectbox("Comparer dans le temps", list(_num_cols.keys()), key="hist_wk_metric")
+                _key = _num_cols[_metric]
+                _pts = [r for r in _wk if r.get(_key) is not None]
+                if _ft != "(toutes)":
+                    _pts = [r for r in _pts if r["seance_type"] == _ft]
+                if len(_pts) >= 2:
+                    _pts = sorted(_pts, key=lambda r: r["date"])
+                    _x = [datetime.strptime(r["date"], "%Y-%m-%d") for r in _pts]
+                    _y = [float(r[_key]) for r in _pts]
+                    fig_wk, axw = plt.subplots(figsize=(11.5, 3.8))
+                    axw.plot(_x, _y, "-o", color=C_RED, lw=2, ms=7, mec=C_SURFACE, mew=1.6)
+                    if len(_pts) >= 3:
+                        _xn = np.array([(d - _x[0]).days for d in _x], dtype=float)
+                        _sl, _ic, _r, _, _ = sp_stats.linregress(_xn, _y)
+                        axw.plot(_x, _ic + _sl * _xn, ls="--", lw=1.2, color=C_WHITE, alpha=0.5,
+                                 label=f"tendance {_sl*30:+.2f} / mois (R²={_r**2:.2f})")
+                        axw.legend(loc="best")
+                    axw.set_ylabel(_metric); axw.set_xlabel("Date de séance")
+                    chart_title(axw, _metric, f"{_aname} · {len(_pts)} séances comparées")
+                    fig_wk.autofmt_xdate(rotation=0, ha="center"); fig_wk.tight_layout()
+                    st.pyplot(fig_wk); plt.close(fig_wk)
+                else:
+                    st.caption("Il faut au moins deux séances contenant cette mesure pour tracer une évolution.")
+
+                _opts_w = {f"{r['date']} — {r['name'] or r['file_name'] or 'séance'} (#{r['id']})": r["id"]
+                           for r in _wk}
+                _sw = st.selectbox("Détail d'une séance", list(_opts_w.keys()), key="hist_wk_detail")
+                _rec = get_record("workouts", _opts_w[_sw])
+                if _rec:
+                    _por = _json.loads(_rec["portions_json"] or "[]")
+                    _itv = _json.loads(_rec["intervals_json"] or "[]")
+                    if _por:
+                        st.markdown("**Portions de terrain enregistrées**")
+                        st.dataframe(pd.DataFrame(_por), use_container_width=True, hide_index=True)
+                    if _itv:
+                        st.markdown("**Intervalles enregistrés**")
+                        st.dataframe(pd.DataFrame(_itv), use_container_width=True, hide_index=True)
+                    if not _por and not _itv:
+                        st.caption("Cette séance a été enregistrée sans détail de portions ni d'intervalles.")
+                    _nn = st.text_area("Notes", value=_rec["notes"] or "", key="hist_wk_notes")
+                    cwn1, cwn2 = st.columns(2)
+                    if cwn1.button("💾 Mettre à jour les notes", key="hist_wk_notes_btn"):
+                        update_record_notes("workouts", _rec["id"], _user["id"], _nn)
+                        st.success("Notes enregistrées."); st.rerun()
+                    if cwn2.button("🗑️ Supprimer cette séance", key="hist_wk_del"):
+                        if delete_record("workouts", _rec["id"], _user["id"]):
+                            st.success("Séance supprimée."); st.rerun()
+
+        # ── Historique courses & plans ───────────────────────────────────
+        with h_t3:
+            if not _rc:
+                st.info("Aucune course enregistrée. Onglet 🏃 Prédiction de course → lance un calcul → "
+                        "« Enregistrer ce plan de course ».")
+            else:
+                df_rc = pd.DataFrame([{
+                    "Date": r["date"], "Course": r["name"] or "—",
+                    "Type": "Résultat" if r["kind"] == "resultat" else "Plan",
+                    "Dist (km)": round(r["distance_km"], 1) if r["distance_km"] else None,
+                    "D+ (m)": round(r["d_plus"]) if r["d_plus"] else None,
+                    "Temps prédit": seconds_to_hms(r["predicted_s"]) if r["predicted_s"] else "—",
+                    "Temps réel": seconds_to_hms(r["actual_s"]) if r["actual_s"] else "—",
+                    "Écart": (("+" if r["actual_s"] - r["predicted_s"] > 0 else "−") +
+                              seconds_to_hms(abs(r["actual_s"] - r["predicted_s"])))
+                             if (r["actual_s"] and r["predicted_s"]) else "—",
+                    "id": r["id"],
+                } for r in _rc])
+                st.dataframe(df_rc.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+                _done = [r for r in _rc if r.get("actual_s") and r.get("predicted_s")]
+                if len(_done) >= 2:
+                    _done = sorted(_done, key=lambda r: r["date"])
+                    fig_rc, axr = plt.subplots(figsize=(11.5, 3.8))
+                    _xr = np.arange(len(_done))
+                    _err = [(r["actual_s"] - r["predicted_s"]) / r["predicted_s"] * 100.0 for r in _done]
+                    axr.bar(_xr, _err, color=[C_RED if e > 0 else C_WHITE for e in _err], width=0.55)
+                    axr.axhline(0, color=C_TEXT_MUT, lw=1)
+                    axr.set_xticks(_xr)
+                    axr.set_xticklabels([f"{r['name'][:18]}\n{r['date']}" for r in _done], fontsize=7.5)
+                    axr.set_ylabel("Écart réel / prédit (%)")
+                    chart_title(axr, "Fiabilité des prédictions",
+                                "au-dessus de 0 : couru plus lentement que prédit")
+                    fig_rc.tight_layout(); st.pyplot(fig_rc); plt.close(fig_rc)
+
+                _opts_r = {f"{r['date']} — {r['name'] or 'course'} (#{r['id']})": r["id"] for r in _rc}
+                _sr = st.selectbox("Détail d'une course / d'un plan", list(_opts_r.keys()), key="hist_rc_detail")
+                _rec_r = get_record("races", _opts_r[_sr])
+                if _rec_r:
+                    _splits = _json.loads(_rec_r["splits_json"] or "[]")
+                    _params = _json.loads(_rec_r["params_json"] or "{}")
+                    _cps = _json.loads(_rec_r["checkpoints_json"] or "[]")
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Temps prédit", seconds_to_hms(_rec_r["predicted_s"]) if _rec_r["predicted_s"] else "—")
+                    rc2.metric("Distance", f"{_rec_r['distance_km']:.1f} km" if _rec_r["distance_km"] else "—")
+                    rc3.metric("D+", f"{_rec_r['d_plus']:.0f} m" if _rec_r["d_plus"] else "—")
+                    if _splits:
+                        st.markdown("**Plan kilomètre par kilomètre (tel qu'enregistré)**")
+                        df_sp = pd.DataFrame(_splits)
+                        st.dataframe(df_sp, use_container_width=True, hide_index=True, height=320)
+                        st.download_button("⬇️ Plan (CSV)", df_sp.to_csv(index=False).encode("utf-8"),
+                                           file_name=f"plan_{(_rec_r['name'] or 'course').replace(' ','_')}.csv",
+                                           key="hist_dl_plan")
+                    if _cps:
+                        st.markdown("**Checkpoints**")
+                        st.dataframe(pd.DataFrame(_cps), use_container_width=True, hide_index=True)
+                    with st.expander("⚙️ Paramètres du modèle utilisés"):
+                        st.json(_params)
+                    rr1, rr2, rr3 = st.columns(3)
+                    with rr1:
+                        _act = hms_input("Temps réellement réalisé", default="0:00:00", key="hist_rc_actual")
+                        if st.button("💾 Enregistrer le temps réel", key="hist_rc_actual_btn"):
+                            if update_race_actual(_rec_r["id"], _user["id"], _act):
+                                st.success("Temps réel enregistré."); st.rerun()
+                    with rr2:
+                        if st.button("♻️ Recharger ce plan dans l'onglet Prédiction", key="hist_rc_reload"):
+                            st.session_state["_pending_plan_params"] = _params
+                            if _rec_r.get("gpx_xml"):
+                                st.session_state["_stored_gpx"] = {"name": _rec_r["gpx_name"] or "parcours.gpx",
+                                                                    "xml": _rec_r["gpx_xml"]}
+                            if _cps:
+                                st.session_state["checkpoints"] = _cps
+                            st.success("Plan rechargé — ouvre l'onglet 🏃 Prédiction de course.")
+                    with rr3:
+                        if st.button("🗑️ Supprimer", key="hist_rc_del"):
+                            if delete_record("races", _rec_r["id"], _user["id"]):
+                                st.success("Course supprimée."); st.rerun()
+
+        # ── Données : export / import / maintenance ──────────────────────
+        with h_t4:
+            st.markdown("#### Sauvegarde et transfert")
+            st.caption(f"Toutes les données sont dans le fichier `{DB_PATH}`. Copie ce fichier pour "
+                       "sauvegarder l'ensemble des athlètes et des analyses.")
+            _exp = export_athlete_json(_aid)
+            if _exp:
+                st.download_button(f"⬇️ Exporter tout l'historique de {_aname} (JSON)",
+                                   data=_json.dumps(_exp, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+                                   file_name=f"historique_{_aname.replace(' ', '_')}.json",
+                                   key="hist_export_json")
+            _imp = st.file_uploader("⬆️ Importer un historique athlète (JSON)", type=["json"], key="hist_import_json")
+            if _imp and st.session_state.get("_last_hist_import") != _imp.name:
+                st.session_state["_last_hist_import"] = _imp.name
+                try:
+                    _payload = _json.loads(_imp.read().decode("utf-8"))
+                    _res_imp, _err_imp = import_athlete_json(_user["id"], _payload)
+                    if _err_imp:
+                        st.error(_err_imp)
+                    else:
+                        st.success(f"{_res_imp['n']} enregistrement(s) importé(s).")
+                        st.rerun()
+                except Exception as _e:
+                    st.error(f"Fichier JSON invalide — {_e}")
+            st.markdown("---")
+            with st.expander("🗑️ Supprimer cet athlète et tout son historique"):
+                st.warning("Action irréversible : tests, séances et courses de cet athlète seront effacés.")
+                _confirm = st.text_input(f"Tape le nom de l'athlète pour confirmer", key="hist_del_ath_confirm")
+                if st.button("Supprimer définitivement l'athlète", key="hist_del_ath_btn"):
+                    if _confirm.strip() == _aname:
+                        delete_athlete(_aid, _user["id"])
+                        st.session_state.pop("_athlete_id", None); st.session_state.pop("_athlete_name", None)
+                        st.success("Athlète supprimé."); st.rerun()
+                    else:
+                        st.error("Le nom saisi ne correspond pas.")
