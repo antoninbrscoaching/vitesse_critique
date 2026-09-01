@@ -1726,30 +1726,85 @@ def parse_zonex_csv(file):
             elif cl=="power":renames[c]="Power"
             elif cl=="cadence":renames[c]="Cadence"
             elif cl=="event":renames[c]="palier"
-            elif cl=="aux1":renames[c]="eqO2_raw"
+            elif cl=="aux1":renames[c]="aux1"      # v9.4 : dérivé de la ventilation, PAS un équivalent O₂
             elif cl=="aux2":renames[c]="aux2"
+            elif cl in("eqo2","veo2","ve/vo2"):renames[c]="eqO2_raw"
+            elif cl in("vo2","vo2l/min","vo2lmin"):renames[c]="VO2_Lmin"
         df.rename(columns=renames,inplace=True)
         if "VE" not in df.columns:
             for c in df.columns:
                 if "VE" in c and "L/min" in c:df.rename(columns={c:"VE"},inplace=True);break
-        required=["timestamp","VE","VCO2","eqO2_raw","HR","palier"]
+        # v9.3 — un masque qui ne mesure QUE le CO₂ est le cas normal : seuls
+        # le temps, la ventilation, le CO₂ et le n° de palier sont exigés.
+        # L'oxygène, s'il est présent, est un bonus.
+        df["timestamp"]=pd.to_numeric(df["timestamp"],errors="coerce") if "timestamp" in df.columns else None
+        if "timestamp" not in df.columns or df["timestamp"] is None:return None
+        for col in["VE","VCO2","eqO2_raw","HR","Cadence","FeCO2","eqCO2","VIn"]:
+            if col in df.columns:df[col]=pd.to_numeric(df[col],errors="coerce")
+        # VCO₂ reconstruit depuis la fraction expirée si la colonne directe manque
+        if "VCO2" not in df.columns and "FeCO2" in df.columns and "VE" in df.columns:
+            df["VCO2"]=df["VE"]*df["FeCO2"]/100.0
+        required=["timestamp","VE","VCO2","palier"]
         missing=[r for r in required if r not in df.columns]
         if missing:return None
-        df["timestamp"]=pd.to_numeric(df["timestamp"],errors="coerce")
         df=df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
         df["elapsed_s"]=df["timestamp"]-df["timestamp"].iloc[0];df["elapsed_min"]=df["elapsed_s"]/60.0
-        for col in["VE","VCO2","eqO2_raw","HR","Cadence","FeCO2","eqCO2"]:
-            if col in df.columns:df[col]=pd.to_numeric(df[col],errors="coerce")
-        df["VO2_Lmin"]=df["VE"]/df["eqO2_raw"].replace(0,np.nan)
-        df["RQ"]=df["VCO2"]/df["VO2_Lmin"].replace(0,np.nan)
-        df["eqO2"]=df["eqO2_raw"]
+        # O₂ : uniquement si une colonne d'oxygène explicite existe (VO2 ou éq. O₂).
+        # Les colonnes aux1/aux2 des masques CO₂ suivent la ventilation (r≈0.99 avec VE)
+        # et ne sont surtout pas des équivalents O₂ : les prendre pour tels fabriquerait
+        # un VO₂ et un RER entièrement faux.
+        _has_o2=False
+        if "VO2_Lmin" in df.columns and pd.to_numeric(df["VO2_Lmin"],errors="coerce").notna().mean()>0.5:
+            df["VO2_Lmin"]=pd.to_numeric(df["VO2_Lmin"],errors="coerce")
+            df["RQ"]=df["VCO2"]/df["VO2_Lmin"].replace(0,np.nan)
+            df["eqO2"]=df["VE"]/df["VO2_Lmin"].replace(0,np.nan)
+            _has_o2=True
+        elif "eqO2_raw" in df.columns:
+            _eq=pd.to_numeric(df["eqO2_raw"],errors="coerce").replace(0,np.nan)
+            if _eq.notna().mean()>0.5 and 12.0<=float(_eq.median())<=70.0:
+                df["VO2_Lmin"]=df["VE"]/_eq
+                df["RQ"]=df["VCO2"]/df["VO2_Lmin"].replace(0,np.nan)
+                df["eqO2"]=_eq
+                _has_o2=True
+        if not _has_o2:
+            # équivalent ventilatoire du CO₂ : c'est LE signal exploitable ici
+            df["eqCO2"]=df.get("eqCO2", df["VE"]/df["VCO2"].replace(0,np.nan))
+        if "HR" not in df.columns:df["HR"]=np.nan
+        # FC figée (capteur non connecté) : une seule valeur sur tout le test → inutilisable
+        _hr_ok=bool(pd.to_numeric(df["HR"],errors="coerce").dropna().nunique()>3)
+        if not _hr_ok:df["HR"]=np.nan
+        # vitesse : la colonne Cadence de ces masques porte la vitesse tapis en km/h,
+        # mais elle vaut 0 quand rien n'est connecté
+        _speed_ok=False
+        if "Cadence" in df.columns:
+            _sp=pd.to_numeric(df["Cadence"],errors="coerce")
+            _speed_ok=bool(_sp.notna().any() and float(_sp.max())>1.0)
+        # ── lissage respiratoire : en breath-by-breath, le CV brut d'un palier atteint
+        # 10 % alors que le signal physiologique est stable à ~3 %. Une médiane glissante
+        # (~15 s) enlève ce bruit sans déformer la tendance ; les colonnes brutes restent
+        # disponibles pour l'affichage.
+        _step=float(np.median(np.diff(df["elapsed_s"].values))) if len(df)>3 else 1.0
+        _w=int(max(3,round(15.0/max(0.2,_step))))
+        if _w%2==0:_w+=1
+        for _c in("VE","VCO2","VO2_Lmin"):
+            if _c in df.columns:
+                df[_c+"_raw"]=df[_c]
+                df[_c]=df[_c].rolling(_w,center=True,min_periods=2).median()
+        if "VCO2" in df.columns and "VE" in df.columns:
+            df["eqCO2"]=df["VE"]/df["VCO2"].replace(0,np.nan)
+        if _has_o2:
+            df["RQ"]=df["VCO2"]/df["VO2_Lmin"].replace(0,np.nan)
         df["palier"]=pd.to_numeric(df["palier"],errors="coerce").fillna(0).astype(int)
+        df.attrs["has_o2"]=_has_o2
+        df.attrs["has_hr"]=_hr_ok
+        df.attrs["has_speed"]=_speed_ok
+        df.attrs["smooth_window_s"]=round(_w*_step)
         return df
     except:return None
 
 def aggregate_by_palier(df):
     cols=["elapsed_min","HR","VE","VO2_Lmin","VCO2","RQ","eqO2","eqCO2","Cadence"]
-    cols=[c for c in cols if c in df.columns]
+    cols=[c for c in cols if c in df.columns]   # en mode CO₂ seul, VO2/RQ/eqO2 sont simplement absents
     agg=df.groupby("palier")[cols].mean().reset_index()
     return agg[agg["palier"]>0].sort_values("palier")
 
@@ -2766,8 +2821,12 @@ def _session_grid(df, step_s=1.0, moving_speed_ms=0.3):
     if len(d) < 10:
         return None
     t = d["elapsed_s"].astype(float).values
+    # Garde-fou : certains fichiers donnent un temps absolu (epoch) au lieu d'un
+    # temps écoulé. On repart toujours de 0, et on refuse les durées absurdes
+    # plutôt que d'allouer une grille de plusieurs milliards de points.
+    t = t - float(t[0])
     t_max = float(t[-1])
-    if t_max < 60:
+    if t_max < 60 or t_max > 36 * 3600:
         return None
     dist = d["distance_m"].astype(float).values if "distance_m" in d.columns else np.full(len(d), np.nan)
     if np.isnan(dist).all() or np.nanmax(dist) <= 1.0:
@@ -3026,6 +3085,838 @@ def plot_hr_zones(zones, hr_max):
     chart_title(ax, "Temps par zone cardiaque",
                 f"Zones calculées sur FC max = {hr_max:.0f} bpm · temps en mouvement uniquement")
     ax.grid(axis="y", alpha=0)
+    fig.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════
+# v9.2 — ZONES CALIBRÉES SUR LA VITESSE CRITIQUE
+# Les zones d'intensité sont exprimées en % de la VC (vitesse critique) plutôt
+# qu'en % de FC max : la VC est un repère métabolique mesuré sur l'athlète, là
+# où la FC max est souvent estimée et bouge avec la chaleur, la fatigue ou la
+# caféine. En trail, le temps par zone est calculé sur la VAP (vitesse ramenée
+# au plat) quand l'altitude est disponible — sinon une montée classerait une
+# séance intense en zone basse.
+# ══════════════════════════════════════════════════════════════
+VC_ZONE_BOUNDS_DEFAULT = (65.0, 75.0, 85.0, 95.0, 110.0)
+VC_ZONE_LABELS = ("Sous-Z1 · marche / récup", "Z1 · endurance basse", "Z2 · endurance",
+                  "Z3 · tempo", "Z4 · seuil / VC", "Z5 · au-dessus de VC")
+VC_ZONE_COLORS_IDX = (0, 1, 2, 3, 4, 5)
+
+def vc_zone_table(vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT):
+    """Bornes de zones en % de VC, converties en vitesse et en allure."""
+    if not vc_ms or vc_ms <= 0:
+        return []
+    edges = [0.0] + list(bounds) + [999.0]
+    rows = []
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+        v_lo = vc_ms * lo / 100.0
+        v_hi = vc_ms * hi / 100.0 if hi < 999 else None
+        rows.append({
+            "zone": VC_ZONE_LABELS[i] if i < len(VC_ZONE_LABELS) else f"Z{i}",
+            "pct_lo": lo, "pct_hi": None if hi >= 999 else hi,
+            "v_lo_kmh": round(v_lo * 3.6, 2), "v_hi_kmh": round(v_hi * 3.6, 2) if v_hi else None,
+            "allure_lo_s_km": (1000.0 / v_hi) if v_hi and v_hi > 0 else None,   # borne rapide
+            "allure_hi_s_km": (1000.0 / v_lo) if v_lo > 0 else None,            # borne lente
+        })
+    return rows
+
+def compute_vc_zone_times(df, vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT, use_vap=True):
+    """Temps passé dans chaque zone de VC, sur le temps en mouvement.
+    use_vap=True : la vitesse de chaque instant est ramenée à son équivalent sur
+    le plat (Minetti) avant d'être comparée à la VC — indispensable en trail."""
+    if not vc_ms or vc_ms <= 0:
+        return [], {"error": "Pas de vitesse critique connue pour cet athlète."}
+    g = _session_grid(df)
+    if g is None or g.get("speed_ms") is None:
+        return [], {"error": "Pas de données de vitesse exploitables."}
+    step = g["step_s"]
+    mov = g["moving"]
+    v = np.array(g["speed_ms"], dtype=float)
+    used_vap = False
+    if use_vap and g.get("alt") is not None and g.get("dist") is not None:
+        d_dist = np.gradient(g["dist"], step)
+        d_alt = np.gradient(g["alt"], step)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            grade = np.where(d_dist > 0.2, d_alt / np.maximum(d_dist, 1e-6) * 100.0, 0.0)
+        grade = np.clip(np.nan_to_num(grade), -45.0, 45.0)
+        ratios = np.array([vap_cost_ratio(x) for x in grade])
+        v = v * ratios
+        used_vap = True
+    v_mov = v[mov]
+    if len(v_mov) < 10:
+        return [], {"error": "Trop peu de temps en mouvement."}
+    pct = v_mov / float(vc_ms) * 100.0
+    edges = [0.0] + list(bounds) + [1e9]
+    rows = []
+    total = len(pct)
+    for i in range(len(edges) - 1):
+        n = int(np.sum((pct >= edges[i]) & (pct < edges[i + 1])))
+        rows.append({"zone": VC_ZONE_LABELS[i] if i < len(VC_ZONE_LABELS) else f"Z{i}",
+                     "pct_lo": edges[i], "pct_hi": None if edges[i + 1] > 1e8 else edges[i + 1],
+                     "temps_s": round(n * step), "pct": round(n / max(1, total) * 100.0, 1)})
+    infos = {"used_vap": used_vap, "vc_ms": float(vc_ms),
+             "pct_median": round(float(np.median(pct)), 1),
+             "moving_s": round(float(total * step))}
+    return rows, infos
+
+def plot_vc_zones(zones, vc_ms, used_vap=True):
+    """Temps par zone d'intensité (référence : vitesse critique)."""
+    fig, ax = plt.subplots(figsize=(11.5, 3.2))
+    labels = [z["zone"] for z in zones]
+    vals = [z["temps_s"] / 60.0 for z in zones]
+    cols = [C_DIM, C_GREY, C_WHITE, "#C9C3B8", C_RED_SOFT, C_RED]
+    bars = ax.barh(labels, vals, color=cols[:len(zones)], height=0.62)
+    for b, z in zip(bars, zones):
+        if z["temps_s"] > 0:
+            _rng = (f"{z['pct_lo']:.0f}–{z['pct_hi']:.0f} %" if z.get("pct_hi") else f"> {z['pct_lo']:.0f} %")
+            ax.annotate(f"{seconds_to_hms(z['temps_s'])}  ·  {z['pct']:.0f} %   ({_rng} VC)",
+                        xy=(b.get_width(), b.get_y() + b.get_height() / 2), xytext=(7, 0),
+                        textcoords="offset points", va="center", fontsize=8, color=C_TEXT)
+    ax.invert_yaxis()
+    ax.set_xlabel("Temps (min)")
+    ax.set_xlim(0, max(vals) * 1.45 if max(vals) > 0 else 1)
+    chart_title(ax, "Temps par zone d'intensité — référence vitesse critique",
+                f"VC = {vc_ms*3.6:.2f} km/h ({pace_str(1000.0/vc_ms)}/km)" +
+                (" · calculé sur la VAP (vitesse ramenée au plat)" if used_vap else " · vitesse brute"))
+    ax.grid(axis="y", alpha=0)
+    fig.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════
+# v9.3 — PROFIL MÉTABOLIQUE À PARTIR D'UN MASQUE **CO₂ SEUL**
+#
+# Le masque mesure la ventilation et le CO₂ expiré. Il ne mesure PAS l'O₂.
+# Cela change tout ce qu'on a le droit d'affirmer :
+#
+#   ✅ MESURÉ            : VE, VCO₂, et donc l'équivalent ventilatoire du CO₂
+#                          (VE/VCO₂) → les SEUILS ventilatoires sont solides.
+#   🟠 MODÉLISÉ          : VO₂, déduit de la mécanique de course (vitesse, pente,
+#                          masse, économie de course). C'est une estimation, pas
+#                          une mesure — l'économie varie de ±10 % entre coureurs.
+#   🔴 DÉRIVÉ DU MODÈLE  : la partition glucides/lipides, qui repose sur le RER
+#                          = VCO₂/VO₂ : sans O₂ mesuré, elle hérite de toute
+#                          l'incertitude sur le VO₂ modélisé.
+#
+# L'app publie donc TROIS confiances distinctes plutôt qu'une seule : seuils,
+# dépense énergétique, partition des substrats. C'est la façon honnête de
+# présenter ce que ce capteur peut et ne peut pas dire.
+#
+# Équations :
+#   • VO₂ modélisé : VO₂net (mL/kg/min) = économie (mL/kg/km) × vitesse (km/min)
+#     × coût relatif de la pente (Minetti) ; VO₂brut = VO₂net + 3.5 (repos).
+#   • Dépense : Weir (1949) réécrit à partir du CO₂ mesuré —
+#     kcal/min = VCO₂ × (3.941/RER + 1.106). Sensibilité au RER ≈ ±12 % sur
+#     toute la plage physiologique : la dépense reste correcte même quand la
+#     partition, elle, ne l'est pas.
+#   • Substrats : Jeukendrup & Wallis (2005), avec VO₂ modélisé.
+#   • Seuils : VT2 = nadir de VE/VCO₂ (méthode standard du point de compensation
+#     respiratoire, ne nécessite pas d'O₂) ; VT1 = rupture de pente de VCO₂ vs
+#     intensité (le CO₂ s'emballe quand le tampon bicarbonate entre en jeu).
+# ══════════════════════════════════════════════════════════════
+CHO_A, CHO_B = 4.210, 2.962      # Jeukendrup & Wallis (2005)
+FAT_A, FAT_B = 1.695, 1.701
+WEIR_A, WEIR_B = 3.941, 1.106    # Weir (1949)
+KCAL_PER_G_CHO = 4.07
+KCAL_PER_G_FAT = 9.75
+GLYCOGEN_G_PER_KG = 7.0          # réserves utilisables (muscle + foie), ~500 g pour 70 kg
+ECONOMY_DEFAULT_ML_KG_KM = 200.0  # économie de course : 180 (élite) à 230 (loisir)
+VO2_REST_ML_KG_MIN = 3.5
+
+def estimate_vo2_running(speed_kmh, mass_kg, economy_ml_kg_km=ECONOMY_DEFAULT_ML_KG_KM, grade_pct=0.0):
+    """VO₂ MODÉLISÉ à partir de la mécanique de course (pas mesuré).
+    Le coût de la pente réutilise le modèle de Minetti déjà employé ailleurs
+    dans l'app, pour rester cohérent d'un onglet à l'autre."""
+    v_kmh = float(speed_kmh or 0.0)
+    if v_kmh <= 0.3:
+        return None
+    ratio = vap_cost_ratio(grade_pct)
+    vo2_ml_kg_min = float(economy_ml_kg_km) * (v_kmh / 60.0) * ratio + VO2_REST_ML_KG_MIN
+    return vo2_ml_kg_min * float(mass_kg) / 1000.0        # L/min
+
+def energy_from_vco2(vco2_lmin, rer):
+    """Dépense énergétique à partir du CO₂ MESURÉ et d'un RER (mesuré ou modélisé).
+    kcal/min = 3.941·VO₂ + 1.106·VCO₂ avec VO₂ = VCO₂/RER."""
+    vco2 = max(0.0, float(vco2_lmin or 0.0))
+    r = float(np.clip(rer or 0.85, 0.65, 1.30))
+    return vco2 * (WEIR_A / r + WEIR_B)
+
+def substrate_from_gas(vo2_lmin, vco2_lmin):
+    """Oxydation des substrats. Nécessite un VO₂ : mesuré si l'appareil le donne,
+    sinon modélisé — l'appelant doit le signaler à l'utilisateur."""
+    vo2 = max(0.0, float(vo2_lmin or 0.0))
+    vco2 = max(0.0, float(vco2_lmin or 0.0))
+    if vo2 <= 0.05:
+        return None
+    rer = vco2 / vo2
+    kcal_min = WEIR_A * vo2 + WEIR_B * vco2
+    if rer < 0.70:
+        # Sous 0.70 la partition n'a plus de sens physiologique : chez un coureur en
+        # mouvement, cela signale un CO₂ encore en retard sur l'effort (début de test,
+        # hyperventilation transitoire) ou une vitesse surestimée — pas une oxydation
+        # lipidique record. On publie la dépense, pas la partition.
+        return {"rer": round(rer, 3), "kcal_min": round(kcal_min, 3),
+                "cho_g_min": None, "fat_g_min": None, "pct_cho_kcal": None,
+                "mode": "rer_trop_bas"}
+    if rer <= 1.0:
+        cho = max(0.0, CHO_A * vco2 - CHO_B * vo2)
+        fat = max(0.0, FAT_A * vo2 - FAT_B * vco2)
+        mode = "partition"
+    else:
+        cho = kcal_min / KCAL_PER_G_CHO
+        fat = 0.0
+        mode = "cho_exclusif"
+    return {"rer": round(rer, 3), "kcal_min": round(kcal_min, 3),
+            "cho_g_min": round(cho, 3), "fat_g_min": round(fat, 3),
+            "pct_cho_kcal": round(min(100.0, cho * KCAL_PER_G_CHO / max(1e-6, kcal_min) * 100.0), 1),
+            "mode": mode}
+
+def target_rer_at_intensity(pct_vc, target_rer_easy=0.82):
+    """RER attendu en fonction de l'intensité relative. À basse intensité on brûle
+    un mélange lipides/glucides (RER ~0.80) ; en approchant la vitesse critique la
+    part glucidique domine (RER ~0.92). Sans intensité connue, on garde la valeur
+    « facile » par défaut. C'est cette courbe qui sert d'ancrage au calage de
+    l'économie quand aucun palier vraiment facile n'a été couru."""
+    if pct_vc is None:
+        return float(target_rer_easy)
+    p = float(pct_vc)
+    if p <= 70.0:
+        return float(target_rer_easy) - 0.02
+    if p >= 100.0:
+        return float(target_rer_easy) + 0.10
+    return (float(target_rer_easy) - 0.02) + (p - 70.0) * 0.12 / 30.0
+
+def calibrate_economy(stage_means, mass_kg, target_rer_easy=0.82, easy_max_pct=None, vc_ms=None,
+                      min_stages=3):
+    """Cale l'économie de course pour que le RER des paliers les moins intenses
+    retombe sur la valeur physiologiquement attendue à leur intensité. C'est ce qui
+    remplace la mesure d'O₂ absente : on ancre le modèle là où l'on sait ce que le
+    RER doit valoir.
+
+    Deux garde-fous appris sur des tests réels :
+      • le tout premier palier d'une rampe est écarté quand d'autres sont
+        disponibles — le CO₂ expiré y est encore en train de monter depuis le
+        repos, ce qui sous-estime l'économie ;
+      • si moins de `min_stages` paliers tombent sous le seuil « facile » (cas d'un
+        test qui démarre déjà vite), la fenêtre s'élargit vers le haut plutôt que
+        de caler sur un seul palier — avec un RER cible qui suit l'intensité.
+    Retourne (économie, n_paliers, écart-type, fenêtre_%VC réellement utilisée)."""
+    usable = []
+    for i, s in enumerate(stage_means):
+        v = s.get("vitesse_kmh"); vco2 = s.get("vco2_lmin")
+        if not v or not vco2 or v <= 0.3:
+            continue
+        pct = (v / 3.6 / float(vc_ms) * 100.0) if vc_ms else None
+        usable.append({"i": i, "v": float(v), "vco2": float(vco2), "pct": pct,
+                       "grade": s.get("grade_pct", 0.0)})
+    if not usable:
+        return ECONOMY_DEFAULT_ML_KG_KM, 0, None, None
+    if len(usable) >= 4 and usable[0]["i"] == 0:
+        usable = usable[1:]                     # rampe : on jette le palier de mise en route
+
+    def _eco_of(c):
+        rer_cible = target_rer_at_intensity(c["pct"], target_rer_easy)
+        vo2_ml_kg_min = (c["vco2"] / rer_cible) * 1000.0 / max(1.0, float(mass_kg))
+        ratio = vap_cost_ratio(c["grade"])
+        return (vo2_ml_kg_min - VO2_REST_ML_KG_MIN) / max(1e-6, (c["v"] / 60.0) * ratio)
+
+    if vc_ms and easy_max_pct is not None:
+        ordered = sorted(usable, key=lambda c: (c["pct"] if c["pct"] is not None else 1e9))
+        window = float(easy_max_pct)
+        sel = [c for c in ordered if c["pct"] is not None and c["pct"] <= window]
+        while len(sel) < int(min_stages) and window < 100.0:
+            window = min(100.0, window + 5.0)
+            sel = [c for c in ordered if c["pct"] is not None and c["pct"] <= window]
+        if len(sel) < int(min_stages):
+            sel = ordered[:max(int(min_stages), 1)]
+            window = max([c["pct"] for c in sel if c["pct"] is not None] or [None]) if sel else None
+    else:
+        sel = usable
+        window = None
+
+    cands = [e for e in (_eco_of(c) for c in sel) if 120.0 <= e <= 320.0]
+    if not cands:
+        return ECONOMY_DEFAULT_ML_KG_KM, 0, None, window
+    eco = float(np.clip(np.median(cands), 150.0, 260.0))
+    return (eco, len(cands), (float(np.std(cands)) if len(cands) > 1 else None),
+            (round(float(window), 0) if window else None))
+
+def _piecewise_breakpoint(x, y):
+    """Rupture de pente : ajuste deux droites et retourne le point de cassure, le
+    gain de R² par rapport à une droite unique, et les deux pentes."""
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if len(x) < 6:
+        return None
+    _, _, r_single, _, _ = sp_stats.linregress(x, y)
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    best = None
+    for i in range(2, len(x) - 3):
+        s1, i1, _, _, _ = sp_stats.linregress(x[:i + 1], y[:i + 1])
+        s2, i2, _, _, _ = sp_stats.linregress(x[i:], y[i:])
+        pred = np.concatenate([s1 * x[:i + 1] + i1, s2 * x[i + 1:] + i2])
+        ss = float(np.sum((y - pred) ** 2))
+        if best is None or ss < best[0]:
+            best = (ss, float(x[i]), float(s1), float(s2))
+    if best is None or ss_tot <= 0:
+        return None
+    r2_2seg = 1.0 - best[0] / ss_tot
+    return {"x_break": best[1], "slope_before": best[2], "slope_after": best[3],
+            "r2_2seg": round(r2_2seg, 3), "r2_1seg": round(float(r_single ** 2), 3),
+            "gain_r2": round(r2_2seg - float(r_single ** 2), 3)}
+
+def detect_thresholds_co2(stages, vc_ms=None):
+    """Seuils ventilatoires SANS oxygène :
+      • VT2 (point de compensation respiratoire) = nadir de VE/VCO₂, puis remontée ;
+      • VT1 = rupture de pente de VCO₂ en fonction de l'intensité.
+    L'axe d'intensité est la vitesse si elle est connue, sinon la FC, sinon le
+    numéro de palier : les seuils restent situables même sans tapis instrumenté."""
+    st_ = [s for s in stages if s.get("vco2_lmin") and s.get("ve_lmin")]
+    _key = ("vitesse_kmh" if all(s.get("vitesse_kmh") for s in st_) else
+            ("hr" if all(s.get("hr") for s in st_) else "palier"))
+    _unit = {"vitesse_kmh": "km/h", "hr": "bpm", "palier": "n° de palier"}[_key]
+    st_ = sorted(st_, key=lambda s: s[_key])
+    out = {"vt1": None, "vt2": None, "n_paliers": len(st_), "axe": _key, "axe_unite": _unit}
+    if len(st_) < 5:
+        out["message"] = "Il faut au moins 5 paliers exploitables pour situer les seuils."
+        return out
+    v = np.array([s[_key] for s in st_], dtype=float)
+    ve = np.array([s["ve_lmin"] for s in st_], dtype=float)
+    vco2 = np.array([s["vco2_lmin"] for s in st_], dtype=float)
+    eqco2 = ve / np.maximum(1e-6, vco2)
+    # ── VT2 : minimum de VE/VCO₂ (le nadir), suivi d'une remontée franche ──
+    i_min = int(np.argmin(eqco2))
+    if 0 < i_min < len(v) - 1:
+        rise = float(eqco2[-1] - eqco2[i_min])
+        out["vt2"] = {"x": round(float(v[i_min]), 2), "axe": _key,
+                      "vitesse_kmh": (round(float(v[i_min]), 2) if _key == "vitesse_kmh"
+                                      else st_[i_min].get("vitesse_kmh")),
+                      "eqco2_nadir": round(float(eqco2[i_min]), 2),
+                      "remontee": round(rise, 2), "palier": st_[i_min]["palier"],
+                      "hr": st_[i_min].get("hr"),
+                      "pct_vc": (round(float(v[i_min]) / 3.6 / vc_ms * 100.0, 1)
+                                 if (vc_ms and _key == "vitesse_kmh") else None),
+                      "fiable": bool(rise >= 1.5 and i_min >= 2)}
+    # ── confirmation indépendante de VT2 : après le point de compensation, le CO₂
+    # expiré CHUTE (l'hyperventilation « lave » le CO₂). Deux marqueurs concordants
+    # valent mieux qu'un seul.
+    _fe_all = [s.get("feco2") for s in st_]
+    if all(f is not None for f in _fe_all) and len(_fe_all) >= 5 and out.get("vt2"):
+        _fe_arr = pd.Series(_fe_all, dtype=float).rolling(3, center=True, min_periods=1).mean().values
+        _i_peak = int(np.argmax(_fe_arr))
+        _chute = float(_fe_arr[_i_peak] - _fe_arr[-1]) / max(1e-6, _fe_arr[_i_peak]) * 100.0
+        if _i_peak < len(_fe_arr) - 1 and _chute >= 3.0:
+            _x_peak = float(v[_i_peak])
+            _ecart = abs(_x_peak - out["vt2"]["x"])
+            _pas = float(np.median(np.diff(v))) if len(v) > 2 else 1.0
+            out["vt2"]["confirmation_feco2"] = {"x": round(_x_peak, 2), "chute_pct": round(_chute, 1),
+                                                "concordant": bool(_ecart <= 1.5 * abs(_pas) + 1e-6)}
+            if out["vt2"]["confirmation_feco2"]["concordant"]:
+                out["vt2"]["fiable"] = True
+
+    # ── VT1 : le CO₂ EXPIRÉ (FeCO₂ ≈ PetCO₂) monte jusqu'à VT1 puis fait un plateau,
+    # avant de chuter après VT2. La fin de la montée est donc un marqueur de VT1 qui ne
+    # demande, lui non plus, aucun oxygène. On y recourt en priorité, et l'on retombe sur
+    # la rupture de pente du VCO₂ si le CO₂ expiré n'est pas dans le fichier.
+    _fe = [s.get("feco2") for s in st_]
+    bp = None
+    _source_vt1 = None
+    if all(f is not None for f in _fe) and len(_fe) >= 6:
+        _bpf = _piecewise_breakpoint(v, np.array(_fe, dtype=float))
+        # plateau/chute après le point de rupture : la pente doit nettement s'affaisser
+        if _bpf and _bpf["slope_before"] > 0 and _bpf["slope_after"] < _bpf["slope_before"] * 0.4:
+            bp = {"x_break": _bpf["x_break"], "slope_before": _bpf["slope_after"],
+                  "slope_after": _bpf["slope_before"], "gain_r2": _bpf["gain_r2"], "r2_2seg": _bpf["r2_2seg"]}
+            _source_vt1 = "plateau du CO₂ expiré (FeCO₂)"
+    if bp is None:
+        bp = _piecewise_breakpoint(v, vco2)
+        _source_vt1 = "rupture de pente du VCO₂"
+    if bp and bp["slope_after"] > bp["slope_before"] * 1.05:
+        i_bp = int(np.argmin(np.abs(v - bp["x_break"])))
+        _vt2_v = (out.get("vt2") or {}).get("x")
+        # garde-fou : un VT1 situé au-dessus du VT2 n'a pas de sens physiologique
+        _coherent = (_vt2_v is None) or (bp["x_break"] < _vt2_v - 0.05)
+        out["vt1"] = {"x": round(bp["x_break"], 2), "axe": _key,
+                      "vitesse_kmh": (round(bp["x_break"], 2) if _key == "vitesse_kmh"
+                                      else st_[i_bp].get("vitesse_kmh")),
+                      "palier": st_[i_bp]["palier"], "hr": st_[i_bp].get("hr"),
+                      "pct_vc": (round(bp["x_break"] / 3.6 / vc_ms * 100.0, 1)
+                                 if (vc_ms and _key == "vitesse_kmh") else None),
+                      "gain_r2": bp["gain_r2"], "r2": bp["r2_2seg"], "coherent_vs_vt2": bool(_coherent),
+                      "methode": _source_vt1,
+                      "fiable": bool(bp["gain_r2"] >= 0.02 and bp["r2_2seg"] >= 0.95 and _coherent)}
+        out["vt1_note"] = (f"VT1 obtenu par {_source_vt1}. Sans oxygène, la méthode de référence (V-slope, "
+                           "qui compare VCO₂ et VO₂) est inapplicable : ce repère est indicatif, contrairement "
+                           "à VT2 que le nadir de VE/VCO₂ situe directement.")
+    if out.get("vt1") is None or not (out.get("vt1") or {}).get("fiable"):
+        _vt2x = (out.get("vt2") or {}).get("x")
+        if _vt2x and float(v[0]) >= 0.72 * float(_vt2x):
+            out["vt1_message"] = (
+                f"VT1 non identifiable : le test démarre déjà à {v[0]:.1f} {_unit}, soit "
+                f"{float(v[0])/float(_vt2x)*100:.0f} % de l'intensité de VT2. Le premier seuil est "
+                f"vraisemblablement SOUS la plage testée — pour le capter, il faudrait commencer le "
+                f"protocole nettement plus bas (2 à 3 paliers très faciles).")
+        else:
+            out["vt1_message"] = ("VT1 non identifiable : aucune rupture nette dans le CO₂ produit ni dans le "
+                                  "CO₂ expiré. Des paliers plus longs (3-5 min) rendraient ce signal plus lisible.")
+    out["eqco2_curve"] = [{"x": round(float(a), 2), "eqco2": round(float(b), 2)}
+                          for a, b in zip(v, eqco2)]
+    return out
+
+def _confidences(dur_s, cv_mean_pct, rer, n_prior_tests, n_samples, missing_frac,
+                 vo2_measured, eco_calibrated, eco_spread_pct):
+    """Trois confiances distinctes : ce que le capteur mesure vraiment (seuils),
+    ce qu'il permet d'estimer correctement (dépense), et ce qui dépend d'un VO₂
+    modélisé (partition des substrats)."""
+    stab = float(np.clip(100.0 - 6.0 * float(cv_mean_pct), 0.0, 100.0))
+    d = float(dur_s)
+    if d < 90:      dur_score = 55.0 + (d / 90.0) * 10.0
+    elif d < 180:   dur_score = 65.0 + (d - 90) / 90.0 * 15.0
+    elif d < 300:   dur_score = 80.0 + (d - 180) / 120.0 * 12.0
+    else:           dur_score = 92.0 + min(6.0, (d - 300) / 300.0 * 6.0)
+    r = float(rer or 0.85)
+    if 0.75 <= r <= 0.95:   rer_score = 100.0
+    elif 0.95 < r <= 1.00:  rer_score = 100.0 - (r - 0.95) / 0.05 * 15.0
+    elif r > 1.00:          rer_score = float(np.clip(85.0 - (r - 1.0) / 0.15 * 55.0, 30.0, 85.0))
+    else:                   rer_score = float(np.clip(60.0 + (r - 0.70) / 0.05 * 30.0, 50.0, 100.0))
+    calib = float(min(85.0, 55.0 + 6.0 * int(n_prior_tests)))
+    signal = float(np.clip(100.0 - 60.0 * float(missing_frac) - (10.0 if n_samples < 5 else 0.0), 0.0, 100.0))
+    # qualité du VO₂ : mesuré = 100 ; modélisé = pénalisé, un peu moins si l'économie
+    # a pu être calée sur les paliers faciles de CE test
+    if vo2_measured:
+        vo2_score = 100.0
+    else:
+        vo2_score = 62.0 if eco_calibrated else 45.0
+        if eco_spread_pct is not None:
+            vo2_score -= float(np.clip(eco_spread_pct, 0.0, 20.0))    # économies dispersées = moins sûr
+        vo2_score = float(np.clip(vo2_score, 30.0, 70.0))
+    conf_seuils = float(np.clip(0.45 * stab + 0.25 * dur_score + 0.20 * signal + 0.10 * calib, 35.0, 95.0))
+    conf_energie = float(np.clip(0.28 * stab + 0.22 * dur_score + 0.20 * rer_score
+                                 + 0.20 * (85.0 if not vo2_measured else 100.0) + 0.10 * calib, 35.0, 95.0))
+    conf_substrats = float(np.clip(0.22 * stab + 0.18 * dur_score + 0.20 * rer_score
+                                   + 0.30 * vo2_score + 0.10 * calib, 25.0, 95.0))
+    return {"conf_seuils": round(conf_seuils, 1), "conf_energie": round(conf_energie, 1),
+            "conf_substrats": round(conf_substrats, 1), "confiance": round(conf_energie, 1),
+            "q_stabilite": round(stab), "q_duree": round(dur_score), "q_rer": round(rer_score),
+            "q_calibration": round(calib), "q_signal": round(signal), "q_vo2": round(vo2_score)}
+
+def confidence_label(conf):
+    c = float(conf or 0)
+    if c >= 90: return "Très forte"
+    if c >= 80: return "Forte"
+    if c >= 70: return "Bonne"
+    if c >= 60: return "Modérée"
+    if c >= 50: return "Faible"
+    return "Insuffisante"
+
+def detect_protocol(durations_s):
+    """Ramp, paliers longs, ou protocole mixte (ramp + validation)."""
+    if not durations_s:
+        return "inconnu", ""
+    d = np.array(durations_s, dtype=float)
+    med = float(np.median(d))
+    short = int(np.sum(d < 110)); long_ = int(np.sum(d >= 200))
+    if short >= 3 and long_ >= 2:
+        return "mixte", ("Ramp + paliers de validation — le meilleur des deux : les paliers courts "
+                         "situent les transitions, les longs calibrent les estimations.")
+    if med < 110:
+        return "ramp", ("Ramp (~1 min/palier) — excellent pour situer les transitions ventilatoires, "
+                        "mais l'état stable n'est pas atteint : les substrats sont publiés comme des "
+                        "plages, avec une confiance plafonnée.")
+    if med < 200:
+        return "paliers_courts", "Paliers courts (2-3 min) — compromis correct entre stabilité et durée du test."
+    return "paliers_longs", "Paliers longs (≥ 3 min) — réponse ventilatoire stabilisée, estimations les plus fiables."
+
+def _stage_means(df_gz, window_frac=0.5):
+    """Moyennes de fin de palier (partie la plus proche de l'état stable)."""
+    out = []
+    for pal, sub in df_gz[df_gz["palier"] > 0].groupby("palier"):
+        sub = sub.sort_values("elapsed_s")
+        if len(sub) < 3:
+            continue
+        t0, t1 = float(sub["elapsed_s"].iloc[0]), float(sub["elapsed_s"].iloc[-1])
+        dur = max(1.0, t1 - t0)
+        win = sub[sub["elapsed_s"] >= t1 - dur * float(window_frac)]
+        if len(win) < 3:
+            win = sub
+        vco2 = pd.to_numeric(win.get("VCO2"), errors="coerce")
+        ve = pd.to_numeric(win.get("VE"), errors="coerce")
+        missing = float(vco2.isna().mean())
+        vco2 = vco2.dropna(); ve = ve.dropna()
+        if len(vco2) < 2 or vco2.mean() <= 0.02:
+            continue
+        _feco2 = pd.to_numeric(win.get("FeCO2"), errors="coerce").dropna() if "FeCO2" in win.columns else []
+        rec = {"palier": int(pal), "t_debut_s": t0, "duree_s": round(dur), "n": int(len(vco2)),
+               "missing_frac": missing,
+               "feco2": (round(float(np.mean(_feco2)) * 100.0, 3) if len(_feco2) else None),
+               "vco2_lmin": float(vco2.mean()), "vco2_sd": float(vco2.std() or 0.0),
+               "ve_lmin": float(ve.mean()) if len(ve) else None,
+               "hr": (lambda h: round(float(h.mean())) if len(h) and float(h.mean()) > 40 else None)(
+                   pd.to_numeric(win.get("HR"), errors="coerce").dropna()),
+               "vitesse_kmh": (lambda v: round(float(v.mean()), 2) if len(v) and float(v.mean()) > 0.3 else None)(
+                   pd.to_numeric(win.get("Cadence"), errors="coerce").dropna()),
+               "grade_pct": 0.0}
+        vo2_col = pd.to_numeric(win.get("VO2_Lmin"), errors="coerce").dropna() if "VO2_Lmin" in win.columns else []
+        if len(vo2_col) >= 2 and float(vo2_col.mean()) > 0.05:
+            rec["vo2_mesure_lmin"] = float(vo2_col.mean())
+            rec["vo2_mesure_sd"] = float(vo2_col.std() or 0.0)
+        out.append(rec)
+    out = sorted(out, key=lambda r: r["palier"])
+    # Un dernier « palier » nettement plus court que les autres est presque toujours
+    # un retour au calme ou une coupure d'enregistrement : il fausserait les seuils
+    # (vitesse qui redescend) et l'ancrage de l'économie. On l'écarte, en le disant.
+    if len(out) >= 4:
+        _med = float(np.median([r["duree_s"] for r in out]))
+        _drop = [r["palier"] for r in out if r["duree_s"] < 0.60 * _med]
+        if _drop:
+            out = [r for r in out if r["palier"] not in _drop]
+            for r in out:
+                r.setdefault("_paliers_ecartes", _drop)
+    return out
+
+def analyze_metabolic_stages(df_gz, mass_kg=70.0, vc_ms=None, n_prior_tests=0, window_frac=0.5,
+                             economy_ml_kg_km=None, auto_calibrate_economy=True,
+                             prefer_measured_vo2=True, target_rer_easy=0.82, easy_max_pct=80.0,
+                             speed_by_stage=None):
+    """Analyse palier par palier avec un masque CO₂ seul.
+    Le VO₂ est modélisé (mécanique de course + économie) sauf si le fichier
+    contient un VO₂ réellement mesuré. Trois confiances sont produites."""
+    if df_gz is None or "palier" not in df_gz.columns:
+        return [], {"error": "Fichier sans découpage en paliers."}
+    means = _stage_means(df_gz, window_frac)
+    if not means:
+        return [], {"error": "Aucun palier exploitable (VCO₂ manquant ou trop court)."}
+    # vitesses saisies à la main (tapis sans capteur, allure notée sur le carnet…) :
+    # elles priment sur ce que contient le fichier
+    if speed_by_stage:
+        for m in means:
+            _v = speed_by_stage.get(m["palier"]) or speed_by_stage.get(str(m["palier"]))
+            if _v and float(_v) > 0.3:
+                m["vitesse_kmh"] = round(float(_v), 2)
+    has_speed = any(m.get("vitesse_kmh") for m in means)
+    vo2_measured = prefer_measured_vo2 and all(m.get("vo2_mesure_lmin") for m in means)
+    eco_used, eco_n, eco_sd, eco_window = None, 0, None, None
+    substrats_possibles = True
+    if not vo2_measured:
+        if not has_speed:
+            # Pas d'O₂ ET pas de vitesse : les seuils ventilatoires et la dépense restent
+            # calculables (le CO₂ suffit), la partition des substrats non — on le dit au
+            # lieu de refuser tout le fichier.
+            substrats_possibles = False
+        elif economy_ml_kg_km:
+            eco_used = float(economy_ml_kg_km)
+        elif auto_calibrate_economy and has_speed:
+            eco_used, eco_n, eco_sd, eco_window = calibrate_economy(
+                means, mass_kg, target_rer_easy, easy_max_pct if vc_ms else None, vc_ms)
+        else:
+            eco_used = ECONOMY_DEFAULT_ML_KG_KM
+    eco_spread_pct = (eco_sd / eco_used * 100.0) if (eco_sd and eco_used) else None
+    eco_alerte = None
+    if eco_used and eco_n and (eco_used <= 151.0 or eco_used >= 259.0):
+        eco_alerte = (f"L'économie calée bute sur une borne ({eco_used:.0f} mL/kg/km). Concrètement, le CO₂ "
+                      f"mesuré ne colle pas aux vitesses fournies : vérifie les allures saisies, la masse, ou "
+                      f"le RER de référence des paliers faciles. Les seuils et la dépense restent valables ; "
+                      f"la partition glucides/lipides, elle, est à prendre avec des pincettes.")
+    elif eco_used and eco_n and not (170.0 <= eco_used <= 240.0):
+        eco_alerte = (f"Économie calée à {eco_used:.0f} mL/kg/km, hors de la fourchette habituelle "
+                      f"(180-230). Soit l'athlète est réellement très (peu) économe, soit le RER de "
+                      f"référence retenu pour les paliers d'ancrage ne lui correspond pas.")
+    if eco_used and eco_n and eco_n < 3:
+        _msg_n = (f"Économie calée sur {eco_n} palier(s) seulement : l'ancrage est fragile, la partition "
+                  f"glucides/lipides plus qu'indicative. Un test qui démarre 2 ou 3 paliers plus bas "
+                  f"donnerait un calage beaucoup plus solide.")
+        eco_alerte = (eco_alerte + " " + _msg_n) if eco_alerte else _msg_n
+
+    rows = []
+    RER_DEFAUT_SANS_VITESSE = 0.90     # hypothèse explicite quand rien ne permet de le modéliser
+    for m in means:
+        if vo2_measured:
+            vo2 = m["vo2_mesure_lmin"]; vo2_sd = m.get("vo2_mesure_sd", 0.0)
+        elif substrats_possibles:
+            vo2 = estimate_vo2_running(m.get("vitesse_kmh"), mass_kg, eco_used, m.get("grade_pct", 0.0))
+            vo2_sd = 0.0
+            if vo2 is None:
+                continue
+        else:
+            vo2 = None; vo2_sd = 0.0
+        vco2, vco2_sd, n = m["vco2_lmin"], m["vco2_sd"], max(1, m["n"])
+        cv = float(vco2_sd / max(1e-6, vco2) * 100.0)
+        vco2_sem = vco2_sd / math.sqrt(n)
+        vo2_sem = vo2_sd / math.sqrt(n)
+        if vo2 is None:
+            # dépense seule, avec un RER supposé et une plage large qui l'assume
+            sub_m = {"rer": RER_DEFAUT_SANS_VITESSE, "kcal_min": energy_from_vco2(vco2, RER_DEFAUT_SANS_VITESSE),
+                     "cho_g_min": None, "fat_g_min": None, "pct_cho_kcal": None, "mode": "sans_vo2"}
+        else:
+            sub_m = substrate_from_gas(vo2, vco2)
+            if sub_m is None:
+                continue
+        conf = _confidences(m["duree_s"], cv, sub_m["rer"], n_prior_tests, n, m["missing_frac"],
+                            vo2_measured, bool(eco_n), eco_spread_pct)
+        if vo2 is None:
+            conf["conf_substrats"] = 0.0
+            cho_lo = cho_hi = fat_lo = fat_hi = None
+            _rer_band = 0.12          # RER totalement supposé : plage de dépense élargie
+        else:
+            # incertitude des substrats : mesure (erreur-type) + incertitude sur le VO₂ modélisé
+            vo2_model_unc = 0.0 if vo2_measured else vo2 * 0.08     # ±8 % sur l'économie individuelle
+            lo = substrate_from_gas(vo2 + vo2_sem + vo2_model_unc, max(0.01, vco2 - vco2_sem))
+            hi = substrate_from_gas(max(0.01, vo2 - vo2_sem - vo2_model_unc), vco2 + vco2_sem)
+            widen = (1.0 - conf["conf_substrats"] / 100.0) * 0.25
+            if (sub_m.get("cho_g_min") is None or lo.get("cho_g_min") is None
+                    or hi.get("cho_g_min") is None):
+                # palier hors plage physiologique : pas de partition, donc pas de plage
+                cho_lo = cho_hi = fat_lo = fat_hi = None
+                conf["conf_substrats"] = 0.0
+            else:
+                cho_lo = max(0.0, min(lo["cho_g_min"], hi["cho_g_min"]) * (1 - widen))
+                cho_hi = max(cho_lo, max(lo["cho_g_min"], hi["cho_g_min"]) * (1 + widen))
+                fat_lo = max(0.0, min(lo["fat_g_min"], hi["fat_g_min"]) * (1 - widen))
+                fat_hi = max(fat_lo, max(lo["fat_g_min"], hi["fat_g_min"]) * (1 + widen))
+            _rer_band = 0.06
+        # dépense : bornée par l'incertitude sur le RER (le CO₂, lui, est mesuré)
+        kcal_min = energy_from_vco2(vco2, sub_m["rer"])
+        kcal_lo = energy_from_vco2(vco2 - vco2_sem, min(1.15, sub_m["rer"] + _rer_band))
+        kcal_hi = energy_from_vco2(vco2 + vco2_sem, max(0.70, sub_m["rer"] - _rer_band))
+        row = {"palier": m["palier"], "t_debut_s": m["t_debut_s"], "duree_s": m["duree_s"],
+               "vco2_lmin": round(vco2, 3), "ve_lmin": round(m["ve_lmin"], 1) if m.get("ve_lmin") else None,
+               "eqco2": round(m["ve_lmin"] / max(1e-6, vco2), 1) if m.get("ve_lmin") else None,
+               "vo2_lmin": round(vo2, 3) if vo2 else None,
+               "vo2_source": "mesuré" if vo2_measured else ("modélisé" if vo2 else "indisponible"),
+               "vo2_ml_kg_min": round(vo2 * 1000.0 / max(1.0, mass_kg), 1) if vo2 else None,
+               "cv_pct": round(cv, 1), "hr": m.get("hr"), "vitesse_kmh": m.get("vitesse_kmh"),
+               "feco2": m.get("feco2"),
+               "cho_g_min": sub_m["cho_g_min"],
+               "cho_lo": round(cho_lo, 2) if cho_lo is not None else None,
+               "cho_hi": round(cho_hi, 2) if cho_hi is not None else None,
+               "fat_g_min": sub_m["fat_g_min"],
+               "fat_lo": round(fat_lo, 2) if fat_lo is not None else None,
+               "fat_hi": round(fat_hi, 2) if fat_hi is not None else None,
+               "kcal_h": round(kcal_min * 60.0), "kcal_h_lo": round(kcal_lo * 60.0), "kcal_h_hi": round(kcal_hi * 60.0),
+               "rer": sub_m["rer"], "pct_cho_kcal": sub_m["pct_cho_kcal"], "mode": sub_m["mode"]}
+        if m.get("vitesse_kmh"):
+            km_per_min = m["vitesse_kmh"] / 60.0
+            row["kcal_km"] = round(kcal_min / max(1e-6, km_per_min), 1)
+            row["kcal_kg_km"] = round(row["kcal_km"] / max(1.0, mass_kg), 3)
+            row["cho_g_km"] = (round(sub_m["cho_g_min"] / max(1e-6, km_per_min), 2)
+                               if sub_m.get("cho_g_min") is not None else None)
+            if vc_ms:
+                row["pct_vc"] = round(m["vitesse_kmh"] / 3.6 / float(vc_ms) * 100.0, 1)
+        row.update(conf)
+        rows.append(row)
+    if not rows:
+        return [], {"error": "Paliers inexploitables après contrôle des données."}
+    proto, proto_msg = detect_protocol([r["duree_s"] for r in rows])
+    thresholds = detect_thresholds_co2(rows, vc_ms)
+    infos = {"protocole": proto, "protocole_msg": proto_msg, "n_paliers": len(rows),
+             "vo2_source": "mesuré" if vo2_measured else "modélisé",
+             "economie_ml_kg_km": round(eco_used, 1) if eco_used else None,
+             "economie_calibree": bool(eco_n), "economie_n_paliers": eco_n, "economie_alerte": eco_alerte,
+             "economie_fenetre_pct": eco_window,
+             "paliers_ecartes": (means[0].get("_paliers_ecartes") if means else None),
+             "economie_dispersion_pct": round(eco_spread_pct, 1) if eco_spread_pct else None,
+             "mass_kg": float(mass_kg), "vc_ms": vc_ms, "n_prior_tests": int(n_prior_tests),
+             "seuils": thresholds,
+             "conf_seuils": round(float(np.mean([r["conf_seuils"] for r in rows])), 1),
+             "conf_energie": round(float(np.mean([r["conf_energie"] for r in rows])), 1),
+             "conf_substrats": round(float(np.mean([r["conf_substrats"] for r in rows])), 1)}
+    infos["confiance_globale"] = infos["conf_energie"]
+    infos["substrats_possibles"] = bool(substrats_possibles or vo2_measured)
+    if not infos["substrats_possibles"]:
+        infos["substrats_msg"] = (
+            "Ni oxygène mesuré, ni vitesse renseignée : la partition glucides/lipides est impossible "
+            "(elle exige le RER = VCO₂/VO₂). Les seuils ventilatoires et la dépense énergétique restent "
+            "calculés — saisis les vitesses des paliers ci-dessus pour débloquer les substrats.")
+    # FatMax : n'a de sens que si la courbe d'oxydation lipidique présente un vrai
+    # maximum INTERNE, à une intensité plausible. Un maximum sur le dernier palier
+    # (ou au-delà de la vitesse critique) n'est pas un FatMax : c'est du bruit de
+    # RER, inévitable avec des paliers d'une minute et un VO₂ modélisé. Mieux vaut
+    # dire qu'il n'est pas résolu que d'afficher une valeur fausse.
+    _with_fat = [r for r in rows if r.get("fat_g_min") is not None]
+    if _with_fat:
+        _ordered = sorted(_with_fat, key=lambda r: (r.get("pct_vc") or r.get("vitesse_kmh") or r["palier"]))
+        _best = max(_ordered, key=lambda r: r["fat_g_min"])
+        _idx = _ordered.index(_best)
+        _interne = 0 < _idx < len(_ordered) - 1
+        _plausible = (_best.get("pct_vc") is None) or (_best["pct_vc"] <= 92.0)
+        if len(_ordered) >= 4 and _interne and _plausible:
+            infos["fatmax"] = {"palier": _best["palier"], "fat_g_min": _best["fat_g_min"],
+                               "pct_vc": _best.get("pct_vc"), "vitesse_kmh": _best.get("vitesse_kmh"),
+                               "hr": _best.get("hr")}
+        else:
+            infos["fatmax_msg"] = (
+                "FatMax non résolu sur ce test : l'oxydation lipidique la plus haute tombe "
+                + ("sur un palier extrême du test" if not _interne else
+                   f"à {_best['pct_vc']:.0f} % de la VC, trop haut pour être un vrai FatMax")
+                + ". Avec des paliers d'une minute et un VO₂ modélisé, le RER est trop bruité pour "
+                  "situer un pic ; il faudrait des paliers de 3-5 min démarrant nettement plus bas.")
+    _rers = [r["rer"] for r in rows] if infos["substrats_possibles"] else []
+    if _rers and (max(_rers) > 1.25 or min(_rers) < 0.68):
+        infos["alerte_rer"] = (f"RER modélisé hors plage physiologique ({min(_rers):.2f}–{max(_rers):.2f}) : "
+                               "l'économie de course retenue ou la vitesse des paliers est probablement "
+                               "inexacte. Ajuste l'économie ou vérifie la colonne vitesse du fichier.")
+    return rows, infos
+
+def fueling_plan(stages, vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT, gut_cap_g_h=90.0, mass_kg=70.0,
+                 glycogen_g_per_kg=GLYCOGEN_G_PER_KG):
+    """Plan nutritionnel par zone de VC : oxydation glucidique estimée, apport
+    conseillé (plafonné par la tolérance intestinale) et autonomie glycogénique."""
+    usable = [s for s in stages if s.get("pct_vc") and s.get("cho_g_min") is not None]
+    if not usable or not vc_ms:
+        return [], {"error": "Il faut la vitesse critique de l'athlète et des paliers avec vitesse "
+                             "pour construire un plan nutritionnel."}
+    xs = np.array([s["pct_vc"] for s in usable], dtype=float)
+    order = np.argsort(xs)
+    xs = xs[order]
+    cho = np.array([usable[i]["cho_g_min"] for i in order], dtype=float)
+    cho_lo = np.array([usable[i]["cho_lo"] for i in order], dtype=float)
+    cho_hi = np.array([usable[i]["cho_hi"] for i in order], dtype=float)
+    kcal = np.array([usable[i]["kcal_h"] for i in order], dtype=float)
+    conf = np.array([usable[i]["conf_substrats"] for i in order], dtype=float)
+    edges = [0.0] + list(bounds) + [130.0]
+    stores_g = float(mass_kg) * float(glycogen_g_per_kg)
+    rows = []
+    for i in range(len(edges) - 1):
+        lo_e, hi_e = edges[i], edges[i + 1]
+        mid = (lo_e + hi_e) / 2.0
+        extrapolated = mid < xs.min() - 5 or mid > xs.max() + 5
+        _c = float(np.interp(mid, xs, cho))
+        _clo = float(np.interp(mid, xs, cho_lo)); _chi = float(np.interp(mid, xs, cho_hi))
+        _k = float(np.interp(mid, xs, kcal))
+        _conf = float(np.interp(mid, xs, conf)) * (0.75 if extrapolated else 1.0)
+        ox_h = _c * 60.0
+        intake = min(float(gut_cap_g_h), ox_h)
+        deficit = max(0.0, ox_h - intake)
+        autonomy_h = (stores_g / deficit) if deficit > 1 else None
+        rows.append({
+            "zone": VC_ZONE_LABELS[i] if i < len(VC_ZONE_LABELS) else f"Z{i}",
+            "pct_lo": lo_e, "pct_hi": hi_e,
+            "allure_s_km": (1000.0 / (vc_ms * mid / 100.0)) if mid > 0 else None,
+            "vitesse_kmh": round(vc_ms * mid / 100.0 * 3.6, 2),
+            "cho_g_h": round(ox_h), "cho_g_h_lo": round(_clo * 60.0), "cho_g_h_hi": round(_chi * 60.0),
+            "kcal_h": round(_k), "apport_g_h": round(intake), "deficit_g_h": round(deficit),
+            "autonomie_h": round(autonomy_h, 1) if autonomy_h else None,
+            "confiance": round(_conf), "extrapole": bool(extrapolated),
+        })
+    return rows, {"stores_g": round(stores_g), "gut_cap_g_h": float(gut_cap_g_h)}
+
+def plot_ventilatory_thresholds(stages, thresholds, vc_ms=None):
+    """Ce que le masque MESURE vraiment : VE/VCO₂ (nadir = VT2) et VCO₂ vs
+    intensité (rupture de pente = VT1). Aucun oxygène n'intervient ici."""
+    _key = (thresholds or {}).get("axe") or "vitesse_kmh"
+    _unit = (thresholds or {}).get("axe_unite") or "km/h"
+    st_ = [s for s in stages if s.get(_key) is not None and s.get("eqco2")]
+    st_ = sorted(st_, key=lambda s: s[_key])
+    if len(st_) < 4:
+        return None
+    x = [s[_key] for s in st_]
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11.5, 5.6), sharex=True, gridspec_kw={"hspace": 0.14})
+    a1.plot(x, [s["eqco2"] for s in st_], "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+    a1.set_ylabel("VE / VCO₂")
+    chart_title(a1, "Seuils ventilatoires — mesure directe du masque",
+                "Le minimum de VE/VCO₂ marque le point de compensation respiratoire (VT2) ; "
+                "la rupture de pente du VCO₂ marque VT1")
+    a2.plot(x, [s["vco2_lmin"] for s in st_], "-o", color=C_WHITE, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+    a2.set_ylabel("VCO₂ (L/min)")
+    a2.set_xlabel({"vitesse_kmh": "Vitesse (km/h)", "hr": "Fréquence cardiaque (bpm)",
+                   "palier": "Palier"}[_key])
+    for key, color, label, dy in (("vt1", C_WHITE, "VT1", -12), ("vt2", C_RED, "VT2", -32)):
+        th = (thresholds or {}).get(key)
+        if th and th.get("x") is not None:
+            for _a in (a1, a2):
+                _a.axvline(th["x"], color=color, lw=1.4,
+                           ls="--" if key == "vt1" else ":", alpha=0.85)
+            _txt = f"{label} {th['x']:.1f} {_unit}"
+            if th.get("hr"):
+                _txt += f" · {th['hr']} bpm"
+            if th.get("pct_vc"):
+                _txt += f" · {th['pct_vc']:.0f} % VC"
+            if not th.get("fiable"):
+                _txt += " (signal faible)"
+            # étiquettes décalées l'une sous l'autre : les deux seuils sont souvent proches
+            a1.annotate(_txt, xy=(th["x"], a1.get_ylim()[1]), xytext=(5, dy),
+                        textcoords="offset points", fontsize=8, color=color, va="top",
+                        bbox=dict(boxstyle="round,pad=0.25", fc=C_SURFACE, ec="none", alpha=0.85))
+    try:
+        fig.set_layout_engine("constrained")
+    except Exception:
+        fig.tight_layout()
+    return fig
+
+def plot_substrates(stages, vc_ms=None):
+    """Oxydation glucides / lipides — deux panneaux distincts. Les paliers dont le
+    RER modélisé sort de la plage physiologique (CO₂ en retard en début de test,
+    vitesse douteuse) n'ont pas de partition : ils sont simplement absents des
+    courbes plutôt que tracés à une valeur inventée."""
+    stages = [s for s in stages if s.get("cho_g_min") is not None and s.get("fat_g_min") is not None]
+    if len(stages) < 2:
+        return None
+    use_vc = bool(vc_ms) and all(s.get("pct_vc") for s in stages)
+    x = [s["pct_vc"] for s in stages] if use_vc else [s.get("vitesse_kmh") or s["palier"] for s in stages]
+    modelled = any(s.get("vo2_source") == "modélisé" for s in stages)
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11.5, 5.6), sharex=True, gridspec_kw={"hspace": 0.14})
+    a1.fill_between(x, [s["cho_lo"] for s in stages], [s["cho_hi"] for s in stages],
+                    color=C_RED, alpha=0.16, linewidth=0)
+    a1.plot(x, [s["cho_g_min"] for s in stages], "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+    a1.set_ylabel("Glucides (g/min)")
+    chart_title(a1, "Oxydation des substrats selon l'intensité",
+                ("VO₂ modélisé (masque CO₂ seul) : lecture qualitative, la plage colorée intègre "
+                 "l'incertitude sur l'économie de course" if modelled else
+                 "Plage colorée : variabilité mesurée + incertitude du modèle"))
+    a2.fill_between(x, [s["fat_lo"] for s in stages], [s["fat_hi"] for s in stages],
+                    color=C_WHITE, alpha=0.14, linewidth=0)
+    a2.plot(x, [s["fat_g_min"] for s in stages], "-o", color=C_WHITE, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+    a2.set_ylabel("Lipides (g/min)")
+    a2.set_xlabel("% de la vitesse critique" if use_vc else "Vitesse (km/h)")
+    if use_vc:
+        for _a in (a1, a2):
+            _a.axvline(100, color=C_TEXT_MUT, lw=1.1, ls=":")
+    _fm = max(stages, key=lambda s: s["fat_g_min"])
+    _i_fm = stages.index(_fm)
+    if 0 < _i_fm < len(stages) - 1:     # pic interne seulement : sinon ce n'est pas un FatMax
+        _xfm = _fm.get("pct_vc") if use_vc else (_fm.get("vitesse_kmh") or _fm["palier"])
+        a2.annotate(f"FatMax ≈ {_fm['fat_g_min']:.2f} g/min", xy=(_xfm, _fm["fat_g_min"]),
+                    xytext=(0, 12), textcoords="offset points", ha="center", fontsize=8, color=C_TEXT)
+    try:
+        fig.set_layout_engine("constrained")
+    except Exception:
+        fig.tight_layout()
+    return fig
+
+def plot_energy(stages, vc_ms=None):
+    """Dépense énergétique — la sortie la plus fiable d'un masque CO₂ seul."""
+    use_vc = bool(vc_ms) and all(s.get("pct_vc") for s in stages)
+    x = [s["pct_vc"] for s in stages] if use_vc else [s.get("vitesse_kmh") or s["palier"] for s in stages]
+    fig, ax = plt.subplots(figsize=(11.5, 3.6))
+    ax.fill_between(x, [s["kcal_h_lo"] for s in stages], [s["kcal_h_hi"] for s in stages],
+                    color=C_RED, alpha=0.15, linewidth=0)
+    ax.plot(x, [s["kcal_h"] for s in stages], "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+    ax.set_ylabel("Dépense (kcal/h)")
+    ax.set_xlabel("% de la vitesse critique" if use_vc else "Vitesse (km/h)")
+    chart_title(ax, "Dépense énergétique selon l'intensité",
+                "Calculée à partir du CO₂ mesuré : la plage reflète l'incertitude sur le RER (±0,06), "
+                "qui ne fait bouger la dépense que d'environ ±6 %")
+    fig.tight_layout()
+    return fig
+
+def plot_economy(stages, mass_kg):
+    """Économie de course : coût énergétique par km selon la vitesse."""
+    pts = [s for s in stages if s.get("kcal_kg_km") and s.get("vitesse_kmh")]
+    if len(pts) < 2:
+        return None
+    fig, ax = plt.subplots(figsize=(11.5, 3.6))
+    x = [s["vitesse_kmh"] for s in pts]
+    y = [s["kcal_kg_km"] for s in pts]
+    ax.plot(x, y, "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+    for s in pts:
+        ax.annotate(f"{s['kcal_kg_km']:.2f}", xy=(s["vitesse_kmh"], s["kcal_kg_km"]), xytext=(0, 9),
+                    textcoords="offset points", ha="center", fontsize=7.5, color=C_TEXT_MUT)
+    _m = float(np.mean(y))
+    ax.axhline(_m, color=C_TEXT_MUT, lw=1, ls=":")
+    ax.set_xlabel("Vitesse (km/h)"); ax.set_ylabel("kcal / kg / km")
+    chart_title(ax, "Économie de course",
+                f"Coût énergétique moyen {_m:.2f} kcal/kg/km (≈ {_m*mass_kg:.0f} kcal/km pour {mass_kg:.0f} kg)")
     fig.tight_layout()
     return fig
 
@@ -3611,14 +4502,16 @@ def save_vc_test(athlete_id, date_str, label, vc_ms, d_prime, r2, k, a, refs, no
 
 def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
                  portions=None, intervals=None, extra=None, notes="",
-                 category_id=None, tags="", zones=None, records=None, hr_max_used=None, quarters=None):
+                 category_id=None, tags="", zones=None, records=None, hr_max_used=None, quarters=None,
+                 zones_vc=None, vc_ref_ms=None):
     s = summary or {}
     with db_conn() as c:
         cur = c.execute("""INSERT INTO workouts(athlete_id,date,name,seance_type,file_name,duration_s,distance_m,
                            d_plus,hr_avg,hr_max,hr_drift,pct_walk,trans_lo,trans_mid,trans_hi,
                            vap_slope_montee,vap_last_montee,portions_json,intervals_json,extra_json,notes,created_at,
-                           category_id,tags,zones_json,records_json,hr_max_used,quarters_json)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           category_id,tags,zones_json,records_json,hr_max_used,quarters_json,
+                           zones_vc_json,vc_ref_ms)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (int(athlete_id), str(date_str), str(name), str(seance_type), str(file_name),
                          _db_float(s.get("duration_s")), _db_float(s.get("distance_m")), _db_float(s.get("d_plus")),
                          _db_float(s.get("hr_avg")), _db_float(s.get("hr_max")), _db_float(s.get("hr_drift")),
@@ -3630,7 +4523,8 @@ def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
                          int(category_id) if category_id else None, str(tags),
                          _json.dumps(zones or [], ensure_ascii=False),
                          _json.dumps(records or [], ensure_ascii=False), _db_float(hr_max_used),
-                         _json.dumps(quarters or [], ensure_ascii=False)))
+                         _json.dumps(quarters or [], ensure_ascii=False),
+                         _json.dumps(zones_vc or [], ensure_ascii=False), _db_float(vc_ref_ms)))
         return int(cur.lastrowid)
 
 def save_race(athlete_id, date_str, name, kind, gpx_name, distance_km, d_plus,
@@ -3659,15 +4553,56 @@ def _db_float(v):
     except Exception:
         return None
 
+def save_metabolic_test(athlete_id, date_str, label, protocole, mass_kg, vc_ms, confiance,
+                        stages, fueling, infos, sv1_hr=None, sv2_hr=None, notes=""):
+    """Enregistre un test à échanges gazeux : paliers, plan nutritionnel et confiance."""
+    fm = (infos or {}).get("fatmax") or {}
+    eco = [s.get("kcal_kg_km") for s in (stages or []) if s.get("kcal_kg_km")]
+    with db_conn() as c:
+        cur = c.execute("""INSERT INTO metabolic_tests(athlete_id,date,label,protocole,mass_kg,vc_ms,
+                           confiance,n_paliers,fatmax_pct_vc,fatmax_g_min,eco_kcal_kg_km,sv1_hr,sv2_hr,
+                           stages_json,fueling_json,infos_json,notes,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (int(athlete_id), str(date_str), str(label), str(protocole), _db_float(mass_kg),
+                         _db_float(vc_ms), _db_float(confiance), len(stages or []),
+                         _db_float(fm.get("pct_vc")), _db_float(fm.get("fat_g_min")),
+                         _db_float(float(np.mean(eco)) if eco else None), _db_float(sv1_hr), _db_float(sv2_hr),
+                         _json.dumps(stages or [], ensure_ascii=False),
+                         _json.dumps(fueling or [], ensure_ascii=False),
+                         _json.dumps(infos or {}, ensure_ascii=False, default=str),
+                         str(notes), _db_now()))
+        return int(cur.lastrowid)
+
+def count_metabolic_tests(athlete_id):
+    """Nombre de tests déjà enregistrés — sert à la composante « calibration
+    individuelle » de la confiance : plus l'athlète a de tests, plus le modèle
+    est ancré sur lui."""
+    try:
+        with db_conn() as c:
+            return int(c.execute("SELECT COUNT(*) n FROM metabolic_tests WHERE athlete_id=?",
+                                 (int(athlete_id),)).fetchone()["n"])
+    except sqlite3.Error:
+        return 0
+
+def set_athlete_profile(athlete_id, user_id, mass_kg=None, gut_cap_g_h=None):
+    if not athlete_belongs_to(athlete_id, user_id):
+        return False
+    with db_conn() as c:
+        if mass_kg is not None:
+            c.execute("UPDATE athletes SET mass_kg=? WHERE id=?", (_db_float(mass_kg), int(athlete_id)))
+        if gut_cap_g_h is not None:
+            c.execute("UPDATE athletes SET gut_cap_g_h=? WHERE id=?", (_db_float(gut_cap_g_h), int(athlete_id)))
+    return True
+
 def list_records(table, athlete_id):
-    if table not in ("vc_tests", "workouts", "races"):
+    if table not in ("vc_tests", "workouts", "races", "metabolic_tests"):
         return []
     with db_conn() as c:
         return [dict(r) for r in c.execute(
             f"SELECT * FROM {table} WHERE athlete_id=? ORDER BY date DESC, id DESC", (int(athlete_id),))]
 
 def get_record(table, rec_id):
-    if table not in ("vc_tests", "workouts", "races"):
+    if table not in ("vc_tests", "workouts", "races", "metabolic_tests"):
         return None
     with db_conn() as c:
         r = c.execute(f"SELECT * FROM {table} WHERE id=?", (int(rec_id),)).fetchone()
@@ -3676,7 +4611,7 @@ def get_record(table, rec_id):
 def delete_record(table, rec_id, user_id):
     """Suppression vérifiée : on ne peut effacer qu'un enregistrement rattaché à
     un athlète du coach connecté."""
-    if table not in ("vc_tests", "workouts", "races"):
+    if table not in ("vc_tests", "workouts", "races", "metabolic_tests"):
         return False
     with db_conn() as c:
         row = c.execute(f"""SELECT t.id FROM {table} t JOIN athletes a ON a.id=t.athlete_id
@@ -3721,7 +4656,7 @@ def export_athlete_json(athlete_id):
         if ath is None:
             return None
         data = {"athlete": dict(ath), "exported_at": _db_now(), "app_version": "v8.9"}
-        for t in ("vc_tests", "workouts", "races"):
+        for t in ("vc_tests", "workouts", "races", "metabolic_tests"):
             data[t] = [dict(r) for r in c.execute(
                 f"SELECT * FROM {t} WHERE athlete_id=? ORDER BY date", (int(athlete_id),))]
     return data
@@ -3736,7 +4671,7 @@ def import_athlete_json(user_id, payload, new_name=None):
         return None, err
     n = 0
     with db_conn() as c:
-        for t in ("vc_tests", "workouts", "races"):
+        for t in ("vc_tests", "workouts", "races", "metabolic_tests"):
             for rec in payload.get(t, []):
                 rec = {k: v for k, v in dict(rec).items() if k not in ("id", "athlete_id")}
                 cols = ",".join(rec.keys()); ph = ",".join("?" * len(rec))
@@ -3759,7 +4694,7 @@ db_init()
 # manque (ALTER TABLE ADD COLUMN) — aucune table n'est jamais recréée ni vidée,
 # et une copie de sauvegarde datée est faite avant toute modification de schéma.
 # ══════════════════════════════════════════════════════════════
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_CATEGORIES = ["Sortie longue", "Endurance fondamentale", "Fractionné court",
                       "Fractionné long", "Seuil", "Côtes / VAM", "Test", "Course", "Récupération"]
 
@@ -3821,6 +4756,20 @@ def db_migrate():
         _ensure_column(c, "workouts", "quarters_json", "TEXT")      # v4 : découpage en quarts
         _ensure_column(c, "races", "stops_s", "REAL")               # v4 : total des arrêts prévus
         _ensure_column(c, "races", "moving_s", "REAL")              # v4 : temps hors arrêts
+        _ensure_column(c, "workouts", "zones_vc_json", "TEXT")      # v5 : zones calibrées sur la VC
+        _ensure_column(c, "workouts", "vc_ref_ms", "REAL")
+        _ensure_column(c, "athletes", "mass_kg", "REAL")
+        _ensure_column(c, "athletes", "gut_cap_g_h", "REAL")
+        c.execute("""CREATE TABLE IF NOT EXISTS metabolic_tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            athlete_id INTEGER NOT NULL REFERENCES athletes(id) ON DELETE CASCADE,
+            date TEXT NOT NULL, label TEXT DEFAULT '', protocole TEXT DEFAULT '',
+            mass_kg REAL, vc_ms REAL, confiance REAL, n_paliers INTEGER,
+            fatmax_pct_vc REAL, fatmax_g_min REAL,
+            eco_kcal_kg_km REAL, sv1_hr REAL, sv2_hr REAL,
+            stages_json TEXT, fueling_json TEXT, infos_json TEXT,
+            notes TEXT DEFAULT '', created_at TEXT NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_met_athlete ON metabolic_tests(athlete_id, date)")
         c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
     return SCHEMA_VERSION
 
@@ -4051,7 +5000,7 @@ with main_tabs[0]:
         st.markdown(f'<div class="note-box note-red">♻️ Paramètres rechargés depuis l\'historique : '
                     f'<b>{st.session_state.pop("_plan_reloaded_banner")}</b>. Vérifie la date et l\'heure de '
                     f'départ en section 05, puis relance le calcul en section 06.</div>', unsafe_allow_html=True)
-    st.caption("v9.1 — Quarts de séance · feuille de route ravitos · comptes coach & historique athlète · Analyse trail course/marche · Charte sombre · Filtre GPS · VC FIT/TCX · Prédiction FC · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
+    st.caption("v9.2 — Zones calibrées sur la vitesse critique · profil métabolique & nutrition · quarts de séance · feuille de route ravitos · comptes coach & historique athlète · Analyse trail course/marche · Charte sombre · Filtre GPS · VC FIT/TCX · Prédiction FC · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -5487,16 +6436,30 @@ with main_tabs[1]:
         else:
             st.success(f"✅ {len(df_gz)} lignes chargées · {df_gz['palier'].max()} paliers détectés")
             df_pal = aggregate_by_palier(df_gz)
-            thresholds = detect_sv1_sv2(df_pal)
+            _has_o2 = bool(df_gz.attrs.get("has_o2", "RQ" in df_gz.columns))
+            if _has_o2 and "RQ" in df_pal.columns and "eqO2" in df_pal.columns:
+                thresholds = detect_sv1_sv2(df_pal)
+            else:
+                thresholds = {"sv1": None, "sv2": None}
+                st.markdown('<div class="note-box note-red">🫁 <b>Masque CO₂ seul détecté</b> — ce fichier ne '
+                            "contient pas d'oxygène mesuré. La détection SV1/SV2 classique (qui compare VO₂ et "
+                            "VCO₂) est donc inapplicable : les seuils ventilatoires sont calculés plus bas, "
+                            "dans la section « Profil métabolique », à partir de VE/VCO₂ — une méthode qui ne "
+                            "demande que du CO₂.</div>", unsafe_allow_html=True)
             sv1 = thresholds["sv1"]; sv2 = thresholds["sv2"]
 
             with st.expander("📊 Données brutes par palier"):
                 st.dataframe(df_pal.round(2), use_container_width=True, hide_index=True)
 
-            st.subheader("🎯 Seuils ventilatoires détectés")
-            col_sv1, col_sv2 = st.columns(2)
+            if not _has_o2:
+                st.caption("Seuils ventilatoires : voir la section « Profil métabolique » ci-dessous — "
+                           "avec un masque CO₂, ils se lisent sur VE/VCO₂.")
+            _show_sv = bool(_has_o2)
+            if _show_sv:
+                st.subheader("🎯 Seuils ventilatoires détectés")
+            col_sv1, col_sv2 = st.columns(2) if _show_sv else (st.container(), st.container())
             with col_sv1:
-                if sv1:
+                if sv1 and _show_sv:
                     st.markdown('<div class="test-card">', unsafe_allow_html=True)
                     st.markdown(f"#### 🟢 SV1 — Seuil aérobie")
                     st.metric("FC", f"{sv1['HR']} bpm"); st.metric("Palier", str(sv1["palier"]))
@@ -5504,9 +6467,9 @@ with main_tabs[1]:
                     st.metric("VE", f"{sv1['VE']:.1f} L/min")
                     if sv1.get("Cadence", 0) > 0: st.metric("Vitesse / Cadence", f"{sv1['Cadence']:.2f} km/h")
                     st.markdown("</div>", unsafe_allow_html=True)
-                else: st.info("SV1 non détecté automatiquement.")
+                elif _show_sv: st.info("SV1 non détecté automatiquement.")
             with col_sv2:
-                if sv2:
+                if sv2 and _show_sv:
                     st.markdown('<div class="test-card">', unsafe_allow_html=True)
                     st.markdown(f"#### 🔴 SV2 — Seuil anaérobie")
                     st.metric("FC", f"{sv2['HR']} bpm"); st.metric("Palier", str(sv2["palier"]))
@@ -5514,7 +6477,7 @@ with main_tabs[1]:
                     st.metric("VE", f"{sv2['VE']:.1f} L/min")
                     if sv2.get("Cadence", 0) > 0: st.metric("Vitesse / Cadence", f"{sv2['Cadence']:.2f} km/h")
                     st.markdown("</div>", unsafe_allow_html=True)
-                else: st.info("SV2 non détecté automatiquement.")
+                elif _show_sv: st.info("SV2 non détecté automatiquement.")
 
             if sv1 and sv2:
                 fc_sv1 = sv1["HR"]; fc_sv2 = sv2["HR"]
@@ -5529,14 +6492,387 @@ with main_tabs[1]:
                 x = df_pal["palier"].values; y = df_pal[y_col].values
                 ax.plot(x, y, lw=2, color=color, marker="o", ms=5)
                 ax.set_xlabel("Palier"); ax.set_ylabel(label); ax.set_title(label); ax.grid(alpha=0.3)
-                if sv1: ax.axvline(sv1["palier"], color=C_WHITE, lw=1.5, ls="--", label="SV1")
-                if sv2: ax.axvline(sv2["palier"], color=C_RED,   lw=1.5, ls="--", label="SV2")
+                if sv1: ax.axvline(sv1["palier"], color=C_TEXT_MUT, lw=1.4, ls="--", label="SV1")
+                if sv2: ax.axvline(sv2["palier"], color=C_RED,      lw=1.4, ls=":",  label="SV2")
                 ax.legend(fontsize=7)
-            _ax_palier(axes[0], "VE",   "VE (L/min)",     "#1f77b4")
-            _ax_palier(axes[1], "RQ",   "Quotient Resp.", "#d62728")
-            _ax_palier(axes[2], "eqO2", "Éq. O₂",        "#2ca02c")
-            _ax_palier(axes[3], "HR",   "FC (bpm)",       "#e377c2")
+            _ax_palier(axes[0], "VE",   "VE (L/min)",     C_WHITE)
+            if _has_o2:
+                _ax_palier(axes[1], "RQ",   "Quotient Resp.", C_RED)
+                _ax_palier(axes[2], "eqO2", "Éq. O₂",        C_GREY)
+            else:
+                _ax_palier(axes[1], "VCO2",  "VCO₂ (L/min)",  C_RED)
+                _ax_palier(axes[2], "eqCO2", "Éq. CO₂ (VE/VCO₂)", C_GREY)
+            _ax_palier(axes[3], "HR",   "FC (bpm)",       C_RED_SOFT)
             plt.tight_layout(); st.pyplot(fig_gz); plt.close(fig_gz)
+
+            # ══════════════════════════════════════════════════════════════
+            # v9.3 — PROFIL MÉTABOLIQUE (masque CO₂ seul)
+            # ══════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.subheader("🍬 Profil métabolique, économie et nutrition")
+            _ath_met = get_athlete(current_athlete_id()) if history_ready() else None
+            _vc_last = last_vc_ms(current_athlete_id()) if history_ready() else None
+            _n_prior = count_metabolic_tests(current_athlete_id()) if history_ready() else 0
+            if _has_o2:
+                st.caption("Fichier avec oxygène mesuré : la partition glucides/lipides repose sur des gaz "
+                           "réellement mesurés.")
+            else:
+                st.markdown(
+                    '<div class="note-box note-red">🫁 <b>Masque CO₂ seul</b> — ce que l\'app peut affirmer, '
+                    'et à quel titre :<br>'
+                    '• <b>Mesuré</b> : ventilation et CO₂ → <b>seuils ventilatoires</b> (VT2 = nadir de VE/VCO₂) '
+                    'et <b>dépense énergétique</b> (le CO₂ suffit, à ±6 % près sur le RER).<br>'
+                    '• <b>Modélisé</b> : le VO₂, déduit de la vitesse, de la masse et de l\'économie de course. '
+                    'Ce n\'est pas une mesure.<br>'
+                    '• <b>Dérivé du modèle</b> : la partition glucides/lipides, qui dépend du RER = VCO₂/VO₂ et '
+                    'hérite donc de toute l\'incertitude du VO₂ estimé.<br>'
+                    'C\'est pourquoi trois confiances distinctes sont affichées plutôt qu\'une seule.</div>',
+                    unsafe_allow_html=True)
+
+            _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+            _mass = _mc1.number_input("Masse de l'athlète (kg)", 35.0, 130.0,
+                                      float((_ath_met or {}).get("mass_kg") or 70.0), 0.5, key="met_mass")
+            _vc_met_kmh = _mc2.number_input("Vitesse critique (km/h)", 5.0, 25.0,
+                                            float((_vc_last or 3.9) * 3.6), 0.05, key="met_vc")
+            _gut_cap = _mc3.number_input("Tolérance intestinale (g glucides/h)", 30.0, 140.0,
+                                         float((_ath_met or {}).get("gut_cap_g_h") or 90.0), 5.0, key="met_gut",
+                                         help="60 g/h avec un seul type de glucide, 90-120 g/h avec un mélange "
+                                              "glucose+fructose chez un athlète entraîné à s'alimenter.")
+            _win_frac = _mc4.slider("Fenêtre d'analyse (fin de palier)", 0.3, 1.0, 0.5, 0.05, key="met_win",
+                                    help="Portion finale de chaque palier utilisée pour les moyennes : la plus "
+                                         "proche de l'état stable.")
+            # ── v9.4 : vitesses des paliers, saisies à la main si besoin ──────
+            _diag = []
+            _diag.append("O₂ mesuré" if _has_o2 else "CO₂ seul")
+            _diag.append("FC exploitable" if df_gz.attrs.get("has_hr") else "FC absente ou figée")
+            _diag.append("vitesse dans le fichier" if df_gz.attrs.get("has_speed") else "aucune vitesse dans le fichier")
+            _diag.append(f"lissage respiratoire {df_gz.attrs.get('smooth_window_s', 15)} s")
+            st.caption("Fichier : " + " · ".join(_diag) + ".")
+
+            _pv = _stage_means(df_gz, _win_frac)
+            _skey = f"_met_speeds_{gazoz_file.name}"
+            _vkey = f"_met_speeds_ver_{gazoz_file.name}"
+            if _skey not in st.session_state:
+                st.session_state[_skey] = {int(m["palier"]): float(m.get("vitesse_kmh") or 0.0) for m in _pv}
+                st.session_state[_vkey] = 0
+            with st.expander("🏃 Vitesse de chaque palier"
+                             + ("" if df_gz.attrs.get("has_speed") else " — à renseigner (absente du fichier)"),
+                             expanded=not df_gz.attrs.get("has_speed")):
+                st.caption("La vitesse sert à modéliser le VO₂, donc à estimer les substrats et l'économie. "
+                           "Les seuils ventilatoires et la dépense énergétique, eux, n'en ont pas besoin. "
+                           "Si le tapis n'était pas connecté, saisis les vitesses ici.")
+                _rc1, _rc2, _rc3 = st.columns([1, 1, 1.3])
+                _v0 = _rc1.number_input("Vitesse du 1er palier (km/h)", 3.0, 25.0, 8.0, 0.1, key="met_ramp_v0")
+                _dv = _rc2.number_input("Incrément par palier (km/h)", 0.0, 3.0, 0.5, 0.1, key="met_ramp_dv")
+                with _rc3:
+                    st.caption(" ")
+                    if st.button("↻ Remplir en rampe", key="met_ramp_fill"):
+                        st.session_state[_skey] = {int(m["palier"]): round(_v0 + _dv * i, 2)
+                                                   for i, m in enumerate(_pv)}
+                        st.session_state[_vkey] = st.session_state.get(_vkey, 0) + 1
+                        st.rerun()
+                _hr_col = any(m.get("hr") for m in _pv)      # colonne FC masquée si la FC est figée/absente
+                _df_sp = pd.DataFrame([{k: v for k, v in {
+                    "Palier": int(m["palier"]),
+                    "Durée": seconds_to_hms(m["duree_s"]),
+                    "VCO₂ (L/min)": round(m["vco2_lmin"], 2),
+                    "VE (L/min)": round(m["ve_lmin"], 1) if m.get("ve_lmin") else None,
+                    "FC": (float(m["hr"]) if m.get("hr") else None) if _hr_col else None,
+                    "Vitesse (km/h)": float(st.session_state[_skey].get(int(m["palier"]), 0.0) or 0.0),
+                }.items() if _hr_col or k != "FC"} for m in _pv])
+                _edited = st.data_editor(
+                    _df_sp, hide_index=True, use_container_width=True,
+                    key=f"met_speed_editor_{gazoz_file.name}_{st.session_state.get(_vkey, 0)}",
+                    disabled=[c for c in ["Palier", "Durée", "VCO₂ (L/min)", "VE (L/min)", "FC"]
+                              if c in _df_sp.columns],
+                    column_config={
+                        "Vitesse (km/h)": st.column_config.NumberColumn(
+                            "Vitesse (km/h)", min_value=0.0, max_value=25.0, step=0.1, format="%.2f",
+                            help="0 = palier ignoré pour les substrats et l'économie."),
+                        "FC": st.column_config.NumberColumn("FC", format="%d",
+                                                            help="Vide = FC absente ou figée dans le fichier."),
+                        "VE (L/min)": st.column_config.NumberColumn("VE (L/min)", format="%.1f")})
+                st.session_state[_skey] = {int(r["Palier"]): float(r["Vitesse (km/h)"] or 0.0)
+                                           for _, r in _edited.iterrows()}
+                _sp_ok = [v for v in st.session_state[_skey].values() if v and v > 0.3]
+                if _sp_ok:
+                    _allures = " · ".join(f"{v:.1f} km/h = {pace_str(3600.0/v)}/km"
+                                          for v in (min(_sp_ok), max(_sp_ok)))
+                    st.caption(f"{len(_sp_ok)} palier(s) avec vitesse — {_allures}.")
+                else:
+                    st.caption("Aucune vitesse renseignée : seuls les seuils et la dépense énergétique seront "
+                               "calculés.")
+            _speeds_manual = {k: v for k, v in st.session_state[_skey].items() if v and v > 0.3}
+
+            _eco_mode = _eco_manual = None
+            if not _has_o2:
+                _ec1, _ec2 = st.columns([1.2, 2])
+                _eco_mode = _ec1.radio("Économie de course (pour modéliser le VO₂)",
+                                       ["Calibrer sur les paliers faciles", "Saisir une valeur"],
+                                       key="met_eco_mode")
+                if _eco_mode == "Saisir une valeur":
+                    _eco_manual = _ec2.number_input("Économie (mL O₂ / kg / km)", 150.0, 260.0, 200.0, 1.0,
+                                                    key="met_eco_val",
+                                                    help="180-190 chez l'élite, 200-210 chez un bon coureur "
+                                                         "entraîné, 220-235 chez un coureur loisir. Si tu as un "
+                                                         "test labo avec VO₂ mesuré, mets la valeur exacte.")
+                else:
+                    _ec2.caption("L'app cale l'économie pour que le RER des paliers faciles retombe sur ~0,82, "
+                                 "valeur attendue à basse intensité. C'est ce qui remplace la mesure d'O₂ : on "
+                                 "ancre le modèle là où l'on sait ce que le RER doit valoir.")
+            if history_ready() and st.button("📌 Mémoriser masse et tolérance dans le profil de l'athlète",
+                                             key="met_save_profile"):
+                set_athlete_profile(current_athlete_id(), current_user()["id"], _mass, _gut_cap)
+                st.success("Profil de l'athlète mis à jour.")
+
+            _stages_met, _infos_met = analyze_metabolic_stages(
+                df_gz, mass_kg=_mass, vc_ms=_vc_met_kmh / 3.6, n_prior_tests=_n_prior, window_frac=_win_frac,
+                economy_ml_kg_km=_eco_manual, auto_calibrate_economy=(_eco_manual is None),
+                speed_by_stage=_speeds_manual)
+            if not _stages_met:
+                st.warning(f"Analyse métabolique impossible — {_infos_met.get('error', 'paliers inexploitables')}.")
+            else:
+                _thr = _infos_met.get("seuils") or {}
+                _fm = _infos_met.get("fatmax") or {}
+                _eco_vals = [s["kcal_kg_km"] for s in _stages_met if s.get("kcal_kg_km")]
+                kpi_row([
+                    ("Confiance — seuils", f"{_infos_met['conf_seuils']:.0f} %",
+                     f"{confidence_label(_infos_met['conf_seuils'])} · VE/VCO₂ mesuré"),
+                    ("Confiance — dépense", f"{_infos_met['conf_energie']:.0f} %",
+                     f"{confidence_label(_infos_met['conf_energie'])} · CO₂ mesuré, RER estimé"),
+                    ("Confiance — substrats", f"{_infos_met['conf_substrats']:.0f} %",
+                     f"{confidence_label(_infos_met['conf_substrats'])} · VO₂ {_infos_met['vo2_source']}"),
+                    ("Protocole",
+                     {"ramp": "Ramp 1 min", "paliers_courts": "Paliers 2-3 min",
+                      "paliers_longs": "Paliers ≥ 3 min", "mixte": "Ramp + validation"}.get(
+                         _infos_met["protocole"], "—"),
+                     f"{_infos_met['n_paliers']} paliers exploitables"),
+                ])
+                st.markdown(f'<div class="note-box">{_infos_met["protocole_msg"]}</div>', unsafe_allow_html=True)
+                if _infos_met.get("economie_ml_kg_km"):
+                    _disp = _infos_met.get("economie_dispersion_pct")
+                    st.caption(f"Économie retenue pour modéliser le VO₂ : **{_infos_met['economie_ml_kg_km']:.0f} "
+                               f"mL/kg/km**"
+                               + ((f" — calée sur {_infos_met['economie_n_paliers']} palier(s) d'ancrage"
+                                   + (f" (les moins intenses, jusqu'à {_infos_met['economie_fenetre_pct']:.0f} % "
+                                      f"de la VC)" if _infos_met.get("economie_fenetre_pct") else "")
+                                   + (f", dispersion {_disp:.0f} %" if _disp else ""))
+                                  if _infos_met.get("economie_calibree") else " (valeur saisie)")
+                               + ". Une erreur de 10 % sur cette valeur déplace la partition glucides/lipides, "
+                                 "beaucoup moins la dépense énergétique.")
+                if _infos_met.get("paliers_ecartes"):
+                    st.caption("Palier(s) " + ", ".join(str(p) for p in _infos_met["paliers_ecartes"])
+                               + " écarté(s) : nettement plus courts que les autres (retour au calme ou "
+                                 "coupure d'enregistrement).")
+                if _infos_met.get("economie_alerte"):
+                    st.warning(f"⚠️ {_infos_met['economie_alerte']}")
+                if _infos_met.get("alerte_rer"):
+                    st.warning(f"⚠️ {_infos_met['alerte_rer']}")
+                if not _infos_met.get("substrats_possibles", True):
+                    st.markdown(f'<div class="note-box note-red">{_infos_met.get("substrats_msg", "")}</div>',
+                                unsafe_allow_html=True)
+
+                # ── 1. ce que le masque mesure : les seuils ──────────────
+                st.markdown("##### 🫁 Seuils ventilatoires (mesure directe)")
+                _fig_thr = plot_ventilatory_thresholds(_stages_met, _thr, _vc_met_kmh / 3.6)
+                if _fig_thr is not None:
+                    st.pyplot(_fig_thr); plt.close("all")
+                _rows_thr = []
+                for _k, _lab in (("vt1", "VT1 — seuil aérobie (indicatif)"),
+                                 ("vt2", "VT2 — compensation respiratoire")):
+                    _t = _thr.get(_k)
+                    if _t:
+                        # sans tapis instrumenté, le seuil est situé sur l'axe disponible
+                        # (FC ou n° de palier) : la ligne s'adapte au lieu de planter
+                        _v_thr = _t.get("vitesse_kmh")
+                        _rows_thr.append({
+                            "Seuil": _lab,
+                            "Situé à": f"{_t.get('x', '—')} {_thr.get('axe_unite', '')}",
+                            "Vitesse (km/h)": _v_thr if _v_thr else "—",
+                            "Allure": (pace_str(3600.0 / _v_thr) + "/km") if _v_thr else "—",
+                            "% VC": _t.get("pct_vc") or "—", "FC": _t.get("hr") or "—",
+                            "Palier": _t.get("palier"),
+                            "Qualité du signal": ("solide" if _t.get("fiable") else "faible — à confirmer"),
+                        })
+                if _rows_thr:
+                    st.dataframe(pd.DataFrame(_rows_thr), use_container_width=True, hide_index=True)
+                if _thr.get("vt1_note") and _thr.get("vt1"):
+                    st.caption("ℹ️ " + _thr["vt1_note"])
+                if _thr.get("vt1_message"):
+                    st.caption("ℹ️ " + _thr["vt1_message"])
+                _cf = ((_thr.get("vt2") or {}).get("confirmation_feco2"))
+                if _cf:
+                    st.caption(("✅ VT2 confirmé par un second marqueur indépendant : le CO₂ expiré chute de "
+                                f"{_cf['chute_pct']:.0f} % à partir de {_cf['x']:.1f} {_thr.get('axe_unite','')}."
+                                ) if _cf.get("concordant") else
+                               ("ℹ️ Le CO₂ expiré chute à partir de "
+                                f"{_cf['x']:.1f} {_thr.get('axe_unite','')}, soit un peu après le nadir de "
+                                f"VE/VCO₂ : les deux marqueurs encadrent VT2 sans se superposer exactement."))
+                if not _rows_thr:
+                    st.caption(_thr.get("message", "Seuils non identifiables sur ce test."))
+
+                # ── 2. dépense énergétique ───────────────────────────────
+                st.markdown("##### 🔥 Dépense énergétique et économie")
+                st.pyplot(plot_energy(_stages_met, _vc_met_kmh / 3.6)); plt.close("all")
+                _fig_eco = plot_economy(_stages_met, _mass)
+                if _fig_eco is not None:
+                    st.pyplot(_fig_eco); plt.close("all")
+
+                # ── 3. substrats ─────────────────────────────────────────
+                st.markdown("##### ⚗️ Oxydation des substrats")
+                _substrats_ok = bool(_infos_met.get("substrats_possibles", True)) and \
+                                any(x.get("cho_g_min") is not None for x in _stages_met)
+                if not _has_o2:
+                    st.caption("Rappel : sans O₂ mesuré, ces courbes reposent sur un VO₂ modélisé. Elles sont "
+                               "utiles pour comparer des intensités entre elles et suivre un athlète dans le "
+                               "temps avec le même protocole ; elles ne remplacent pas une mesure de laboratoire.")
+                _fig_sub = (plot_substrates([x for x in _stages_met if x.get("cho_g_min") is not None],
+                                            _vc_met_kmh / 3.6) if _substrats_ok else None)
+                _rer_bas = [x["palier"] for x in _stages_met if x.get("mode") == "rer_trop_bas"]
+                if _fig_sub is not None:
+                    st.pyplot(_fig_sub); plt.close("all")
+                    if _rer_bas:
+                        st.caption("Palier(s) " + ", ".join(str(p) for p in _rer_bas)
+                                   + " sans partition : RER modélisé sous 0.70, physiologiquement impossible "
+                                     "à l'effort. C'est le signe d'un CO₂ encore en retard sur l'effort "
+                                     "(typique du tout premier palier) ou d'une vitesse surestimée — la "
+                                     "dépense énergétique de ces paliers, elle, reste valable.")
+                elif _substrats_ok:
+                    st.info("Pas assez de paliers avec une partition exploitable pour tracer les courbes "
+                            "de substrats.")
+                else:
+                    st.info("Substrats non calculables sur ce fichier : renseigne les vitesses des paliers "
+                            "ci-dessus (section « Vitesse de chaque palier ») pour les débloquer.")
+                if not _fm and _infos_met.get("fatmax_msg") and _substrats_ok:
+                    st.markdown(f'<div class="note-box">{_infos_met["fatmax_msg"]}</div>',
+                                unsafe_allow_html=True)
+                if _fm and _substrats_ok:
+                    st.markdown(f'<div class="note-box note-red">FatMax estimé à <b>{_fm.get("fat_g_min", 0):.2f} '
+                                f'g/min</b> vers <b>{_fm.get("vitesse_kmh", 0):.1f} km/h</b>'
+                                + (f" ({_fm['pct_vc']:.0f} % de la VC)" if _fm.get("pct_vc") else "")
+                                + (f", FC ≈ {_fm['hr']} bpm" if _fm.get("hr") else "")
+                                + ".</div>", unsafe_allow_html=True)
+
+                st.markdown("##### Détail par palier")
+                st.dataframe(pd.DataFrame([{
+                    "Palier": s["palier"], "Durée": seconds_to_hms(s["duree_s"]),
+                    "Vitesse (km/h)": s.get("vitesse_kmh", "—"), "% VC": s.get("pct_vc", "—"),
+                    "FC": s.get("hr", "—"),
+                    "VE (L/min)": s.get("ve_lmin", "—"), "VCO₂ (L/min)": s["vco2_lmin"],
+                    "VE/VCO₂": s.get("eqco2", "—"),
+                    "VO₂ (mL/kg/min)": (f"{s['vo2_ml_kg_min']} ({s['vo2_source']})"
+                                        if s.get("vo2_ml_kg_min") else "—"),
+                    "RER": (s["rer"] if s.get("mode") != "sans_vo2" else f"{s['rer']} (supposé)"),
+                    "Dépense (kcal/h)": f"{s['kcal_h']}  [{s['kcal_h_lo']} – {s['kcal_h_hi']}]",
+                    "kcal/kg/km": s.get("kcal_kg_km", "—"),
+                    # sans vitesse ni O₂, ces deux colonnes n'ont pas de valeur : on l'affiche
+                    "Glucides (g/min)": (f"{s['cho_g_min']:.2f}  [{s['cho_lo']:.2f} – {s['cho_hi']:.2f}]"
+                                         if s.get("cho_g_min") is not None else "—"),
+                    "Lipides (g/min)": (f"{s['fat_g_min']:.2f}  [{s['fat_lo']:.2f} – {s['fat_hi']:.2f}]"
+                                        if s.get("fat_g_min") is not None else "—"),
+                    "Stabilité (CV %)": s["cv_pct"],
+                    "Conf. seuils / dépense / substrats":
+                        f"{s['conf_seuils']:.0f} / {s['conf_energie']:.0f} / {s['conf_substrats']:.0f} %",
+                } for s in _stages_met]), use_container_width=True, hide_index=True)
+                if any(s["mode"] == "cho_exclusif" for s in _stages_met):
+                    st.caption("⚠️ Paliers à RER > 1.00 : une partie du CO₂ provient du tamponnement des ions H⁺ "
+                               "et non du métabolisme. L'app y bascule sur « glucides quasi exclusifs » et "
+                               "abaisse la confiance.")
+
+                # ── 4. plan nutritionnel ─────────────────────────────────
+                st.markdown("##### 🥤 Plan nutritionnel par zone")
+                _plan_met, _pinfo = fueling_plan(_stages_met, _vc_met_kmh / 3.6,
+                                                 gut_cap_g_h=_gut_cap, mass_kg=_mass)
+                if not _plan_met:
+                    st.caption(_pinfo.get("error", "Plan indisponible."))
+                else:
+                    st.dataframe(pd.DataFrame([{
+                        "Zone": r["zone"], "% VC": f"{r['pct_lo']:.0f} – {r['pct_hi']:.0f} %",
+                        "Allure": (pace_str(r["allure_s_km"]) + "/km") if r.get("allure_s_km") else "—",
+                        "Vitesse (km/h)": r["vitesse_kmh"], "Dépense (kcal/h)": r["kcal_h"],
+                        "Glucides oxydés (g/h)": f"{r['cho_g_h']}  [{r['cho_g_h_lo']} – {r['cho_g_h_hi']}]",
+                        "Apport conseillé (g/h)": r["apport_g_h"], "Déficit horaire (g/h)": r["deficit_g_h"],
+                        "Autonomie glycogène": f"{r['autonomie_h']} h" if r.get("autonomie_h") else "≥ 24 h",
+                        "Confiance": f"{r['confiance']:.0f} %" + (" (extrapolé)" if r["extrapole"] else ""),
+                    } for r in _plan_met]), use_container_width=True, hide_index=True)
+                    st.markdown(
+                        f'<div class="note-box">Réserves glycogéniques estimées : <b>{_pinfo["stores_g"]} g</b> '
+                        f'({GLYCOGEN_G_PER_KG:.0f} g/kg) — ordre de grandeur, pas une mesure. L\'apport est '
+                        f'plafonné à <b>{_gut_cap:.0f} g/h</b> : au-delà, ce n\'est plus le métabolisme qui '
+                        f'limite mais l\'absorption. La colonne dépense (kcal/h) est la plus fiable de ce '
+                        f'tableau ; les grammes de glucides en héritent de l\'incertitude du VO₂ modélisé.</div>',
+                        unsafe_allow_html=True)
+
+                st.markdown("##### 🎯 Estimation à une allure donnée")
+                _ec1b, _ec2b = st.columns([1, 3])
+                _target_pace = _ec1b.text_input("Allure visée (mm:ss/km)", value="5:30", key="met_target_pace")
+                _mm = re.match(r"^(\d+):(\d{2})$", _target_pace.strip())
+                if _mm:
+                    _t_s_km = int(_mm.group(1)) * 60 + int(_mm.group(2))
+                    _v_target = 3600.0 / _t_s_km
+                    _pct_target = _v_target / _vc_met_kmh * 100.0
+                    _pts = [s for s in _stages_met if s.get("pct_vc") and s.get("kcal_h") is not None]
+                    if len(_pts) >= 2:
+                        _o = np.argsort([s["pct_vc"] for s in _pts])
+                        _xs_s = np.array([_pts[i]["pct_vc"] for i in _o], dtype=float)
+                        # les paliers sans partition exploitable ne participent qu'à la dépense
+                        _pcho = [s for s in _pts if s.get("cho_g_min") is not None]
+                        if len(_pcho) >= 2:
+                            _oc = np.argsort([s["pct_vc"] for s in _pcho])
+                            _cho_i = float(np.interp(
+                                _pct_target,
+                                np.array([_pcho[i]["pct_vc"] for i in _oc], dtype=float),
+                                np.array([_pcho[i]["cho_g_min"] for i in _oc], dtype=float)))
+                        else:
+                            _cho_i = None
+                        _kcal_i = float(np.interp(_pct_target, _xs_s,
+                                                  np.array([_pts[i]["kcal_h"] for i in _o], dtype=float)))
+                        _conf_i = float(np.interp(_pct_target, _xs_s,
+                                                  np.array([_pts[i]["conf_energie"] for i in _o], dtype=float)))
+                        _hpts = [s for s in _pts if s.get("hr")]
+                        _hr_i = (float(np.interp(_pct_target, [s["pct_vc"] for s in _hpts],
+                                                 [s["hr"] for s in _hpts])) if len(_hpts) >= 2 else None)
+                        _outside = _pct_target < min(_xs_s) - 3 or _pct_target > max(_xs_s) + 3
+                        with _ec2b:
+                            kpi_row([
+                                ("Intensité", f"{_pct_target:.0f} % VC", f"{_v_target:.2f} km/h"),
+                                ("Dépense", f"{_kcal_i:.0f} kcal/h",
+                                 f"≈ {_kcal_i/max(0.1,_v_target):.0f} kcal/km · confiance {_conf_i:.0f} %"),
+                                ("Glucides oxydés",
+                                 f"{_cho_i*60:.0f} g/h" if _cho_i is not None else "—",
+                                 (f"apport conseillé {min(_gut_cap, _cho_i*60):.0f} g/h"
+                                  + (" — valeur invraisemblable, vérifie les vitesses"
+                                     if _cho_i * 60 > 300 else "")
+                                  ) if _cho_i is not None else "partition indisponible"),
+                                ("FC attendue", f"{_hr_i:.0f} bpm" if _hr_i else "—",
+                                 "extrapolé hors plage testée" if _outside else "dans la plage testée"),
+                            ])
+                else:
+                    st.caption("Format attendu : mm:ss (ex. 5:30).")
+
+                st.markdown("##### 💾 Enregistrer ce test métabolique")
+                if history_ready():
+                    with st.form("save_met_form"):
+                        _sm1, _sm2 = st.columns(2)
+                        _met_date = _sm1.date_input("Date du test", value=date.today(), key="save_met_date")
+                        _met_label = _sm2.text_input("Libellé", value="Test CO₂ — profil métabolique",
+                                                     key="save_met_label")
+                        _met_notes = st.text_area("Notes (état de forme, alimentation avant test, matériel…)",
+                                                  key="save_met_notes")
+                        if st.form_submit_button("💾 Enregistrer dans l'historique"):
+                            _sv1_hr = (sv1 or {}).get("HR") or ((_thr.get("vt1") or {}).get("hr"))
+                            _sv2_hr = (sv2 or {}).get("HR") or ((_thr.get("vt2") or {}).get("hr"))
+                            _mid = save_metabolic_test(
+                                current_athlete_id(), _met_date.isoformat(), _met_label,
+                                _infos_met["protocole"], _mass, _vc_met_kmh / 3.6,
+                                _infos_met["conf_energie"], _stages_met, _plan_met if _plan_met else [],
+                                _infos_met, sv1_hr=_sv1_hr, sv2_hr=_sv2_hr, notes=_met_notes)
+                            st.success(f"✅ Test enregistré (#{_mid}) — évolution dans l'onglet 📚 Historique. "
+                                       f"Il compte désormais dans la calibration individuelle de la confiance.")
+                    st.caption(f"Calibration individuelle actuelle : {_n_prior} test(s) déjà enregistré(s) "
+                               f"pour cet athlète.")
+                else:
+                    save_gate("ce test métabolique")
 
     st.markdown("---")
     st.header("04 · Détection du point de rupture (tests à effort maximal)")
@@ -5726,12 +7062,18 @@ with main_tabs[2]:
                 _dv = _q_last.get("derive_vap_pct"); _da = _q_last.get("derive_allure_pct")
                 _dh = _q_last.get("derive_fc_bpm")
                 if _dv is not None and _dh is not None:
+                    _pace_drop = (_da or 0) > 8      # l'allure brute s'est nettement dégradée
                     if _dv <= -6 and _dh >= 8:
-                        _msg = ("Effort typiquement dégradé : la VAP baisse alors que la FC monte — le coût "
-                                "cardiaque de la même vitesse a augmenté (chaleur, déshydratation, fatigue).")
+                        _msg = ("Effort dégradé : la VAP baisse alors que la FC monte — le coût cardiaque de la "
+                                "même vitesse a augmenté (chaleur, déshydratation, fatigue).")
+                    elif _dv >= -3 and _pace_drop:
+                        _msg = ("L'allure brute chute nettement mais la VAP tient : c'est le <b>terrain</b> qui "
+                                "change (plus de dénivelé sur la fin), pas la forme. "
+                                + ("La FC monte quand même : effort soutenable mais engagé."
+                                   if _dh >= 8 else "La FC reste stable : effort bien géré."))
                     elif _dv >= -3 and _dh >= 8:
-                        _msg = ("Allure tenue mais FC en hausse : dérive cardiaque classique sur une sortie "
-                                "longue, sans perte de vitesse — signe d'un effort soutenable mais engagé.")
+                        _msg = ("Allure et VAP tenues, FC en hausse : dérive cardiaque classique sur une sortie "
+                                "longue — effort soutenable mais engagé.")
                     elif _dv >= -3 and abs(_dh) < 8:
                         _msg = "Séance très régulière : ni la VAP ni la FC ne dérivent réellement."
                     else:
@@ -5782,10 +7124,50 @@ with main_tabs[2]:
                                f"{_vc_ref*3.6:.2f} km/h ({pace_str(1000.0/_vc_ref)}/km).")
             else:
                 st.caption("Pas assez de données de distance pour calculer les temps de maintien.")
-            if _zones_tr:
-                st.pyplot(plot_hr_zones(_zones_tr, _hr_max_used)); plt.close("all")
+            # ── v9.2 : zones d'intensité calibrées sur la VITESSE CRITIQUE ──────
+            _vc_athlete = last_vc_ms(current_athlete_id()) if history_ready() else None
+            st.markdown("##### 🎯 Zones d'intensité — référence vitesse critique")
+            _vz1, _vz2 = st.columns([1, 2])
+            _vc_manual = _vz1.number_input("Vitesse critique de référence (km/h)", 5.0, 25.0,
+                                           float((_vc_athlete or 3.9) * 3.6), 0.05, key="vc_zone_ref",
+                                           help="Reprise du dernier test de VC enregistré pour l'athlète ; "
+                                                "modifiable ici pour une simulation.")
+            _vc_use = float(_vc_manual) / 3.6
+            with _vz2:
+                _use_vap_zones = st.checkbox("Calculer sur la VAP (vitesse ramenée au plat) — recommandé en trail",
+                                             value=True, key="vc_zone_vap")
+                st.caption("Les bornes par défaut (65 / 75 / 85 / 95 / 110 % de VC) sont modifiables ci-dessous.")
+            with st.expander("Bornes des zones (% de la vitesse critique)"):
+                _b = st.columns(5)
+                _bounds_vc = tuple(
+                    _b[i].number_input(f"Z{i+1} à partir de (%)", 30.0, 160.0,
+                                       float(VC_ZONE_BOUNDS_DEFAULT[i]), 1.0, key=f"vc_bound_{i}")
+                    for i in range(5))
+            _zones_vc, _zinfo = compute_vc_zone_times(df_train, _vc_use, _bounds_vc, use_vap=_use_vap_zones)
+            st.session_state["_session_zones_vc"] = _zones_vc
+            st.session_state["_session_vc_ref"] = _vc_use
+            if _zones_vc:
+                st.pyplot(plot_vc_zones(_zones_vc, _vc_use, _zinfo.get("used_vap", False))); plt.close("all")
+                _zt = vc_zone_table(_vc_use, _bounds_vc)
+                st.dataframe(pd.DataFrame([{
+                    "Zone": z["zone"],
+                    "% VC": (f"{z['pct_lo']:.0f} – {z['pct_hi']:.0f} %" if z["pct_hi"] else f"> {z['pct_lo']:.0f} %"),
+                    "Vitesse (km/h)": (f"{z['v_lo_kmh']:.2f} – {z['v_hi_kmh']:.2f}" if z["v_hi_kmh"]
+                                       else f"> {z['v_lo_kmh']:.2f}"),
+                    "Allure": ((pace_str(z["allure_lo_s_km"]) + " – " + pace_str(z["allure_hi_s_km"]))
+                               if z["allure_lo_s_km"] else "plus rapide que " + pace_str(z["allure_hi_s_km"])),
+                    "Temps passé": seconds_to_hms(zz["temps_s"]), "% du temps": zz["pct"],
+                } for z, zz in zip(_zt, _zones_vc)]), use_container_width=True, hide_index=True)
+                st.caption(f"Intensité médiane de la séance : **{_zinfo.get('pct_median', 0):.0f} % de la VC**. "
+                           "Zones calibrées sur une mesure de terrain (la VC) plutôt que sur une FC max estimée.")
             else:
-                st.caption("Pas de données cardiaques exploitables dans ce fichier — zones non calculables.")
+                st.caption(f"Zones VC non calculables — {_zinfo.get('error', '')}")
+
+            with st.expander("💓 Zones cardiaques (référence FC max) — vue secondaire"):
+                if _zones_tr:
+                    st.pyplot(plot_hr_zones(_zones_tr, _hr_max_used)); plt.close("all")
+                else:
+                    st.caption("Pas de données cardiaques exploitables dans ce fichier — zones non calculables.")
 
             st.markdown("---")
             st.subheader("🏔️ Analyse trail — course / marche & tenue de la performance")
@@ -6120,7 +7502,9 @@ with main_tabs[2]:
                             zones=st.session_state.get("_session_zones", []),
                             records=st.session_state.get("_session_records", []),
                             hr_max_used=st.session_state.get("_session_hr_max_used"),
-                            quarters=st.session_state.get("_session_quarters", []))
+                            quarters=st.session_state.get("_session_quarters", []),
+                            zones_vc=st.session_state.get("_session_zones_vc", []),
+                            vc_ref_ms=st.session_state.get("_session_vc_ref"))
                         st.success(f"✅ Séance « {_wk_name} » enregistrée pour {current_athlete_name()} "
                                    f"(#{_wid}) — comparaison dans l'onglet 📚 Historique.")
                 st.caption("Les intervalles sont enregistrés tels que découpés ci-dessus : lance "
@@ -6580,7 +7964,9 @@ with main_tabs[4]:
             ("Courses & plans", str(len(_rc)), "prédictions enregistrées"),
         ])
 
-        h_t1, h_t2, h_t3, h_t4 = st.tabs(["📈 Vitesse critique", "🏃 Séances", "🏁 Courses & plans", "🗄️ Données"])
+        _met = list_records("metabolic_tests", _aid)
+        h_t1, h_t2, h_t3, h_t5, h_t4 = st.tabs(["📈 Vitesse critique", "🏃 Séances", "🏁 Courses & plans",
+                                                "🍬 Métabolisme & nutrition", "🗄️ Données"])
 
         # ── Historique VC ────────────────────────────────────────────────
         with h_t1:
@@ -6984,6 +8370,99 @@ with main_tabs[4]:
                         if st.button("🗑️ Supprimer", key="hist_rc_del"):
                             if delete_record("races", _rec_r["id"], _user["id"]):
                                 st.success("Course supprimée."); st.rerun()
+
+        # ── Historique métabolique ───────────────────────────────────────
+        with h_t5:
+            if not _met:
+                st.info("Aucun test métabolique enregistré. Onglet 🧪 Tests d'endurance + VC → section 03 "
+                        "(CSV masque ventilatoire) → « Enregistrer ce test métabolique ».")
+            else:
+                st.dataframe(pd.DataFrame([{
+                    "Date": r["date"], "Test": r["label"] or "—",
+                    "Protocole": {"ramp": "Ramp 1 min", "paliers_courts": "Paliers 2-3 min",
+                                  "paliers_longs": "Paliers ≥ 3 min", "mixte": "Ramp + validation"}.get(
+                                      r["protocole"], r["protocole"] or "—"),
+                    "Paliers": r["n_paliers"],
+                    "Masse (kg)": round(r["mass_kg"], 1) if r["mass_kg"] else None,
+                    "VC (km/h)": round(r["vc_ms"] * 3.6, 2) if r["vc_ms"] else None,
+                    "FatMax (g/min)": round(r["fatmax_g_min"], 2) if r["fatmax_g_min"] else None,
+                    "FatMax (% VC)": round(r["fatmax_pct_vc"]) if r["fatmax_pct_vc"] else None,
+                    "Économie (kcal/kg/km)": round(r["eco_kcal_kg_km"], 3) if r["eco_kcal_kg_km"] else None,
+                    "Confiance": f"{r['confiance']:.0f} %" if r["confiance"] else "—",
+                } for r in _met]), use_container_width=True, hide_index=True)
+
+                _mplot = [r for r in _met if r.get("eco_kcal_kg_km") or r.get("fatmax_g_min")]
+                if len(_mplot) >= 2:
+                    _mplot = sorted(_mplot, key=lambda r: r["date"])
+                    _xm = [datetime.strptime(r["date"], "%Y-%m-%d") for r in _mplot]
+                    fig_m, (axm1, axm2) = plt.subplots(2, 1, figsize=(11.5, 5.2), sharex=True,
+                                                       gridspec_kw={"hspace": 0.15})
+                    axm1.plot(_xm, [r.get("fatmax_g_min") or np.nan for r in _mplot], "-o",
+                              color=C_WHITE, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+                    axm1.set_ylabel("FatMax (g/min)")
+                    chart_title(axm1, "Évolution du profil métabolique",
+                                f"{_aname} · {len(_mplot)} tests — capacité à oxyder les lipides et coût énergétique")
+                    axm2.plot(_xm, [r.get("eco_kcal_kg_km") or np.nan for r in _mplot], "-o",
+                              color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
+                    axm2.set_ylabel("Économie (kcal/kg/km)"); axm2.set_xlabel("Date du test")
+                    axm2.invert_yaxis()   # plus bas = plus économe
+                    fig_m.autofmt_xdate(rotation=0, ha="center")
+                    try:
+                        fig_m.set_layout_engine("constrained")
+                    except Exception:
+                        fig_m.tight_layout()
+                    st.pyplot(fig_m); plt.close(fig_m)
+                    st.caption("Axe du bas inversé : une courbe qui monte visuellement = un athlète plus "
+                               "économe (moins de kcal pour parcourir un km).")
+
+                _opts_m = {f"{r['date']} — {r['label'] or 'test'} (#{r['id']})": r["id"] for r in _met}
+                _sm = st.selectbox("Détail d'un test", list(_opts_m.keys()), key="hist_met_detail")
+                _rec_m = get_record("metabolic_tests", _opts_m[_sm])
+                if _rec_m:
+                    _st_m = _json.loads(_rec_m["stages_json"] or "[]")
+                    _fu_m = _json.loads(_rec_m["fueling_json"] or "[]")
+                    kpi_row([
+                        ("Confiance du modèle", f"{_rec_m['confiance']:.0f} %" if _rec_m["confiance"] else "—",
+                         confidence_label(_rec_m["confiance"] or 0)),
+                        ("FatMax", f"{_rec_m['fatmax_g_min']:.2f} g/min" if _rec_m["fatmax_g_min"] else "—",
+                         f"{_rec_m['fatmax_pct_vc']:.0f} % VC" if _rec_m["fatmax_pct_vc"] else "—"),
+                        ("Économie", f"{_rec_m['eco_kcal_kg_km']:.2f} kcal/kg/km" if _rec_m["eco_kcal_kg_km"] else "—",
+                         f"≈ {_rec_m['eco_kcal_kg_km']*(_rec_m['mass_kg'] or 70):.0f} kcal/km"
+                         if _rec_m["eco_kcal_kg_km"] else "—"),
+                        ("Seuils ventilatoires",
+                         f"SV1 {_rec_m['sv1_hr']:.0f} / SV2 {_rec_m['sv2_hr']:.0f} bpm"
+                         if (_rec_m.get("sv1_hr") and _rec_m.get("sv2_hr")) else "—", "FC aux transitions"),
+                    ])
+                    if _st_m:
+                        st.markdown("**Paliers enregistrés**")
+                        st.dataframe(pd.DataFrame([{
+                            "Palier": x["palier"], "Vitesse (km/h)": x.get("vitesse_kmh", "—"),
+                            "% VC": x.get("pct_vc", "—"), "FC": x.get("hr", "—"), "RER": x.get("rer"),
+                            "Glucides (g/min)": f"{x['cho_g_min']:.2f} [{x['cho_lo']:.2f}–{x['cho_hi']:.2f}]",
+                            "Lipides (g/min)": f"{x['fat_g_min']:.2f} [{x['fat_lo']:.2f}–{x['fat_hi']:.2f}]",
+                            "kcal/h": x.get("kcal_h"), "kcal/kg/km": x.get("kcal_kg_km", "—"),
+                            "Confiance": f"{x['confiance']:.0f} %"} for x in _st_m]),
+                            use_container_width=True, hide_index=True)
+                    if _fu_m:
+                        st.markdown("**Plan nutritionnel enregistré**")
+                        st.dataframe(pd.DataFrame([{
+                            "Zone": x["zone"], "% VC": f"{x['pct_lo']:.0f}–{x['pct_hi']:.0f} %",
+                            "Vitesse (km/h)": x.get("vitesse_kmh"),
+                            "kcal/h": x.get("kcal_h"),
+                            "Glucides oxydés (g/h)": f"{x['cho_g_h']} [{x['cho_g_h_lo']}–{x['cho_g_h_hi']}]",
+                            "Apport conseillé (g/h)": x["apport_g_h"], "Déficit (g/h)": x["deficit_g_h"],
+                            "Autonomie": f"{x['autonomie_h']} h" if x.get("autonomie_h") else "≥ 24 h",
+                            "Confiance": f"{x['confiance']:.0f} %"} for x in _fu_m]),
+                            use_container_width=True, hide_index=True)
+                        st.download_button("⬇️ Plan nutritionnel (CSV)",
+                                           pd.DataFrame(_fu_m).to_csv(index=False).encode("utf-8"),
+                                           file_name=f"plan_nutrition_{_aname.replace(' ', '_')}.csv",
+                                           key="hist_dl_fueling")
+                    if _rec_m.get("notes"):
+                        st.caption(f"📝 {_rec_m['notes']}")
+                    if st.button("🗑️ Supprimer ce test", key="hist_met_del"):
+                        if delete_record("metabolic_tests", _rec_m["id"], _user["id"]):
+                            st.success("Test supprimé."); st.rerun()
 
         # ── Données : export / import / maintenance ──────────────────────
         with h_t4:
