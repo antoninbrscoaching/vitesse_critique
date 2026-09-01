@@ -160,6 +160,31 @@ plt.rcParams.update({
     "axes.prop_cycle": plt.cycler(color=CHART_CYCLE),
 })
 
+def df_arrow_safe(df):
+    """Streamlit convertit les tableaux en Arrow, qui refuse une colonne mélangeant
+    des nombres et du texte (ex. la colonne « Km » où le dernier kilomètre partiel
+    s'écrit « 34 (974m) », ou une colonne où les valeurs absentes sont notées « — »).
+    On force ces colonnes-là en texte : l'affichage est identique, mais le tableau
+    ne fait plus planter le rendu de la page."""
+    try:
+        out = df.copy()
+        for c in out.columns:
+            if out[c].dtype == object:
+                types = {type(v) for v in out[c].dropna().head(500)}
+                if len(types) > 1:
+                    out[c] = out[c].astype(str)
+        return out
+    except Exception:
+        return df
+
+# Tous les tableaux de l'app passent par ce filtre, y compris ceux ajoutés plus tard.
+_st_dataframe_original = st.dataframe
+def _st_dataframe_safe(data=None, *args, **kwargs):
+    if isinstance(data, pd.DataFrame):
+        data = df_arrow_safe(data)
+    return _st_dataframe_original(data, *args, **kwargs)
+st.dataframe = _st_dataframe_safe
+
 def chart_title(ax, title, subtitle=None):
     """Titre de graphique en deux niveaux (titre blanc + sous-titre gris)."""
     ax.set_title(title, color=C_TEXT, fontsize=11.5, fontweight="600", loc="left", pad=(22 if subtitle else 12))
@@ -2202,6 +2227,68 @@ def run_prediction(distance_cible_km,refs_input,points,date_course,heure_course,
            "dist_gpx_km":dist_gpx_km,"K":K,"K_raw":K_raw,"avg_alt":avg_alt,"d_plus_total":d_plus_total,
            "refs_fit":refs_fit,"pre_df":df_pre}
 
+def build_checkpoint_schedule(df_out, checkpoints, start_dt=None):
+    """Feuille de route : pour chaque ravitaillement, heure/temps d'arrivée, temps
+    d'arrêt prévu, temps de départ, et allure du segment précédent (hors arrêts).
+    Les arrêts des ravitaillements précédents décalent tous les temps suivants.
+    Retourne (lignes, total_arrets_s)."""
+    km_vals, t_cum = [], []
+    for _, row in df_out.iterrows():
+        try:
+            km = float(str(row["Km"]).split()[0])
+        except (ValueError, IndexError):
+            continue
+        km_vals.append(km)
+        t_cum.append(float(hms_to_seconds(str(row["Temps cumulé"]))))
+    if len(km_vals) < 2 or not checkpoints:
+        return [], 0.0
+    rows = []
+    stops_before = 0.0
+    prev_km = 0.0
+    prev_t_mov = 0.0
+    for cp in sorted(checkpoints, key=lambda c: float(c.get("dist_km", 0))):
+        km = float(cp.get("dist_km", 0))
+        t_mov = float(np.interp(km, km_vals, t_cum))
+        arrivee = t_mov + stops_before
+        arret = max(0.0, float(cp.get("arret_s", 0) or 0))
+        depart = arrivee + arret
+        seg_km = max(0.0, km - prev_km)
+        seg_s = max(0.0, t_mov - prev_t_mov)
+        rows.append({
+            "label": cp.get("label", "Ravito"), "type": cp.get("type", ""),
+            "dist_km": km, "alt": cp.get("alt"),
+            "t_mouvement_s": t_mov, "arrivee_s": arrivee, "arret_s": arret, "depart_s": depart,
+            "segment_km": seg_km, "segment_s": seg_s,
+            "allure_segment_s_km": (seg_s / seg_km) if seg_km > 0.05 else None,
+            "allure_moy_depuis_depart_s_km": (t_mov / km) if km > 0.05 else None,
+            "heure_arrivee": (start_dt + timedelta(seconds=arrivee)).strftime("%H:%M:%S") if start_dt else None,
+            "heure_depart": (start_dt + timedelta(seconds=depart)).strftime("%H:%M:%S") if start_dt else None,
+        })
+        stops_before += arret
+        prev_km = km
+        prev_t_mov = t_mov
+    return rows, stops_before
+
+def distribute_stop_budget(checkpoints, budget_s, max_per_stop_s, only_types=("🥤 Ravitaillement",)):
+    """Répartit un budget d'arrêt total sur les ravitaillements, sans dépasser le
+    maximum autorisé par ravitaillement. Retourne (nb_ravitos_servis, budget_placé,
+    budget_non_plaçable)."""
+    elig = [c for c in checkpoints if c.get("type") in only_types] or list(checkpoints)
+    n = len(elig)
+    if n == 0 or budget_s <= 0:
+        for c in checkpoints:
+            c["arret_s"] = 0.0
+        return 0, 0.0, float(budget_s)
+    per = min(float(max_per_stop_s), float(budget_s) / n)
+    placed = 0.0
+    for c in checkpoints:
+        if c in elig:
+            c["arret_s"] = round(per, 1)
+            placed += per
+        else:
+            c["arret_s"] = 0.0
+    return n, placed, max(0.0, float(budget_s) - placed)
+
 def extract_interval_df(df,start_hms,end_hms):
     t_start=float(hms_to_seconds(start_hms));t_end=float(hms_to_seconds(end_hms))
     if t_end<=t_start:return pd.DataFrame()
@@ -2708,7 +2795,138 @@ def _session_grid(df, step_s=1.0, moving_speed_ms=0.3):
         out["hr"] = np.interp(grid, t, hr.interpolate(limit_direction="both").fillna(0.0).values)
     else:
         out["hr"] = None
+    # v9.1 — altitude et cadence, utilisées par le découpage en quarts
+    if "altitude_m" in d.columns and d["altitude_m"].notna().any():
+        alt = pd.Series(d["altitude_m"].astype(float)).interpolate(limit_direction="both").fillna(0.0)
+        alt_g = np.interp(grid, t, alt.values)
+        w_a = max(3, int(round(30.0 / float(step_s))))
+        if w_a % 2 == 0:
+            w_a += 1
+        out["alt"] = pd.Series(alt_g).rolling(w_a, center=True, min_periods=1).median().values
+    else:
+        out["alt"] = None
+    if "cadence_spm" in d.columns and d["cadence_spm"].notna().any():
+        cad = pd.to_numeric(d["cadence_spm"], errors="coerce")
+        _valid = cad.dropna(); _valid = _valid[_valid > 20]
+        cad_g = np.interp(grid, t, cad.interpolate(limit_direction="both").fillna(0.0).values)
+        if len(_valid) and float(_valid.median()) < 110.0:
+            cad_g = cad_g * 2.0            # cadence par jambe → pas/min
+        out["cadence"] = cad_g
+    else:
+        out["cadence"] = None
     return out
+
+def compute_session_quarters(df, n_parts=4):
+    """Découpe la séance en n parts de TEMPS EN MOUVEMENT égales (les pauses ne
+    décalent pas le découpage) et calcule pour chacune : durée, distance, allure,
+    D+, FC moyenne et max, cadence. Sert à voir si l'allure tient et comment la
+    FC dérive au fil de la séance."""
+    g = _session_grid(df)
+    if g is None or g.get("dist") is None:
+        return []
+    step = g["step_s"]; mov = g["moving"]
+    idx_mov = np.flatnonzero(mov)
+    if len(idx_mov) < 4 * n_parts:
+        return []
+    chunks = np.array_split(idx_mov, int(n_parts))
+    rows = []
+    for i, ch in enumerate(chunks):
+        if len(ch) < 2:
+            continue
+        i0, i1 = int(ch[0]), int(ch[-1])
+        dur = float(len(ch) * step)
+        dist = float(g["dist"][i1] - g["dist"][i0])
+        row = {"part": i + 1, "libelle": f"Q{i + 1}",
+               "t_debut_s": float(g["grid"][i0]), "t_fin_s": float(g["grid"][i1]),
+               "duree_s": round(dur), "distance_m": round(dist),
+               "vitesse_kmh": round(dist / max(1.0, dur) * 3.6, 2),
+               "allure_s_km": round(dur / max(0.001, dist / 1000.0), 1) if dist > 10 else None}
+        if g.get("hr") is not None:
+            _h = g["hr"][ch]; _h = _h[(_h >= 40) & (_h <= 230)]
+            if len(_h) > 5:
+                row["fc_moy"] = round(float(np.mean(_h)), 1)
+                row["fc_max"] = round(float(np.percentile(_h, 95)))
+        if g.get("alt") is not None:
+            _a = g["alt"][i0:i1 + 1]
+            if len(_a) > 2:
+                _d = np.diff(_a)
+                row["d_plus"] = round(float(np.sum(np.clip(_d, 0, None))))
+                row["d_moins"] = round(float(-np.sum(np.clip(_d, None, 0))))
+        if g.get("cadence") is not None:
+            _c = g["cadence"][ch]; _c = _c[_c > 20]
+            if len(_c) > 5:
+                row["cadence"] = round(float(np.median(_c)))
+        if g.get("alt") is not None and g.get("speed_ms") is not None and len(ch) > 5:
+            # VAP du quart : vitesse ramenée à son équivalent sur le plat (Minetti),
+            # pour comparer des quarts qui n'ont pas le même dénivelé
+            _alt_c = g["alt"][ch]; _dist_c = g["dist"][ch]
+            _dd = np.diff(_dist_c); _de = np.diff(_alt_c)
+            _grade = np.zeros(len(ch))
+            _ok = _dd > 0.2
+            _grade[1:][_ok] = np.clip(_de[_ok] / _dd[_ok] * 100.0, -45, 45)
+            _ratios = np.array([vap_cost_ratio(gg) for gg in _grade])
+            _spd_kmh = g["speed_ms"][ch] * 3.6
+            row["vap_kmh"] = round(float(np.mean(_spd_kmh * _ratios)), 2)
+        rows.append(row)
+    # dérives par rapport au 1er quart : lecture immédiate de la tenue de l'effort
+    if rows:
+        p0 = rows[0].get("allure_s_km"); h0 = rows[0].get("fc_moy"); v0 = rows[0].get("vap_kmh")
+        for r in rows:
+            if p0 and r.get("allure_s_km"):
+                r["derive_allure_pct"] = round((r["allure_s_km"] - p0) / p0 * 100.0, 1)
+            if h0 and r.get("fc_moy"):
+                r["derive_fc_bpm"] = round(r["fc_moy"] - h0, 1)
+            if v0 and r.get("vap_kmh"):
+                r["derive_vap_pct"] = round((r["vap_kmh"] - v0) / v0 * 100.0, 1)
+    return rows
+
+def plot_session_quarters(quarters):
+    """Allure et FC par quart : deux panneaux distincts partageant l'axe des quarts
+    (jamais deux échelles sur un même axe)."""
+    has_hr = any(q.get("fc_moy") for q in quarters)
+    fig, axes = plt.subplots(2 if has_hr else 1, 1, figsize=(11.5, 4.9 if has_hr else 3.1),
+                             sharex=True, gridspec_kw={"hspace": 0.16})
+    axes = np.atleast_1d(axes)
+    x = np.arange(len(quarters))
+    labels = [q["libelle"] for q in quarters]
+    paces = [q.get("allure_s_km") or 0 for q in quarters]
+    cols = [C_WHITE if i == 0 else (C_RED if (q.get("derive_allure_pct") or 0) > 3 else C_GREY)
+            for i, q in enumerate(quarters)]
+    axes[0].bar(x, paces, color=cols, width=0.6)
+    for xi, q in zip(x, quarters):
+        if q.get("allure_s_km"):
+            _lab = pace_str(q["allure_s_km"]) + "/km"
+            if q.get("derive_allure_pct") is not None and q["part"] > 1:
+                _lab += f"\n{q['derive_allure_pct']:+.1f} %"
+            axes[0].annotate(_lab, xy=(xi, q["allure_s_km"]), xytext=(0, 6), textcoords="offset points",
+                             ha="center", fontsize=8, color=C_TEXT)
+    axes[0].invert_yaxis()
+    axes[0].set_ylabel("Allure (min/km)")
+    axes[0].set_yticks(axes[0].get_yticks())
+    axes[0].set_yticklabels([pace_str(v) for v in axes[0].get_yticks()])
+    axes[0].set_ylim(max(paces) * 1.16, min(p for p in paces if p) * 0.86)
+    chart_title(axes[0], "Séance découpée en quarts",
+                "Quarts de temps en mouvement · en rouge, un quart ralenti de plus de 3 % vs le premier")
+    if has_hr:
+        hrs = [q.get("fc_moy") or 0 for q in quarters]
+        axes[1].bar(x, hrs, color=[C_WHITE if i == 0 else C_RED_SOFT for i in range(len(quarters))], width=0.6)
+        for xi, q in zip(x, quarters):
+            if q.get("fc_moy"):
+                _lab = f"{q['fc_moy']:.0f} bpm"
+                if q.get("derive_fc_bpm") is not None and q["part"] > 1:
+                    _lab += f"\n{q['derive_fc_bpm']:+.0f}"
+                axes[1].annotate(_lab, xy=(xi, q["fc_moy"]), xytext=(0, 6), textcoords="offset points",
+                                 ha="center", fontsize=8, color=C_TEXT)
+        _lo = min(h for h in hrs if h); _hi = max(hrs)
+        axes[1].set_ylim(_lo * 0.90, _hi * 1.10)
+        axes[1].set_ylabel("FC moyenne (bpm)")
+    axes[-1].set_xticks(x); axes[-1].set_xticklabels(labels)
+    axes[-1].set_xlabel("Quart de séance")
+    try:
+        fig.set_layout_engine("constrained")
+    except Exception:
+        fig.tight_layout()
+    return fig
 
 def compute_session_records(df, durations_s=RECORD_DURATIONS_S):
     """Meilleure vitesse moyenne tenue sur chaque durée (fenêtre glissante sur
@@ -3393,14 +3611,14 @@ def save_vc_test(athlete_id, date_str, label, vc_ms, d_prime, r2, k, a, refs, no
 
 def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
                  portions=None, intervals=None, extra=None, notes="",
-                 category_id=None, tags="", zones=None, records=None, hr_max_used=None):
+                 category_id=None, tags="", zones=None, records=None, hr_max_used=None, quarters=None):
     s = summary or {}
     with db_conn() as c:
         cur = c.execute("""INSERT INTO workouts(athlete_id,date,name,seance_type,file_name,duration_s,distance_m,
                            d_plus,hr_avg,hr_max,hr_drift,pct_walk,trans_lo,trans_mid,trans_hi,
                            vap_slope_montee,vap_last_montee,portions_json,intervals_json,extra_json,notes,created_at,
-                           category_id,tags,zones_json,records_json,hr_max_used)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           category_id,tags,zones_json,records_json,hr_max_used,quarters_json)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (int(athlete_id), str(date_str), str(name), str(seance_type), str(file_name),
                          _db_float(s.get("duration_s")), _db_float(s.get("distance_m")), _db_float(s.get("d_plus")),
                          _db_float(s.get("hr_avg")), _db_float(s.get("hr_max")), _db_float(s.get("hr_drift")),
@@ -3411,21 +3629,24 @@ def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
                          _json.dumps(extra or {}, ensure_ascii=False), str(notes), _db_now(),
                          int(category_id) if category_id else None, str(tags),
                          _json.dumps(zones or [], ensure_ascii=False),
-                         _json.dumps(records or [], ensure_ascii=False), _db_float(hr_max_used)))
+                         _json.dumps(records or [], ensure_ascii=False), _db_float(hr_max_used),
+                         _json.dumps(quarters or [], ensure_ascii=False)))
         return int(cur.lastrowid)
 
 def save_race(athlete_id, date_str, name, kind, gpx_name, distance_km, d_plus,
-              predicted_s, actual_s, params, splits, checkpoints=None, notes="", gpx_xml=None):
+              predicted_s, actual_s, params, splits, checkpoints=None, notes="", gpx_xml=None,
+              stops_s=None, moving_s=None):
     with db_conn() as c:
         cur = c.execute("""INSERT INTO races(athlete_id,date,name,kind,gpx_name,distance_km,d_plus,
-                           predicted_s,actual_s,params_json,splits_json,checkpoints_json,gpx_xml,notes,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           predicted_s,actual_s,params_json,splits_json,checkpoints_json,gpx_xml,notes,created_at,
+                           stops_s,moving_s)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (int(athlete_id), str(date_str), str(name), str(kind), str(gpx_name),
                          _db_float(distance_km), _db_float(d_plus), _db_float(predicted_s), _db_float(actual_s),
                          _json.dumps(params or {}, ensure_ascii=False, default=str),
                          _json.dumps(splits or [], ensure_ascii=False, default=str),
                          _json.dumps(checkpoints or [], ensure_ascii=False, default=str),
-                         gpx_xml, str(notes), _db_now()))
+                         gpx_xml, str(notes), _db_now(), _db_float(stops_s), _db_float(moving_s)))
         return int(cur.lastrowid)
 
 def _db_float(v):
@@ -3538,7 +3759,7 @@ db_init()
 # manque (ALTER TABLE ADD COLUMN) — aucune table n'est jamais recréée ni vidée,
 # et une copie de sauvegarde datée est faite avant toute modification de schéma.
 # ══════════════════════════════════════════════════════════════
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_CATEGORIES = ["Sortie longue", "Endurance fondamentale", "Fractionné court",
                       "Fractionné long", "Seuil", "Côtes / VAM", "Test", "Course", "Récupération"]
 
@@ -3597,6 +3818,9 @@ def db_migrate():
         _ensure_column(c, "athletes", "hr_max", "REAL")
         _ensure_column(c, "athletes", "birth_year", "INTEGER")
         _ensure_column(c, "races", "gpx_xml", "TEXT")
+        _ensure_column(c, "workouts", "quarters_json", "TEXT")      # v4 : découpage en quarts
+        _ensure_column(c, "races", "stops_s", "REAL")               # v4 : total des arrêts prévus
+        _ensure_column(c, "races", "moving_s", "REAL")              # v4 : temps hors arrêts
         c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
     return SCHEMA_VERSION
 
@@ -3827,7 +4051,7 @@ with main_tabs[0]:
         st.markdown(f'<div class="note-box note-red">♻️ Paramètres rechargés depuis l\'historique : '
                     f'<b>{st.session_state.pop("_plan_reloaded_banner")}</b>. Vérifie la date et l\'heure de '
                     f'départ en section 05, puis relance le calcul en section 06.</div>', unsafe_allow_html=True)
-    st.caption("v8.9 — Comptes coach & historique athlète · Analyse trail course/marche · Charte sombre · Filtre GPS · VC FIT/TCX · Prédiction FC · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
+    st.caption("v9.1 — Quarts de séance · feuille de route ravitos · comptes coach & historique athlète · Analyse trail course/marche · Charte sombre · Filtre GPS · VC FIT/TCX · Prédiction FC · K Riegel relevé · Fatigue à deux phases (parcours + perso)")
 
     col_mode1,col_mode2=st.columns([2,3])
     with col_mode1:
@@ -4058,7 +4282,20 @@ with main_tabs[0]:
                     avg_temp_ref=cs2.number_input(f"Temp moy. course (°C)",value=15.0,key=f"avgT_{i}")
                     avg_hum_ref=ce2.number_input(f"Humidité moy. (%)",value=60.0,key=f"avgH_{i}")
                 else:avg_temp_ref=avg_hum_ref=None
+            # v9.1 — temps d'arrêt inclus dans le chrono de la référence (ravitos, pauses) :
+            # on les retire pour calibrer le modèle sur du temps EN MOUVEMENT, puis on
+            # rajoutera explicitement les arrêts prévus sur la course cible.
+            arret_ref=hms_input("⏱️ Dont temps d'arrêt (ravitos, pauses)",default="0:00:00",key=f"arret_ref_{i}",
+                                help="Temps total passé à l'arrêt pendant cette course de référence. "
+                                     "Laisse 0:00:00 si le chrono est déjà un temps en mouvement.")
             temps_eff=dur_hms_file if dur_hms_file else temps
+            secs_chrono=hms_to_seconds(temps_eff);secs_arret_ref=hms_to_seconds(arret_ref)
+            if secs_arret_ref>0 and secs_arret_ref<secs_chrono:
+                temps_eff=seconds_to_hms(secs_chrono-secs_arret_ref)
+                st.caption(f"→ chrono {seconds_to_hms(secs_chrono)} − {seconds_to_hms(secs_arret_ref)} d'arrêt "
+                           f"= **{temps_eff} en mouvement** (c'est cette valeur qui calibre le modèle).")
+            elif secs_arret_ref>=secs_chrono and secs_arret_ref>0:
+                st.warning("⚠️ Le temps d'arrêt annoncé dépasse le chrono — valeur ignorée.")
             secs_brut=hms_to_seconds(temps_eff);dist_km=safe_float(dist,1.0)/1000.0
             if secs_brut>0 and dist_km>0:
                 st.caption(f"📍 {dist:.0f} m · {temps_eff} · **{pace_str(secs_brut/dist_km)}/km**"
@@ -4069,8 +4306,9 @@ with main_tabs[0]:
                 st.caption(f"💓 FC max {hr_ref['hr_max']} bpm · FC moy. {hr_ref.get('hr_avg','—')} bpm · dérive {hr_ref['hr_drift']} bpm · seuil ~{hr_ref['hr_threshold_est']} bpm")
             hr_avg_ref = hr_ref.get("hr_avg") if hr_ref else None
             hr_max_ref = hr_ref.get("hr_max") if hr_ref else None
-            refs_raw.append({"distance":float(dist),"temps":str(temps_eff),
-                              "D_up":float(dup),"D_down":float(ddn),"duration_hms_file":dur_hms_file,
+            refs_raw.append({"distance":float(dist),"temps":str(temps_eff),"arret_s":float(secs_arret_ref),
+                              "D_up":float(dup),"D_down":float(ddn),
+                              "duration_hms_file":(temps_eff if secs_arret_ref>0 else dur_hms_file),
                               "avg_temp":avg_temp_ref,"avg_humidity":avg_hum_ref,"avg_wind":avg_wind_ref,
                               "hr_analysis":hr_ref,"hr_avg":hr_avg_ref,"hr_max":hr_max_ref,
                               "breakpoint":ref_breakpoint})
@@ -4537,6 +4775,15 @@ with main_tabs[0]:
             st.error("⚠️ Renseigne au moins une référence valide.")
         else:
             st.session_state["_meteo_api_cache"]={}
+            # v9.1 — un objectif de temps s'entend chrono TOTAL : on en retire les arrêts
+            # prévus pour ne piloter que la partie « en mouvement » du plan.
+            _stops_planned_s=sum(max(0.0,float(c.get("arret_s",0) or 0))
+                                 for c in st.session_state.get("checkpoints",[]))
+            _objectif_mouvement=temps_objectif
+            if force_temps and temps_objectif and _stops_planned_s>0:
+                _objectif_mouvement=seconds_to_hms(max(60.0,hms_to_seconds(temps_objectif)-_stops_planned_s))
+                st.caption(f"Objectif {temps_objectif} − {seconds_to_hms(_stops_planned_s)} d'arrêts prévus "
+                           f"= {_objectif_mouvement} de course effective.")
             with st.spinner("Calcul en cours..."):
                 try:
                     res=run_prediction(
@@ -4559,7 +4806,7 @@ with main_tabs[0]:
                         fatigue_mode=fatigue_mode,
                         dual_fatigue=dual_fatigue,fatigue_threshold2=fatigue_threshold2,fatigue_rate2=fatigue_rate2,
                         apply_ultra=apply_ultra,ultra_amp=ultra_amp,
-                        objective_hms=temps_objectif if force_temps else None,
+                        objective_hms=_objectif_mouvement if force_temps else None,
                         show_smooth_pace=show_smooth_pace,smooth_window_km=smooth_window_km,
                         dem_elevations=dem_elevations,surface_mult=surface_mult,
                         meteo_fallback_temp=meteo_fb["temp"],meteo_fallback_amp=meteo_fb["amp"],
@@ -4679,6 +4926,95 @@ with main_tabs[0]:
                 ax2.legend();ax2.grid(alpha=0.3);st.pyplot(fig2);plt.close(fig2)
             with res_t3:st.dataframe(df_out,use_container_width=True)
 
+        # ── v9.1 : ravitaillements — arrêts prévus et feuille de route ───
+        st.markdown("---")
+        st.subheader("🥤 Ravitaillements — temps de passage et arrêts")
+        _cps_plan = sorted(st.session_state.get("checkpoints", []), key=lambda c: float(c.get("dist_km", 0)))
+        for _cp in _cps_plan:      # identifiant stable : la clé du widget d'arrêt ne bouge plus
+            if not _cp.get("cp_id"):
+                _cp["cp_id"] = f"{float(_cp.get('dist_km', 0)):.3f}_{str(_cp.get('label', ''))[:14]}"
+        if not _cps_plan:
+            st.info("Aucun ravitaillement défini. Ajoute-les plus bas dans « 📍 Checkpoints & Ravitaillements » : "
+                    "ils apparaîtront ici avec leur heure de passage, et tu pourras y placer des temps d'arrêt.")
+        else:
+            with st.expander("⏱️ Temps d'arrêt prévus", expanded=True):
+                st.caption("Le temps d'arrêt s'ajoute au chrono sans changer l'allure de course : la feuille de "
+                           "route ci-dessous décale toutes les heures de passage suivantes.")
+                _bs1, _bs2, _bs3 = st.columns([1, 1, 1.4])
+                _budget_min = _bs1.number_input("Budget total d'arrêt (min)", 0.0, 240.0, 10.0, 0.5,
+                                                key="stop_budget_min")
+                _max_stop_min = _bs2.number_input("Maximum par ravito (min)", 0.5, 30.0, 3.5, 0.5,
+                                                  key="stop_max_min")
+                with _bs3:
+                    st.caption(" ")
+                    if st.button("↻ Répartir le budget sur les ravitaillements", key="btn_distribute_stops"):
+                        _n_srv, _placed, _left = distribute_stop_budget(
+                            st.session_state["checkpoints"], _budget_min * 60.0, _max_stop_min * 60.0)
+                        # on écrit dans les widgets eux-mêmes : sinon Streamlit réafficherait
+                        # l'ancienne valeur du champ tout en utilisant la nouvelle en interne
+                        for _cp in st.session_state["checkpoints"]:
+                            if _cp.get("cp_id"):
+                                st.session_state[f"arret_cp_{_cp['cp_id']}"] = float(_cp.get("arret_s", 0) or 0) / 60.0
+                        st.session_state["_stop_flash"] = (
+                            (f"⚠️ {_n_srv} ravitaillement(s) × {_max_stop_min:.1f} min = {seconds_to_hms(_placed)} "
+                             f"placés ; {seconds_to_hms(_left)} non plaçables avec ce maximum.")
+                            if _left > 1 else
+                            (f"✅ {seconds_to_hms(_placed)} répartis sur {_n_srv} ravitaillement(s) "
+                             f"({_placed/max(1,_n_srv)/60:.1f} min chacun)."))
+                        st.rerun()
+                if st.session_state.get("_stop_flash"):
+                    st.caption(st.session_state.pop("_stop_flash"))
+                _cols_stop = st.columns(min(4, len(_cps_plan)))
+                for _i_cp, _cp in enumerate(_cps_plan):
+                    with _cols_stop[_i_cp % len(_cols_stop)]:
+                        _k_cp = f"arret_cp_{_cp['cp_id']}"
+                        if _k_cp not in st.session_state:
+                            st.session_state[_k_cp] = float(_cp.get("arret_s", 0) or 0) / 60.0
+                        st.number_input(f"{_cp['label']} — km {_cp['dist_km']:.1f}",
+                                        min_value=0.0, max_value=90.0, step=0.5, key=_k_cp,
+                                        help="Temps d'arrêt prévu, en minutes.")
+                        _cp["arret_s"] = float(st.session_state[_k_cp]) * 60.0
+
+            _sched, _stops_total = build_checkpoint_schedule(
+                df_out, _cps_plan, datetime.combine(date_course, heure_course))
+            _moving_s = float(res["total_s"])
+            _total_s = _moving_s + _stops_total
+            kpi_row([
+                ("Temps de course (mouvement)", seconds_to_hms(_moving_s),
+                 pace_str(_moving_s / max(_dist_simulated_km, 1e-6)) + "/km"),
+                ("Arrêts prévus", seconds_to_hms(_stops_total),
+                 f"{len([c for c in _cps_plan if (c.get('arret_s') or 0) > 0])} ravitaillement(s)"),
+                ("Temps total (chrono)", seconds_to_hms(_total_s),
+                 pace_str(_total_s / max(_dist_simulated_km, 1e-6)) + "/km sur la montre"),
+                ("Arrivée prévue",
+                 (datetime.combine(date_course, heure_course) + timedelta(seconds=_total_s)).strftime("%d/%m %H:%M"),
+                 f"départ {heure_course.strftime('%H:%M')}"),
+            ])
+            if _sched:
+                _rows_sched = []
+                for _r in _sched:
+                    _rows_sched.append({
+                        "Ravitaillement": _r["label"], "Km": round(_r["dist_km"], 1),
+                        "Alt (m)": _r.get("alt"),
+                        "Arrivée (temps)": seconds_to_hms(_r["arrivee_s"]),
+                        "Arrivée (heure)": _r.get("heure_arrivee") or "—",
+                        "Arrêt": seconds_to_hms(_r["arret_s"]) if _r["arret_s"] > 0 else "—",
+                        "Départ (temps)": seconds_to_hms(_r["depart_s"]),
+                        "Départ (heure)": _r.get("heure_depart") or "—",
+                        "Segment (km)": round(_r["segment_km"], 1),
+                        "Temps segment": seconds_to_hms(_r["segment_s"]),
+                        "Allure segment": (pace_str(_r["allure_segment_s_km"]) + "/km")
+                                          if _r.get("allure_segment_s_km") else "—",
+                        "Allure moy. cumulée": (pace_str(_r["allure_moy_depuis_depart_s_km"]) + "/km")
+                                               if _r.get("allure_moy_depuis_depart_s_km") else "—",
+                    })
+                df_sched = pd.DataFrame(_rows_sched)
+                st.dataframe(df_sched, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Feuille de route (CSV)", df_sched.to_csv(index=False).encode("utf-8"),
+                                   file_name="feuille_de_route.csv", key="dl_sched")
+                st.caption("« Allure segment » est l'allure à tenir entre deux ravitaillements, hors arrêt. "
+                           "Les heures tiennent compte des arrêts placés en amont.")
+
         # ── v8.9 : enregistrement du plan dans l'historique ──────────────
         st.markdown("---")
         st.markdown("#### 💾 Enregistrer ce plan de course")
@@ -4699,12 +5035,19 @@ with main_tabs[0]:
                                   if c in df_out.columns]
                     _params_save = dict(st.session_state.get("_pred_params", {}))
                     _params_save["_race_name"] = _race_name
+                    _sched_save, _stops_save = build_checkpoint_schedule(
+                        df_out, sorted(st.session_state.get("checkpoints", []),
+                                       key=lambda c: float(c.get("dist_km", 0))),
+                        datetime.combine(date_course, heure_course))
+                    _moving_save = float(res.get("total_s") or 0)
+                    _params_save["stops_total_s"] = _stops_save
                     _rid = save_race(current_athlete_id(), _race_date.isoformat(), _race_name, "plan",
                                      _gpx_name_save, _dist_simulated_km, res.get("d_plus_total"),
-                                     res.get("total_s"), None, _params_save,
+                                     _moving_save + _stops_save, None, _params_save,
                                      df_out[_cols_keep].to_dict("records"),
-                                     st.session_state.get("checkpoints", []), _race_notes,
-                                     st.session_state.get("_gpx_xml") if _keep_gpx else None)
+                                     _sched_save or st.session_state.get("checkpoints", []), _race_notes,
+                                     st.session_state.get("_gpx_xml") if _keep_gpx else None,
+                                     stops_s=_stops_save, moving_s=_moving_save)
                     st.success(f"✅ Plan « {_race_name} » enregistré pour {current_athlete_name()} "
                                f"(#{_rid}) — retrouve-le dans l'onglet 📚 Historique.")
         else:
@@ -4739,7 +5082,7 @@ with main_tabs[0]:
                 y_gps_cp=[getattr(p,"elevation",0.0) or 0.0 for p in points]
                 cp_alt=float(np.interp(cp_dist_m,cum_d_map,y_gps_cp))
                 label=cp_nom.strip() if cp_nom.strip() else f"{cp_type} km {cp_dist:.1f}"
-                st.session_state["checkpoints"].append({"dist_km":cp_dist,"type":cp_type,"label":label,"lat":cp_lat,"lon":cp_lon,"alt":round(cp_alt)})
+                st.session_state["checkpoints"].append({"dist_km":cp_dist,"type":cp_type,"label":label,"lat":cp_lat,"lon":cp_lon,"alt":round(cp_alt),"arret_s":0.0})
                 st.success(f"✅ Checkpoint ajouté : {label}")
         with col_btn2:
             if st.button("🗑️ Effacer tous les checkpoints"):st.session_state["checkpoints"]=[]
@@ -5339,6 +5682,68 @@ with main_tabs[2]:
                     st.pyplot(fig_pace); plt.close(fig_pace)
 
             st.markdown("---")
+            st.subheader("📐 Séance découpée en quarts")
+            st.caption("La séance est coupée en quatre parts de temps en mouvement égales (les pauses ne "
+                       "décalent pas le découpage). Pour chaque quart : allure réelle, VAP (allure ramenée "
+                       "au plat, comparable même si le dénivelé change), FC et cadence.")
+            _n_parts = st.select_slider("Nombre de parts", options=[2, 3, 4, 5, 6], value=4, key="quarters_n")
+            _quarters = compute_session_quarters(df_train, n_parts=_n_parts)
+            st.session_state["_session_quarters"] = _quarters
+            if _quarters:
+                _dur_tot_q = sum(q["duree_s"] for q in _quarters)
+                _dist_tot_q = sum(q["distance_m"] for q in _quarters)
+                _pace_glob = _dur_tot_q / max(0.001, _dist_tot_q / 1000.0)
+                _q_last, _q_first = _quarters[-1], _quarters[0]
+                kpi_row([
+                    ("Allure moyenne (en mouvement)", pace_str(_pace_glob) + "/km",
+                     f"{_dist_tot_q/1000:.2f} km en {seconds_to_hms(_dur_tot_q)}"),
+                    ("Allure 1er quart", pace_str(_q_first["allure_s_km"]) + "/km" if _q_first.get("allure_s_km") else "—",
+                     f"FC {_q_first.get('fc_moy', '—')} bpm"),
+                    ("Allure dernier quart", pace_str(_q_last["allure_s_km"]) + "/km" if _q_last.get("allure_s_km") else "—",
+                     f"{_q_last.get('derive_allure_pct', 0):+.1f} % vs 1er quart"),
+                    ("Dérive cardiaque",
+                     f"{_q_last.get('derive_fc_bpm', 0):+.0f} bpm" if _q_last.get("derive_fc_bpm") is not None else "—",
+                     f"FC {_q_first.get('fc_moy', '—')} → {_q_last.get('fc_moy', '—')} bpm"),
+                ])
+                st.pyplot(plot_session_quarters(_quarters)); plt.close("all")
+                _rows_q = []
+                for q in _quarters:
+                    _rows_q.append({
+                        "Quart": q["libelle"],
+                        "De → à": f"{seconds_to_hms(q['t_debut_s'])} → {seconds_to_hms(q['t_fin_s'])}",
+                        "Durée": seconds_to_hms(q["duree_s"]),
+                        "Distance (km)": round(q["distance_m"] / 1000.0, 2),
+                        "Allure": pace_str(q["allure_s_km"]) + "/km" if q.get("allure_s_km") else "—",
+                        "Δ allure": f"{q['derive_allure_pct']:+.1f} %" if q.get("derive_allure_pct") is not None else "—",
+                        "VAP (km/h)": q.get("vap_kmh", "—"),
+                        "Δ VAP": f"{q['derive_vap_pct']:+.1f} %" if q.get("derive_vap_pct") is not None else "—",
+                        "D+ (m)": q.get("d_plus", "—"), "D- (m)": q.get("d_moins", "—"),
+                        "FC moy": q.get("fc_moy", "—"), "FC max": q.get("fc_max", "—"),
+                        "Δ FC": f"{q['derive_fc_bpm']:+.0f}" if q.get("derive_fc_bpm") is not None else "—",
+                        "Cadence": q.get("cadence", "—"),
+                    })
+                st.dataframe(pd.DataFrame(_rows_q), use_container_width=True, hide_index=True)
+                _dv = _q_last.get("derive_vap_pct"); _da = _q_last.get("derive_allure_pct")
+                _dh = _q_last.get("derive_fc_bpm")
+                if _dv is not None and _dh is not None:
+                    if _dv <= -6 and _dh >= 8:
+                        _msg = ("Effort typiquement dégradé : la VAP baisse alors que la FC monte — le coût "
+                                "cardiaque de la même vitesse a augmenté (chaleur, déshydratation, fatigue).")
+                    elif _dv >= -3 and _dh >= 8:
+                        _msg = ("Allure tenue mais FC en hausse : dérive cardiaque classique sur une sortie "
+                                "longue, sans perte de vitesse — signe d'un effort soutenable mais engagé.")
+                    elif _dv >= -3 and abs(_dh) < 8:
+                        _msg = "Séance très régulière : ni la VAP ni la FC ne dérivent réellement."
+                    else:
+                        _msg = ("La VAP baisse sans hausse marquée de la FC : gestion volontaire, terrain plus "
+                                "exigeant, ou fatigue musculaire plutôt que cardiovasculaire.")
+                    st.markdown(f'<div class="note-box note-red">{_msg} — dernier quart : allure '
+                                f'<b>{_da:+.1f} %</b>, VAP <b>{_dv:+.1f} %</b>, FC <b>{_dh:+.0f} bpm</b> '
+                                f'par rapport au premier quart.</div>', unsafe_allow_html=True)
+            else:
+                st.caption("Découpage impossible : séance trop courte ou sans données de distance.")
+
+            st.markdown("---")
             st.subheader("⏱️ Temps de maintien & zones cardiaques")
             st.caption("Pour chaque durée, la meilleure vitesse moyenne réellement tenue dans la séance "
                        "(équivalent mesuré de la table de maintien théorique de l'onglet Vitesse Critique), "
@@ -5714,7 +6119,8 @@ with main_tabs[2]:
                             category_id=_cat_id, tags=_wk_tags,
                             zones=st.session_state.get("_session_zones", []),
                             records=st.session_state.get("_session_records", []),
-                            hr_max_used=st.session_state.get("_session_hr_max_used"))
+                            hr_max_used=st.session_state.get("_session_hr_max_used"),
+                            quarters=st.session_state.get("_session_quarters", []))
                         st.success(f"✅ Séance « {_wk_name} » enregistrée pour {current_athlete_name()} "
                                    f"(#{_wid}) — comparaison dans l'onglet 📚 Historique.")
                 st.caption("Les intervalles sont enregistrés tels que découpés ci-dessus : lance "
@@ -6280,11 +6686,28 @@ with main_tabs[4]:
                     except Exception:
                         return None
 
+                def _quart_drift(r, key):
+                    """Dérive du dernier quart par rapport au premier, telle qu'enregistrée."""
+                    try:
+                        _q = _json.loads(r.get("quarters_json") or "[]")
+                        return float(_q[-1].get(key)) if _q and _q[-1].get(key) is not None else None
+                    except Exception:
+                        return None
+
                 for _r in _wk:
                     _r["_cat"] = _cat_of(_r)
                     _r["_v10"] = _rec_speed(_r, 600)
                     _r["_v30"] = _rec_speed(_r, 1800)
                     _r["_z45"] = _zone_time(_r)
+                    _r["_dq_pace"] = _quart_drift(_r, "derive_allure_pct")
+                    _r["_dq_vap"] = _quart_drift(_r, "derive_vap_pct")
+                    _r["_dq_hr"] = _quart_drift(_r, "derive_fc_bpm")
+                    try:
+                        _q0 = _json.loads(_r.get("quarters_json") or "[]")
+                        _r["_pace_moy"] = (sum(x["duree_s"] for x in _q0) /
+                                           max(0.001, sum(x["distance_m"] for x in _q0) / 1000.0)) if _q0 else None
+                    except Exception:
+                        _r["_pace_moy"] = None
 
                 _cat_names = ["(toutes)"] + sorted({r["_cat"] for r in _wk})
                 _fc1, _fc2 = st.columns([2, 3])
@@ -6300,6 +6723,9 @@ with main_tabs[4]:
                     "Dist (km)": round(r["distance_m"] / 1000.0, 2) if r["distance_m"] else None,
                     "D+ (m)": round(r["d_plus"]) if r["d_plus"] else None,
                     "FC moy": round(r["hr_avg"]) if r["hr_avg"] else None,
+                    "Allure moy.": (pace_str(r["_pace_moy"]) + "/km") if r.get("_pace_moy") else "—",
+                    "Δ allure Q4/Q1": f"{r['_dq_pace']:+.1f} %" if r.get("_dq_pace") is not None else "—",
+                    "Δ FC Q4/Q1": f"{r['_dq_hr']:+.0f}" if r.get("_dq_hr") is not None else "—",
                     "Dérive FC": round(r["hr_drift"], 1) if r["hr_drift"] is not None else None,
                     "Z4+Z5 (min)": round(r["_z45"]) if r["_z45"] is not None else None,
                     "Best 10 min (km/h)": round(r["_v10"], 2) if r["_v10"] else None,
@@ -6312,6 +6738,10 @@ with main_tabs[4]:
 
                 # ── évolution d'une mesure au choix ──────────────────────
                 _num_cols = {
+                    "Allure moyenne (s/km — plus bas = plus rapide)": "_pace_moy",
+                    "Dérive d'allure dernier quart / premier (%)": "_dq_pace",
+                    "Dérive de VAP dernier quart / premier (%)": "_dq_vap",
+                    "Dérive FC dernier quart / premier (bpm)": "_dq_hr",
                     "Meilleure vitesse sur 10 min (km/h)": "_v10",
                     "Meilleure vitesse sur 30 min (km/h)": "_v30",
                     "Temps en Z4+Z5 (min)": "_z45",
@@ -6409,6 +6839,20 @@ with main_tabs[4]:
                     _itv = _json.loads(_rec["intervals_json"] or "[]")
                     _zz = _json.loads(_rec["zones_json"] or "[]")
                     _rr_ = _json.loads(_rec["records_json"] or "[]")
+                    _qq = _json.loads(_rec.get("quarters_json") or "[]")
+                    if _qq:
+                        st.markdown("**Découpage en quarts**")
+                        st.dataframe(pd.DataFrame([{
+                            "Quart": q["libelle"], "Durée": seconds_to_hms(q["duree_s"]),
+                            "Distance (km)": round(q["distance_m"] / 1000.0, 2),
+                            "Allure": pace_str(q["allure_s_km"]) + "/km" if q.get("allure_s_km") else "—",
+                            "Δ allure": f"{q['derive_allure_pct']:+.1f} %" if q.get("derive_allure_pct") is not None else "—",
+                            "VAP (km/h)": q.get("vap_kmh", "—"),
+                            "Δ VAP": f"{q['derive_vap_pct']:+.1f} %" if q.get("derive_vap_pct") is not None else "—",
+                            "D+ (m)": q.get("d_plus", "—"), "FC moy": q.get("fc_moy", "—"),
+                            "Δ FC": f"{q['derive_fc_bpm']:+.0f}" if q.get("derive_fc_bpm") is not None else "—",
+                            "Cadence": q.get("cadence", "—")} for q in _qq]),
+                            use_container_width=True, hide_index=True)
                     if _rr_:
                         st.markdown("**Temps de maintien de cette séance**")
                         st.dataframe(pd.DataFrame([{
@@ -6488,10 +6932,27 @@ with main_tabs[4]:
                     _splits = _json.loads(_rec_r["splits_json"] or "[]")
                     _params = _json.loads(_rec_r["params_json"] or "{}")
                     _cps = _json.loads(_rec_r["checkpoints_json"] or "[]")
-                    rc1, rc2, rc3 = st.columns(3)
-                    rc1.metric("Temps prédit", seconds_to_hms(_rec_r["predicted_s"]) if _rec_r["predicted_s"] else "—")
-                    rc2.metric("Distance", f"{_rec_r['distance_km']:.1f} km" if _rec_r["distance_km"] else "—")
-                    rc3.metric("D+", f"{_rec_r['d_plus']:.0f} m" if _rec_r["d_plus"] else "—")
+                    kpi_row([
+                        ("Temps total prédit", seconds_to_hms(_rec_r["predicted_s"]) if _rec_r["predicted_s"] else "—",
+                         "arrêts inclus"),
+                        ("Dont course", seconds_to_hms(_rec_r["moving_s"]) if _rec_r.get("moving_s") else "—",
+                         "temps en mouvement"),
+                        ("Dont arrêts", seconds_to_hms(_rec_r["stops_s"]) if _rec_r.get("stops_s") else "—",
+                         "ravitaillements"),
+                        ("Parcours", f"{_rec_r['distance_km']:.1f} km" if _rec_r["distance_km"] else "—",
+                         f"{_rec_r['d_plus']:.0f} m D+" if _rec_r["d_plus"] else ""),
+                    ])
+                    if _cps and isinstance(_cps, list) and _cps and isinstance(_cps[0], dict) and "arrivee_s" in _cps[0]:
+                        st.markdown("**Feuille de route enregistrée**")
+                        st.dataframe(pd.DataFrame([{
+                            "Ravitaillement": c.get("label"), "Km": round(float(c.get("dist_km", 0)), 1),
+                            "Arrivée": seconds_to_hms(c.get("arrivee_s", 0)),
+                            "Heure": c.get("heure_arrivee") or "—",
+                            "Arrêt": seconds_to_hms(c.get("arret_s", 0)) if c.get("arret_s") else "—",
+                            "Départ": seconds_to_hms(c.get("depart_s", 0)),
+                            "Allure segment": (pace_str(c["allure_segment_s_km"]) + "/km")
+                                              if c.get("allure_segment_s_km") else "—"} for c in _cps]),
+                            use_container_width=True, hide_index=True)
                     if _splits:
                         st.markdown("**Plan kilomètre par kilomètre (tel qu'enregistré)**")
                         df_sp = pd.DataFrame(_splits)
@@ -6499,8 +6960,8 @@ with main_tabs[4]:
                         st.download_button("⬇️ Plan (CSV)", df_sp.to_csv(index=False).encode("utf-8"),
                                            file_name=f"plan_{(_rec_r['name'] or 'course').replace(' ','_')}.csv",
                                            key="hist_dl_plan")
-                    if _cps:
-                        st.markdown("**Checkpoints**")
+                    if _cps and not (isinstance(_cps[0], dict) and "arrivee_s" in _cps[0]):
+                        st.markdown("**Checkpoints (plan enregistré avant la feuille de route)**")
                         st.dataframe(pd.DataFrame(_cps), use_container_width=True, hide_index=True)
                     with st.expander("⚙️ Paramètres du modèle utilisés"):
                         st.json(_params)
