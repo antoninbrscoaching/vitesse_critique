@@ -110,6 +110,7 @@ import xml.etree.ElementTree as ET
 import requests
 import io
 import os
+import glob
 import sqlite3
 import hashlib
 import secrets
@@ -2655,6 +2656,162 @@ function rst(){playing=false;frac=0;drawn=-1;cumDP=0;lcp=-1;lastSI=-1;segs.forEa
 
 
 # ══════════════════════════════════════════════════════════════
+# v9.0 — TEMPS DE MAINTIEN & ZONES CARDIAQUES (séance)
+#   • Courbe des records : meilleure vitesse moyenne réellement tenue sur
+#     chaque durée (1 min, 3 min, 5 min, 10 min, 20 min, 30 min, 1 h…).
+#     C'est la contrepartie mesurée de la table de maintien théorique de
+#     l'onglet Vitesse Critique.
+#   • Temps passé par zone cardiaque, calculé sur le temps en mouvement.
+# Ces deux résultats sont enregistrés avec la séance : ils restent comparables
+# d'une séance à l'autre, même si le modèle évolue par la suite.
+# ══════════════════════════════════════════════════════════════
+
+RECORD_DURATIONS_S = (60, 180, 300, 600, 1200, 1800, 3600, 7200)
+HR_ZONE_BOUNDS = (0.60, 0.70, 0.80, 0.90)      # en fraction de FC max
+HR_ZONE_LABELS = ("Z1 · récup", "Z2 · endurance", "Z3 · tempo", "Z4 · seuil", "Z5 · VMA")
+
+def _session_grid(df, step_s=1.0, moving_speed_ms=0.3):
+    """Grille temporelle régulière (1 s) : distance, vitesse, FC, masque de
+    mouvement. Base commune aux records et aux zones cardiaques."""
+    if df is None or "elapsed_s" not in df.columns:
+        return None
+    d = df.dropna(subset=["elapsed_s"]).sort_values("elapsed_s").reset_index(drop=True)
+    if len(d) < 10:
+        return None
+    t = d["elapsed_s"].astype(float).values
+    t_max = float(t[-1])
+    if t_max < 60:
+        return None
+    dist = d["distance_m"].astype(float).values if "distance_m" in d.columns else np.full(len(d), np.nan)
+    if np.isnan(dist).all() or np.nanmax(dist) <= 1.0:
+        if "speed_ms" in d.columns and d["speed_ms"].notna().any():
+            sp = pd.Series(d["speed_ms"].astype(float)).interpolate().fillna(0.0).values
+            dist = np.concatenate([[0.0], np.cumsum(sp[1:] * np.diff(t))])
+        else:
+            dist = None
+    grid = np.arange(0.0, t_max, float(step_s))
+    out = {"grid": grid, "step_s": float(step_s)}
+    if dist is not None:
+        dist = pd.Series(dist).interpolate(limit_direction="both").fillna(0.0).values
+        dist = np.maximum.accumulate(dist)
+        dist_g = np.interp(grid, t, dist)
+        out["dist"] = dist_g
+        spd = np.gradient(dist_g, float(step_s))
+        out["speed_ms"] = np.clip(spd, 0.0, 12.0)
+        out["moving"] = out["speed_ms"] >= float(moving_speed_ms)
+    else:
+        out["dist"] = None; out["speed_ms"] = None
+        out["moving"] = np.ones(len(grid), dtype=bool)
+    if "heart_rate" in d.columns and d["heart_rate"].notna().any():
+        hr = pd.to_numeric(d["heart_rate"], errors="coerce")
+        hr = hr.where((hr >= 40) & (hr <= 230))
+        out["hr"] = np.interp(grid, t, hr.interpolate(limit_direction="both").fillna(0.0).values)
+    else:
+        out["hr"] = None
+    return out
+
+def compute_session_records(df, durations_s=RECORD_DURATIONS_S):
+    """Meilleure vitesse moyenne tenue sur chaque durée (fenêtre glissante sur
+    toute la séance, pauses incluses dans la fenêtre : c'est bien la vitesse
+    réellement soutenue sur ce laps de temps)."""
+    g = _session_grid(df)
+    if g is None or g.get("dist") is None:
+        return []
+    dist = g["dist"]; step = g["step_s"]; total_s = float(g["grid"][-1])
+    rows = []
+    for D in durations_s:
+        n = int(round(D / step))
+        if n < 2 or n >= len(dist):
+            continue
+        gains = dist[n:] - dist[:-n]
+        if len(gains) == 0:
+            continue
+        i_best = int(np.argmax(gains))
+        best_m = float(gains[i_best])
+        if best_m <= 1.0:
+            continue
+        v_kmh = best_m / D * 3.6
+        rows.append({"duree_s": int(D), "distance_m": round(best_m), "vitesse_kmh": round(v_kmh, 3),
+                     "allure_s_km": round(D / (best_m / 1000.0), 1), "debut_s": float(g["grid"][i_best])})
+    return rows
+
+def compute_hr_zone_times(df, hr_max, bounds=HR_ZONE_BOUNDS):
+    """Temps passé dans chaque zone cardiaque, en secondes, sur le temps en
+    mouvement uniquement (les arrêts ne gonflent pas la zone 1)."""
+    g = _session_grid(df)
+    if g is None or g.get("hr") is None or not hr_max or hr_max <= 0:
+        return []
+    hr = g["hr"][g["moving"]]
+    hr = hr[(hr >= 40) & (hr <= 230)]
+    if len(hr) < 10:
+        return []
+    step = g["step_s"]
+    frac = hr / float(hr_max)
+    edges = [0.0] + list(bounds) + [10.0]
+    rows = []
+    for i in range(5):
+        n = int(np.sum((frac >= edges[i]) & (frac < edges[i + 1])))
+        rows.append({"zone": HR_ZONE_LABELS[i],
+                     "bpm_min": round(edges[i] * hr_max) if i > 0 else None,
+                     "bpm_max": round(edges[i + 1] * hr_max) if i < 4 else None,
+                     "temps_s": round(n * step), "pct": round(n / max(1, len(hr)) * 100.0, 1)})
+    return rows
+
+def plot_records_curve(records, vc_ms=None, compare=None, title_suffix=""):
+    """Courbe des records : vitesse moyenne maximale tenue en fonction de la durée.
+    `compare` = liste de (label, records) pour superposer d'autres séances."""
+    fig, ax = plt.subplots(figsize=(11.5, 4.2))
+    _x = [r["duree_s"] / 60.0 for r in records]
+    _y = [r["vitesse_kmh"] for r in records]
+    if compare:
+        for _i, (_lab, _rec) in enumerate(compare):
+            if not _rec:
+                continue
+            _c = [C_GREY, C_WHITE, C_DIM, C_RED_SOFT][_i % 4]
+            ax.plot([r["duree_s"] / 60.0 for r in _rec], [r["vitesse_kmh"] for r in _rec],
+                    "-o", color=_c, lw=1.6, ms=5, alpha=0.85, mec=C_SURFACE, mew=1.2, label=_lab)
+    ax.plot(_x, _y, "-o", color=C_RED, lw=2.2, ms=7, mec=C_SURFACE, mew=1.6,
+            label="Séance analysée" if compare else None)
+    for r in records:
+        ax.annotate(pace_str(r["allure_s_km"]), xy=(r["duree_s"] / 60.0, r["vitesse_kmh"]),
+                    xytext=(0, 10), textcoords="offset points", ha="center", fontsize=7, color=C_TEXT_MUT)
+    if vc_ms:
+        ax.axhline(vc_ms * 3.6, color=C_WHITE, lw=1.2, ls=":",
+                   label=f"Vitesse critique ({vc_ms*3.6:.2f} km/h)")
+    ax.set_xscale("log")
+    ax.set_xticks([r["duree_s"] / 60.0 for r in records])
+    ax.set_xticklabels([(f"{r['duree_s']//60} min" if r["duree_s"] < 3600 else f"{r['duree_s']//3600} h")
+                        for r in records], fontsize=8)
+    ax.set_xlabel("Durée tenue"); ax.set_ylabel("Vitesse moyenne (km/h)")
+    chart_title(ax, "Temps de maintien — meilleures vitesses tenues",
+                "Pour chaque durée, la meilleure moyenne réellement réalisée dans la séance" + title_suffix)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+def plot_hr_zones(zones, hr_max):
+    """Répartition du temps en mouvement par zone cardiaque."""
+    fig, ax = plt.subplots(figsize=(11.5, 2.9))
+    labels = [z["zone"] for z in zones]
+    vals = [z["temps_s"] / 60.0 for z in zones]
+    cols = [C_DIM, C_GREY, C_WHITE, C_RED_SOFT, C_RED]
+    bars = ax.barh(labels, vals, color=cols, height=0.62)
+    for b, z in zip(bars, zones):
+        if z["temps_s"] > 0:
+            ax.annotate(f"{seconds_to_hms(z['temps_s'])}  ·  {z['pct']:.0f} %",
+                        xy=(b.get_width(), b.get_y() + b.get_height() / 2), xytext=(7, 0),
+                        textcoords="offset points", va="center", fontsize=8, color=C_TEXT)
+    ax.invert_yaxis()
+    ax.set_xlabel("Temps (min)")
+    ax.set_xlim(0, max(vals) * 1.28 if max(vals) > 0 else 1)
+    chart_title(ax, "Temps par zone cardiaque",
+                f"Zones calculées sur FC max = {hr_max:.0f} bpm · temps en mouvement uniquement")
+    ax.grid(axis="y", alpha=0)
+    fig.tight_layout()
+    return fig
+
+# ══════════════════════════════════════════════════════════════
 # TERRAIN PROFILES — v8.1 : k_up/g0_up/max_cap/fatigue recalibrés
 # sur 1245 segments coureurs (top10 réel, 12 ultra-trails). Voir
 # calibration_facteurs_v8.md pour la méthodologie et les limites.
@@ -3235,13 +3392,15 @@ def save_vc_test(athlete_id, date_str, label, vc_ms, d_prime, r2, k, a, refs, no
         return int(cur.lastrowid)
 
 def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
-                 portions=None, intervals=None, extra=None, notes=""):
+                 portions=None, intervals=None, extra=None, notes="",
+                 category_id=None, tags="", zones=None, records=None, hr_max_used=None):
     s = summary or {}
     with db_conn() as c:
         cur = c.execute("""INSERT INTO workouts(athlete_id,date,name,seance_type,file_name,duration_s,distance_m,
                            d_plus,hr_avg,hr_max,hr_drift,pct_walk,trans_lo,trans_mid,trans_hi,
-                           vap_slope_montee,vap_last_montee,portions_json,intervals_json,extra_json,notes,created_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           vap_slope_montee,vap_last_montee,portions_json,intervals_json,extra_json,notes,created_at,
+                           category_id,tags,zones_json,records_json,hr_max_used)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (int(athlete_id), str(date_str), str(name), str(seance_type), str(file_name),
                          _db_float(s.get("duration_s")), _db_float(s.get("distance_m")), _db_float(s.get("d_plus")),
                          _db_float(s.get("hr_avg")), _db_float(s.get("hr_max")), _db_float(s.get("hr_drift")),
@@ -3249,7 +3408,10 @@ def save_workout(athlete_id, date_str, name, seance_type, file_name, summary,
                          _db_float(s.get("trans_hi")), _db_float(s.get("vap_slope_montee")), _db_float(s.get("vap_last_montee")),
                          _json.dumps(portions or [], ensure_ascii=False),
                          _json.dumps(intervals or [], ensure_ascii=False),
-                         _json.dumps(extra or {}, ensure_ascii=False), str(notes), _db_now()))
+                         _json.dumps(extra or {}, ensure_ascii=False), str(notes), _db_now(),
+                         int(category_id) if category_id else None, str(tags),
+                         _json.dumps(zones or [], ensure_ascii=False),
+                         _json.dumps(records or [], ensure_ascii=False), _db_float(hr_max_used)))
         return int(cur.lastrowid)
 
 def save_race(athlete_id, date_str, name, kind, gpx_name, distance_km, d_plus,
@@ -3367,6 +3529,165 @@ def import_athlete_json(user_id, payload, new_name=None):
 
 db_init()
 
+# ══════════════════════════════════════════════════════════════
+# v9.0 — CATÉGORIES DE SÉANCE & MIGRATIONS NON DESTRUCTIVES
+#
+# La base de données est un fichier SÉPARÉ du script : modifier l'algorithme,
+# ajouter des colonnes ou changer les graphiques ne touche jamais aux données
+# déjà enregistrées. À chaque démarrage, db_migrate() ajoute uniquement ce qui
+# manque (ALTER TABLE ADD COLUMN) — aucune table n'est jamais recréée ni vidée,
+# et une copie de sauvegarde datée est faite avant toute modification de schéma.
+# ══════════════════════════════════════════════════════════════
+SCHEMA_VERSION = 3
+DEFAULT_CATEGORIES = ["Sortie longue", "Endurance fondamentale", "Fractionné court",
+                      "Fractionné long", "Seuil", "Côtes / VAM", "Test", "Course", "Récupération"]
+
+def _table_columns(c, table):
+    return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+
+def _ensure_column(c, table, col, decl):
+    if col not in _table_columns(c, table):
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        return True
+    return False
+
+def db_backup(tag="migration"):
+    """Copie datée de la base avant toute évolution de schéma (7 dernières gardées)."""
+    if not os.path.exists(DB_PATH):
+        return None
+    stamp = datetime.now().strftime("%Y%m%d")
+    dest = f"{DB_PATH}.bak-{stamp}-{tag}"
+    if not os.path.exists(dest):
+        try:
+            with db_conn() as src, sqlite3.connect(dest) as dst:
+                src.backup(dst)                      # copie cohérente, même base ouverte
+        except Exception:
+            return None
+        _baks = sorted(glob.glob(f"{DB_PATH}.bak-*"))
+        for _old in _baks[:-7]:
+            try:
+                os.remove(_old)
+            except OSError:
+                pass
+    return dest
+
+def db_migrate():
+    """Ajoute les nouveautés de schéma sans jamais toucher aux données existantes."""
+    with db_conn() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        row = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        current = int(row["value"]) if row else 0
+    if current >= SCHEMA_VERSION:
+        return current
+    # copie de sécurité systématique avant toute évolution de schéma sur une base
+    # qui contient déjà quelque chose
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 4096:
+        db_backup(f"v{current}-to-v{SCHEMA_VERSION}")
+    with db_conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL,
+            UNIQUE(user_id, name))""")
+        _ensure_column(c, "workouts", "category_id", "INTEGER")
+        _ensure_column(c, "workouts", "tags", "TEXT DEFAULT ''")
+        _ensure_column(c, "workouts", "zones_json", "TEXT")
+        _ensure_column(c, "workouts", "records_json", "TEXT")
+        _ensure_column(c, "workouts", "hr_max_used", "REAL")
+        _ensure_column(c, "athletes", "hr_max", "REAL")
+        _ensure_column(c, "athletes", "birth_year", "INTEGER")
+        _ensure_column(c, "races", "gpx_xml", "TEXT")
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+    return SCHEMA_VERSION
+
+def seed_categories(user_id):
+    """Catégories de départ, créées une seule fois par coach. Elles restent
+    entièrement modifiables : ce ne sont que des lignes en base."""
+    with db_conn() as c:
+        n = c.execute("SELECT COUNT(*) n FROM categories WHERE user_id=?", (int(user_id),)).fetchone()["n"]
+        if n:
+            return
+        for i, name in enumerate(DEFAULT_CATEGORIES):
+            c.execute("INSERT OR IGNORE INTO categories(user_id,name,sort_order,created_at) VALUES(?,?,?,?)",
+                      (int(user_id), name, i, _db_now()))
+
+def list_categories(user_id):
+    with db_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM categories WHERE user_id=? ORDER BY sort_order, name", (int(user_id),))]
+
+def create_category(user_id, name):
+    name = str(name).strip()
+    if not name:
+        return None, "Nom de catégorie vide."
+    try:
+        with db_conn() as c:
+            n = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 s FROM categories WHERE user_id=?",
+                          (int(user_id),)).fetchone()["s"]
+            cur = c.execute("INSERT INTO categories(user_id,name,sort_order,created_at) VALUES(?,?,?,?)",
+                            (int(user_id), name, n, _db_now()))
+            return int(cur.lastrowid), None
+    except sqlite3.IntegrityError:
+        return None, "Cette catégorie existe déjà."
+
+def rename_category(cat_id, user_id, new_name):
+    new_name = str(new_name).strip()
+    if not new_name:
+        return "Nom vide."
+    try:
+        with db_conn() as c:
+            r = c.execute("SELECT 1 FROM categories WHERE id=? AND user_id=?",
+                          (int(cat_id), int(user_id))).fetchone()
+            if r is None:
+                return "Catégorie introuvable."
+            c.execute("UPDATE categories SET name=? WHERE id=?", (new_name, int(cat_id)))
+    except sqlite3.IntegrityError:
+        return "Une catégorie porte déjà ce nom."
+    return None
+
+def delete_category(cat_id, user_id):
+    """Supprime la catégorie mais CONSERVE les séances : elles passent simplement
+    en « sans catégorie »."""
+    with db_conn() as c:
+        r = c.execute("SELECT 1 FROM categories WHERE id=? AND user_id=?",
+                      (int(cat_id), int(user_id))).fetchone()
+        if r is None:
+            return False
+        c.execute("UPDATE workouts SET category_id=NULL WHERE category_id=?", (int(cat_id),))
+        c.execute("DELETE FROM categories WHERE id=?", (int(cat_id),))
+    return True
+
+def set_workout_category(workout_id, user_id, category_id):
+    with db_conn() as c:
+        r = c.execute("""SELECT w.id FROM workouts w JOIN athletes a ON a.id=w.athlete_id
+                         WHERE w.id=? AND a.user_id=?""", (int(workout_id), int(user_id))).fetchone()
+        if r is None:
+            return False
+        c.execute("UPDATE workouts SET category_id=? WHERE id=?",
+                  (int(category_id) if category_id else None, int(workout_id)))
+    return True
+
+def set_athlete_hr_max(athlete_id, user_id, hr_max):
+    if not athlete_belongs_to(athlete_id, user_id):
+        return False
+    with db_conn() as c:
+        c.execute("UPDATE athletes SET hr_max=? WHERE id=?", (_db_float(hr_max), int(athlete_id)))
+    return True
+
+def get_athlete(athlete_id):
+    with db_conn() as c:
+        r = c.execute("SELECT * FROM athletes WHERE id=?", (int(athlete_id),)).fetchone()
+    return dict(r) if r else None
+
+def last_vc_ms(athlete_id):
+    """Dernière vitesse critique connue de l'athlète (pour situer les records)."""
+    with db_conn() as c:
+        r = c.execute("""SELECT vc_ms FROM vc_tests WHERE athlete_id=? AND vc_ms IS NOT NULL
+                         ORDER BY date DESC, id DESC LIMIT 1""", (int(athlete_id),)).fetchone()
+    return float(r["vc_ms"]) if r else None
+
+db_migrate()
+
 # ── Session : utilisateur courant / athlète courant ───────────────────────
 def current_user():
     return st.session_state.get("_auth_user")
@@ -3418,6 +3739,7 @@ def render_account_sidebar():
                    "l'enregistrement des analyses sont désactivés.")
         return
 
+    seed_categories(user["id"])       # catégories de départ, créées une seule fois
     st.markdown(f'<div class="sidebar-label">👤 {user["name"]}</div>', unsafe_allow_html=True)
     athletes = list_athletes(user["id"])
     names = [a["name"] for a in athletes]
@@ -5017,6 +5339,50 @@ with main_tabs[2]:
                     st.pyplot(fig_pace); plt.close(fig_pace)
 
             st.markdown("---")
+            st.subheader("⏱️ Temps de maintien & zones cardiaques")
+            st.caption("Pour chaque durée, la meilleure vitesse moyenne réellement tenue dans la séance "
+                       "(équivalent mesuré de la table de maintien théorique de l'onglet Vitesse Critique), "
+                       "puis la répartition du temps en mouvement par zone cardiaque.")
+            _hr_obs = (hr_stats_train or {}).get("fc_max") if isinstance(hr_stats_train, dict) else None
+            _ath_prof = get_athlete(current_athlete_id()) if history_ready() else None
+            _hr_default = float((_ath_prof or {}).get("hr_max") or _hr_obs or 185.0)
+            _zc1, _zc2 = st.columns([1, 2])
+            _hr_max_used = _zc1.number_input("FC max de référence (bpm)", 120.0, 230.0,
+                                             float(_hr_default), 1.0, key="tm_hrmax",
+                                             help="Sert uniquement à découper les zones. Par défaut : la FC max "
+                                                  "mémorisée pour l'athlète, sinon la plus haute de la séance.")
+            with _zc2:
+                if history_ready():
+                    if st.button("📌 Mémoriser comme FC max de l'athlète", key="tm_hrmax_save"):
+                        set_athlete_hr_max(current_athlete_id(), current_user()["id"], _hr_max_used)
+                        st.success("FC max enregistrée dans le profil de l'athlète.")
+                else:
+                    st.caption("Connecte-toi pour mémoriser cette FC max dans le profil de l'athlète.")
+            _records_tr = compute_session_records(df_train)
+            _zones_tr = compute_hr_zone_times(df_train, _hr_max_used)
+            st.session_state["_session_records"] = _records_tr
+            st.session_state["_session_zones"] = _zones_tr
+            st.session_state["_session_hr_max_used"] = _hr_max_used
+            if _records_tr:
+                _vc_ref = last_vc_ms(current_athlete_id()) if history_ready() else None
+                _by_dur = {r["duree_s"]: r for r in _records_tr}
+                kpi_row([(f"Best {d//60} min",
+                          f"{_by_dur[d]['vitesse_kmh']:.2f} km/h" if d in _by_dur else "—",
+                          (pace_str(_by_dur[d]["allure_s_km"]) + "/km · " +
+                           f"{_by_dur[d]['distance_m']:.0f} m") if d in _by_dur else "durée non atteinte")
+                         for d in (300, 1200, 1800, 3600)])
+                st.pyplot(plot_records_curve(_records_tr, vc_ms=_vc_ref)); plt.close("all")
+                if _vc_ref:
+                    st.caption(f"Repère : dernière vitesse critique enregistrée pour cet athlète — "
+                               f"{_vc_ref*3.6:.2f} km/h ({pace_str(1000.0/_vc_ref)}/km).")
+            else:
+                st.caption("Pas assez de données de distance pour calculer les temps de maintien.")
+            if _zones_tr:
+                st.pyplot(plot_hr_zones(_zones_tr, _hr_max_used)); plt.close("all")
+            else:
+                st.caption("Pas de données cardiaques exploitables dans ce fichier — zones non calculables.")
+
+            st.markdown("---")
             st.subheader("🏔️ Analyse trail — course / marche & tenue de la performance")
             st.caption("Deux lectures d'une sortie trail : (1) à partir de quelle pente tu bascules de la course "
                        "à la marche, (2) comment ta VAP (Vitesse Ajustée à la Pente) se dégrade au fil de la "
@@ -5300,10 +5666,14 @@ with main_tabs[2]:
                     _wk_date = _sw1.date_input("Date de la séance", value=date.today(), key="save_wk_date")
                     _wk_name = _sw2.text_input("Nom de la séance",
                                                value=train_file.name.rsplit(".", 1)[0], key="save_wk_name")
-                    _wk_type = _sw3.selectbox("Type de séance",
-                                              ["Sortie longue", "Endurance fondamentale", "Fractionné court",
-                                               "Fractionné long", "Seuil", "Côtes / VAM", "Test",
-                                               "Course", "Récupération", "Autre"], key="save_wk_type")
+                    _cat_list = list_categories(current_user()["id"])
+                    _cat_names = [c["name"] for c in _cat_list] or ["Autre"]
+                    _wk_type = _sw3.selectbox("Catégorie de séance", _cat_names, key="save_wk_type",
+                                              help="Catégories libres, gérées dans 📚 Historique → Séances.")
+                    _wk_newcat = st.text_input("…ou nouvelle catégorie (laisse vide pour utiliser celle "
+                                               "sélectionnée)", key="save_wk_newcat")
+                    _wk_tags = st.text_input("Tags libres (séparés par des virgules)", key="save_wk_tags",
+                                             placeholder="ex : chaleur, nuit, sac 5 kg, spécifique UTMB")
                     _wk_notes = st.text_area("Notes / ressenti", key="save_wk_notes")
                     _wk_incl = st.checkbox("Inclure le détail des portions de terrain et des intervalles",
                                            value=True, key="save_wk_incl")
@@ -5331,12 +5701,20 @@ with main_tabs[2]:
                                 "FC moy": _hri.get("fc_avg"), "FC max": _hri.get("fc_max"),
                                 "Dérive FC": _hri.get("drift_abs"),
                             })
+                        _cat_final = (_wk_newcat or "").strip() or _wk_type
+                        _cat_id = next((c["id"] for c in _cat_list if c["name"] == _cat_final), None)
+                        if _cat_id is None and _cat_final:
+                            _cat_id, _err_cat = create_category(current_user()["id"], _cat_final)
                         _wid = save_workout(
-                            current_athlete_id(), _wk_date.isoformat(), _wk_name, _wk_type,
+                            current_athlete_id(), _wk_date.isoformat(), _wk_name, _cat_final,
                             train_file.name, _summary_wk,
                             st.session_state.get("_trail_portions", []) if _wk_incl else [],
                             _intervals_save if _wk_incl else [],
-                            {k: v for k, v in _ts.items() if k not in _summary_wk}, _wk_notes)
+                            {k: v for k, v in _ts.items() if k not in _summary_wk}, _wk_notes,
+                            category_id=_cat_id, tags=_wk_tags,
+                            zones=st.session_state.get("_session_zones", []),
+                            records=st.session_state.get("_session_records", []),
+                            hr_max_used=st.session_state.get("_session_hr_max_used"))
                         st.success(f"✅ Séance « {_wk_name} » enregistrée pour {current_athlete_name()} "
                                    f"(#{_wid}) — comparaison dans l'onglet 📚 Historique.")
                 st.caption("Les intervalles sont enregistrés tels que découpés ci-dessus : lance "
@@ -5853,78 +6231,218 @@ with main_tabs[4]:
 
         # ── Historique séances ───────────────────────────────────────────
         with h_t2:
+            _cats = list_categories(_user["id"])
+            _cat_by_id = {c["id"]: c["name"] for c in _cats}
+
+            with st.expander("🏷️ Gérer mes catégories de séance"):
+                st.caption("Les catégories sont libres et propres à ton compte. Supprimer une catégorie "
+                           "ne supprime aucune séance : celles qui l'utilisaient repassent simplement "
+                           "en « sans catégorie ».")
+                _cc1, _cc2 = st.columns([3, 1])
+                with _cc1.form("new_cat_form", clear_on_submit=True):
+                    _newc = st.text_input("Nouvelle catégorie", placeholder="ex : Sortie longue spécifique UTMB")
+                    if st.form_submit_button("➕ Créer"):
+                        _cid, _errc = create_category(_user["id"], _newc)
+                        st.error(_errc) if _errc else st.rerun()
+                if _cats:
+                    for _c in _cats:
+                        _r1, _r2, _r3 = st.columns([3, 1, 1])
+                        _nn = _r1.text_input("Nom", value=_c["name"], key=f"cat_name_{_c['id']}",
+                                             label_visibility="collapsed")
+                        if _r2.button("Renommer", key=f"cat_ren_{_c['id']}"):
+                            _e = rename_category(_c["id"], _user["id"], _nn)
+                            st.error(_e) if _e else st.rerun()
+                        if _r3.button("Supprimer", key=f"cat_del_{_c['id']}"):
+                            delete_category(_c["id"], _user["id"]); st.rerun()
+
             if not _wk:
                 st.info("Aucune séance enregistrée. Onglet ⚙️ Analyse entraînement → charge un fichier → "
                         "« Enregistrer cette séance ».")
             else:
+                def _cat_of(r):
+                    return _cat_by_id.get(r.get("category_id")) or (r.get("seance_type") or "— sans catégorie —")
+
+                def _rec_speed(r, dur_s):
+                    """Meilleure vitesse tenue sur `dur_s` telle qu'enregistrée avec la séance."""
+                    try:
+                        for _x in _json.loads(r.get("records_json") or "[]"):
+                            if int(_x.get("duree_s", 0)) == int(dur_s):
+                                return float(_x.get("vitesse_kmh"))
+                    except Exception:
+                        pass
+                    return None
+
+                def _zone_time(r, idx_from=3):
+                    """Temps cumulé dans les zones hautes (Z4 + Z5 par défaut), en minutes."""
+                    try:
+                        _z = _json.loads(r.get("zones_json") or "[]")
+                        return sum(float(x.get("temps_s", 0)) for x in _z[idx_from:]) / 60.0 if _z else None
+                    except Exception:
+                        return None
+
+                for _r in _wk:
+                    _r["_cat"] = _cat_of(_r)
+                    _r["_v10"] = _rec_speed(_r, 600)
+                    _r["_v30"] = _rec_speed(_r, 1800)
+                    _r["_z45"] = _zone_time(_r)
+
+                _cat_names = ["(toutes)"] + sorted({r["_cat"] for r in _wk})
+                _fc1, _fc2 = st.columns([2, 3])
+                _ft = _fc1.selectbox("Filtrer par catégorie", _cat_names, key="hist_wk_cat")
+                _wk_f = _wk if _ft == "(toutes)" else [r for r in _wk if r["_cat"] == _ft]
+                _fc2.caption(f"{len(_wk_f)} séance(s) dans cette sélection — la comparaison ci-dessous ne "
+                             "porte que sur elles.")
+
                 df_wk = pd.DataFrame([{
                     "Date": r["date"], "Séance": r["name"] or r["file_name"] or "—",
-                    "Type": r["seance_type"] or "—",
+                    "Catégorie": r["_cat"], "Tags": r.get("tags") or "",
                     "Durée": seconds_to_hms(r["duration_s"]) if r["duration_s"] else "—",
                     "Dist (km)": round(r["distance_m"] / 1000.0, 2) if r["distance_m"] else None,
                     "D+ (m)": round(r["d_plus"]) if r["d_plus"] else None,
                     "FC moy": round(r["hr_avg"]) if r["hr_avg"] else None,
                     "Dérive FC": round(r["hr_drift"], 1) if r["hr_drift"] is not None else None,
+                    "Z4+Z5 (min)": round(r["_z45"]) if r["_z45"] is not None else None,
+                    "Best 10 min (km/h)": round(r["_v10"], 2) if r["_v10"] else None,
+                    "Best 30 min (km/h)": round(r["_v30"], 2) if r["_v30"] else None,
                     "% marche": round(r["pct_walk"]) if r["pct_walk"] is not None else None,
                     "Bascule (%)": round(r["trans_mid"], 1) if r["trans_mid"] is not None else None,
                     "VAP montée fin (%)": round(r["vap_last_montee"]) if r["vap_last_montee"] is not None else None,
-                    "Tenue (pts/h)": round(r["vap_slope_montee"], 1) if r["vap_slope_montee"] is not None else None,
-                    "id": r["id"],
-                } for r in _wk])
-                _types = ["(toutes)"] + sorted({r["seance_type"] for r in _wk if r["seance_type"]})
-                _ft = st.selectbox("Filtrer par type de séance", _types, key="hist_wk_type")
-                df_show = df_wk if _ft == "(toutes)" else df_wk[df_wk["Type"] == _ft]
-                st.dataframe(df_show.drop(columns=["id"]), use_container_width=True, hide_index=True)
+                } for r in _wk_f])
+                st.dataframe(df_wk, use_container_width=True, hide_index=True)
 
-                _num_cols = {"Bascule course→marche (%)": "trans_mid", "% du temps en marche": "pct_walk",
-                             "Dérive cardiaque (bpm)": "hr_drift",
-                             "VAP montée en fin de séance (% de la 1re)": "vap_last_montee",
-                             "FC moyenne (bpm)": "hr_avg"}
+                # ── évolution d'une mesure au choix ──────────────────────
+                _num_cols = {
+                    "Meilleure vitesse sur 10 min (km/h)": "_v10",
+                    "Meilleure vitesse sur 30 min (km/h)": "_v30",
+                    "Temps en Z4+Z5 (min)": "_z45",
+                    "FC moyenne (bpm)": "hr_avg",
+                    "Dérive cardiaque (bpm)": "hr_drift",
+                    "Bascule course→marche (%)": "trans_mid",
+                    "% du temps en marche": "pct_walk",
+                    "VAP montée en fin de séance (% de la 1re)": "vap_last_montee",
+                    "Distance (km)": "distance_m", "Dénivelé positif (m)": "d_plus",
+                }
                 _metric = st.selectbox("Comparer dans le temps", list(_num_cols.keys()), key="hist_wk_metric")
                 _key = _num_cols[_metric]
-                _pts = [r for r in _wk if r.get(_key) is not None]
-                if _ft != "(toutes)":
-                    _pts = [r for r in _pts if r["seance_type"] == _ft]
+                _pts = [r for r in _wk_f if r.get(_key) is not None]
                 if len(_pts) >= 2:
                     _pts = sorted(_pts, key=lambda r: r["date"])
                     _x = [datetime.strptime(r["date"], "%Y-%m-%d") for r in _pts]
-                    _y = [float(r[_key]) for r in _pts]
-                    fig_wk, axw = plt.subplots(figsize=(11.5, 3.8))
+                    _scale = 1000.0 if _key == "distance_m" else 1.0
+                    _y = [float(r[_key]) / _scale for r in _pts]
+                    fig_wk, axw = plt.subplots(figsize=(11.5, 3.9))
                     axw.plot(_x, _y, "-o", color=C_RED, lw=2, ms=7, mec=C_SURFACE, mew=1.6)
+                    for _xi, _yi in zip(_x, _y):
+                        axw.annotate(f"{_yi:.1f}", xy=(_xi, _yi), xytext=(0, 9), textcoords="offset points",
+                                     ha="center", fontsize=7, color=C_TEXT_MUT)
                     if len(_pts) >= 3:
                         _xn = np.array([(d - _x[0]).days for d in _x], dtype=float)
-                        _sl, _ic, _r, _, _ = sp_stats.linregress(_xn, _y)
-                        axw.plot(_x, _ic + _sl * _xn, ls="--", lw=1.2, color=C_WHITE, alpha=0.5,
-                                 label=f"tendance {_sl*30:+.2f} / mois (R²={_r**2:.2f})")
+                        _sl, _ic, _rr, _, _ = sp_stats.linregress(_xn, _y)
+                        axw.plot(_x, _ic + _sl * _xn, ls="--", lw=1.2, color=C_WHITE, alpha=0.55,
+                                 label=f"tendance {_sl*30:+.2f} / mois (R²={_rr**2:.2f})")
                         axw.legend(loc="best")
                     axw.set_ylabel(_metric); axw.set_xlabel("Date de séance")
-                    chart_title(axw, _metric, f"{_aname} · {len(_pts)} séances comparées")
+                    chart_title(axw, _metric,
+                                f"{_aname} · {len(_pts)} séances" +
+                                (f" · catégorie « {_ft} »" if _ft != "(toutes)" else " · toutes catégories"))
                     fig_wk.autofmt_xdate(rotation=0, ha="center"); fig_wk.tight_layout()
                     st.pyplot(fig_wk); plt.close(fig_wk)
                 else:
-                    st.caption("Il faut au moins deux séances contenant cette mesure pour tracer une évolution.")
+                    st.caption("Il faut au moins deux séances comportant cette mesure — filtre moins "
+                               "restrictif, ou enregistre d'autres séances.")
 
+                # ── courbes de temps de maintien superposées ─────────────
+                _with_rec = [r for r in _wk_f if _json.loads(r.get("records_json") or "[]")]
+                if _with_rec:
+                    st.markdown("##### ⏱️ Temps de maintien — comparaison de séances")
+                    _lbl = {f"{r['date']} — {r['name'] or r['file_name'] or 'séance'} (#{r['id']})": r
+                            for r in _with_rec}
+                    _sel_rec = st.multiselect("Séances à superposer (2 à 4 conseillées)", list(_lbl.keys()),
+                                              default=list(_lbl.keys())[:2], key="hist_wk_reccmp")
+                    if _sel_rec:
+                        _series = [(k.split(" — ")[0] + " · " + (_lbl[k]["name"] or "séance"),
+                                    _json.loads(_lbl[k].get("records_json") or "[]")) for k in _sel_rec]
+                        _main_lab, _main_rec = _series[-1]
+                        fig_rec = plot_records_curve(_main_rec, vc_ms=last_vc_ms(_aid),
+                                                     compare=_series[:-1],
+                                                     title_suffix=f" · en rouge : {_main_lab}")
+                        st.pyplot(fig_rec); plt.close(fig_rec)
+                        st.caption("La courbe rouge est la dernière séance sélectionnée. Un décalage vers le "
+                                   "haut sur les durées longues = meilleure endurance ; un gain seulement sur "
+                                   "les durées courtes = travail de vitesse.")
+
+                # ── temps par zone cardiaque, séance par séance ──────────
+                _with_z = [r for r in _wk_f if _json.loads(r.get("zones_json") or "[]")]
+                if len(_with_z) >= 1:
+                    st.markdown("##### 💓 Répartition du temps par zone cardiaque")
+                    _with_z = sorted(_with_z, key=lambda r: r["date"])[-12:]
+                    _zlabels = [z["zone"] for z in _json.loads(_with_z[0]["zones_json"])]
+                    _mat = []
+                    for r in _with_z:
+                        _z = _json.loads(r["zones_json"])
+                        _mat.append([float(x["temps_s"]) / 60.0 for x in _z])
+                    _mat = np.array(_mat)
+                    fig_z, axz = plt.subplots(figsize=(11.5, 3.9))
+                    _cols_z = [C_DIM, C_GREY, C_WHITE, C_RED_SOFT, C_RED]
+                    _bottom = np.zeros(len(_with_z))
+                    _xz = np.arange(len(_with_z))
+                    for i in range(_mat.shape[1]):
+                        axz.bar(_xz, _mat[:, i], bottom=_bottom, color=_cols_z[i % 5], width=0.6,
+                                label=_zlabels[i], edgecolor=C_SURFACE, linewidth=1.2)
+                        _bottom += _mat[:, i]
+                    axz.set_xticks(_xz)
+                    axz.set_xlim(-0.75, len(_with_z) - 0.25)   # évite une barre étalée quand il n'y en a qu'une
+                    axz.set_xticklabels([f"{r['date'][5:]}\n{(r['name'] or '')[:14]}" for r in _with_z], fontsize=7.5)
+                    axz.set_ylabel("Temps (min)")
+                    chart_title(axz, "Temps par zone cardiaque, séance par séance",
+                                "12 séances les plus récentes de la sélection")
+                    axz.legend(loc="upper left", ncol=5, fontsize=7.5)
+                    fig_z.tight_layout(); st.pyplot(fig_z); plt.close(fig_z)
+
+                # ── détail d'une séance ─────────────────────────────────
                 _opts_w = {f"{r['date']} — {r['name'] or r['file_name'] or 'séance'} (#{r['id']})": r["id"]
-                           for r in _wk}
+                           for r in _wk_f}
                 _sw = st.selectbox("Détail d'une séance", list(_opts_w.keys()), key="hist_wk_detail")
                 _rec = get_record("workouts", _opts_w[_sw])
                 if _rec:
                     _por = _json.loads(_rec["portions_json"] or "[]")
                     _itv = _json.loads(_rec["intervals_json"] or "[]")
+                    _zz = _json.loads(_rec["zones_json"] or "[]")
+                    _rr_ = _json.loads(_rec["records_json"] or "[]")
+                    if _rr_:
+                        st.markdown("**Temps de maintien de cette séance**")
+                        st.dataframe(pd.DataFrame([{
+                            "Durée": seconds_to_hms(x["duree_s"]), "Distance (m)": x["distance_m"],
+                            "Vitesse (km/h)": x["vitesse_kmh"], "Allure": pace_str(x["allure_s_km"]) + "/km",
+                            "À partir de": seconds_to_hms(x["debut_s"])} for x in _rr_]),
+                            use_container_width=True, hide_index=True)
+                    if _zz:
+                        st.markdown("**Zones cardiaques**")
+                        st.dataframe(pd.DataFrame([{
+                            "Zone": x["zone"], "Plage (bpm)": f"{x['bpm_min'] or '—'} – {x['bpm_max'] or '—'}",
+                            "Temps": seconds_to_hms(x["temps_s"]), "% du temps": x["pct"]} for x in _zz]),
+                            use_container_width=True, hide_index=True)
                     if _por:
                         st.markdown("**Portions de terrain enregistrées**")
                         st.dataframe(pd.DataFrame(_por), use_container_width=True, hide_index=True)
                     if _itv:
                         st.markdown("**Intervalles enregistrés**")
                         st.dataframe(pd.DataFrame(_itv), use_container_width=True, hide_index=True)
-                    if not _por and not _itv:
-                        st.caption("Cette séance a été enregistrée sans détail de portions ni d'intervalles.")
-                    _nn = st.text_area("Notes", value=_rec["notes"] or "", key="hist_wk_notes")
-                    cwn1, cwn2 = st.columns(2)
-                    if cwn1.button("💾 Mettre à jour les notes", key="hist_wk_notes_btn"):
-                        update_record_notes("workouts", _rec["id"], _user["id"], _nn)
+                    _dc1, _dc2 = st.columns(2)
+                    _cat_opts = ["— sans catégorie —"] + [c["name"] for c in _cats]
+                    _cur_cat = _cat_by_id.get(_rec.get("category_id"), "— sans catégorie —")
+                    _new_cat = _dc1.selectbox("Catégorie de cette séance", _cat_opts,
+                                              index=_cat_opts.index(_cur_cat) if _cur_cat in _cat_opts else 0,
+                                              key="hist_wk_setcat")
+                    if _dc1.button("Appliquer la catégorie", key="hist_wk_setcat_btn"):
+                        _cid2 = next((c["id"] for c in _cats if c["name"] == _new_cat), None)
+                        set_workout_category(_rec["id"], _user["id"], _cid2)
+                        st.success("Catégorie mise à jour."); st.rerun()
+                    _nn2 = _dc2.text_area("Notes", value=_rec["notes"] or "", key="hist_wk_notes")
+                    if _dc2.button("💾 Mettre à jour les notes", key="hist_wk_notes_btn"):
+                        update_record_notes("workouts", _rec["id"], _user["id"], _nn2)
                         st.success("Notes enregistrées."); st.rerun()
-                    if cwn2.button("🗑️ Supprimer cette séance", key="hist_wk_del"):
+                    if st.button("🗑️ Supprimer cette séance", key="hist_wk_del"):
                         if delete_record("workouts", _rec["id"], _user["id"]):
                             st.success("Séance supprimée."); st.rerun()
 
@@ -6009,8 +6527,20 @@ with main_tabs[4]:
         # ── Données : export / import / maintenance ──────────────────────
         with h_t4:
             st.markdown("#### Sauvegarde et transfert")
-            st.caption(f"Toutes les données sont dans le fichier `{DB_PATH}`. Copie ce fichier pour "
-                       "sauvegarder l'ensemble des athlètes et des analyses.")
+            st.markdown('<div class="note-box note-red">La base de données est un fichier <b>séparé du '
+                        'script</b>. Modifier l\'algorithme, ajouter des graphiques ou remplacer le fichier '
+                        '.py ne touche jamais aux données : au démarrage, l\'app ajoute seulement les '
+                        'colonnes manquantes (aucune table n\'est recréée ni vidée) et fait une copie de '
+                        'sauvegarde datée avant toute évolution de schéma.</div>', unsafe_allow_html=True)
+            _db_size = os.path.getsize(DB_PATH) / 1024.0 if os.path.exists(DB_PATH) else 0
+            st.caption(f"Fichier : `{DB_PATH}` · {_db_size:,.0f} Ko · schéma v{SCHEMA_VERSION}".replace(",", " "))
+            _baks = sorted(glob.glob(f"{DB_PATH}.bak-*"), reverse=True)
+            if _baks:
+                st.caption("Sauvegardes automatiques : " +
+                           " · ".join(os.path.basename(b) for b in _baks[:4]))
+            with open(DB_PATH, "rb") as _dbf:
+                st.download_button("⬇️ Télécharger la base complète (.db)", data=_dbf.read(),
+                                   file_name=os.path.basename(DB_PATH), key="hist_dl_db")
             _exp = export_athlete_json(_aid)
             if _exp:
                 st.download_button(f"⬇️ Exporter tout l'historique de {_aname} (JSON)",
