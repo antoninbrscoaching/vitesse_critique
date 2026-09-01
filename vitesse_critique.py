@@ -956,6 +956,7 @@ def parse_fit_ref(file, tz_name=TZ_NAME_DEFAULT):
 
     return {"points": [{"lat": r[0], "lon": r[1], "elev": r[2], "dist": r[3], "time": t}
                        for r, t in zip(records, times_pts)],
+            "laps": fit_laps(raw_bytes),
             "distance": dist_max, "D_up": dup, "D_down": ddn,
             "duration_hms": seconds_to_hms((end_dt - start_dt).total_seconds()),
             "avg_temp": avgT, "avg_wind": avgW, "avg_humidity": avgH,
@@ -988,6 +989,94 @@ def parse_tcx_ref(file,tz_name=TZ_NAME_DEFAULT):
     return{"points":pts,"distance":round(total),"D_up":round(dup,1),"D_down":round(ddn,1),
            "duration_hms":seconds_to_hms((end_dt-start_dt).total_seconds()),
            "avg_temp":avgT,"avg_wind":avgW,"avg_humidity":avgH,"hr_analysis":hr_analysis}
+
+def fit_laps(raw_bytes):
+    """Tours (laps) enregistrés par la montre, avec leur position dans le fichier.
+    Un test de 3 min est presque toujours un tour dédié au milieu d'une séance :
+    le tour donne la distance et la durée mesurées par la montre, sans avoir à
+    retrouver le segment à la main."""
+    if not HAS_FITDECODE:
+        return []
+    laps, t_start = [], None
+    def gv(fr, n):
+        try:
+            return fr.get_value(n) if fr.has_field(n) else None
+        except Exception:
+            return None
+    kwargs = {}
+    if hasattr(fitdecode, "CrcCheck"):
+        kwargs["check_crc"] = fitdecode.CrcCheck.WARN
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with fitdecode.FitReader(io.BytesIO(raw_bytes), **kwargs) as fr:
+                for frame in fr:
+                    if not isinstance(frame, fitdecode.FitDataMessage):
+                        continue
+                    if frame.name == "record" and t_start is None:
+                        _ts = gv(frame, "timestamp")
+                        if isinstance(_ts, datetime):
+                            t_start = _ts.replace(tzinfo=None)
+                    elif frame.name == "lap":
+                        d = safe_float(gv(frame, "total_distance"), 0.0)
+                        t = safe_float(gv(frame, "total_timer_time"), 0.0) or \
+                            safe_float(gv(frame, "total_elapsed_time"), 0.0)
+                        st_ = gv(frame, "start_time")
+                        laps.append({"distance": float(d or 0.0), "temps": float(t or 0.0),
+                                     "start": st_.replace(tzinfo=None) if isinstance(st_, datetime) else None,
+                                     "D_up": safe_float(gv(frame, "total_ascent"), 0.0) or 0.0})
+    except Exception:
+        return []
+    out = []
+    for i, lp in enumerate(laps, 1):
+        if lp["distance"] <= 50 or lp["temps"] <= 20:
+            continue
+        offset = ((lp["start"] - t_start).total_seconds()
+                  if (lp["start"] and t_start) else None)
+        lp.update({"num": i, "offset_s": offset,
+                   "vitesse_ms": lp["distance"] / lp["temps"]})
+        out.append(lp)
+    return out
+
+def best_effort_window(points, target_s):
+    """Meilleur effort continu d'une durée donnée dans une trace : la fenêtre qui
+    couvre le plus de distance. Sert à retrouver un test court noyé dans une
+    séance (échauffement + test + retour au calme) sans chercher les bornes à la
+    main. Retourne (distance_m, debut_s, fin_s) ou None."""
+    def _t(p): return p.get("time") if isinstance(p, dict) else getattr(p, "time", None)
+    def _lat(p): return p.get("lat") if isinstance(p, dict) else getattr(p, "latitude", None)
+    def _lon(p): return p.get("lon") if isinstance(p, dict) else getattr(p, "longitude", None)
+    def _d(p):
+        v = p.get("dist") if isinstance(p, dict) else None
+        return safe_float(v) if v is not None else None
+    pts = [p for p in (points or []) if _t(p) is not None]
+    if len(pts) < 10:
+        return None
+    t0 = _t(pts[0])
+    try:
+        ts = np.array([(_t(p) - t0).total_seconds() for p in pts], dtype=float)
+    except Exception:
+        return None
+    raw = [_d(p) for p in pts]
+    if all(x is not None for x in raw) and raw[-1] and raw[-1] > 1.0:
+        ds = np.array([x or 0.0 for x in raw], dtype=float)
+    else:
+        acc = [0.0]
+        for i in range(1, len(pts)):
+            acc.append(acc[-1] + haversine_m(_lat(pts[i-1]), _lon(pts[i-1]), _lat(pts[i]), _lon(pts[i])))
+        ds = np.array(acc, dtype=float)
+    order = np.argsort(ts); ts, ds = ts[order], ds[order]
+    ds = np.maximum.accumulate(ds)
+    if ts[-1] < float(target_s):
+        return None
+    grid = np.arange(0.0, ts[-1] + 1e-6, 1.0)
+    dg = np.interp(grid, ts, ds)
+    w = int(round(float(target_s)))
+    if w >= len(grid):
+        return None
+    gains = dg[w:] - dg[:-w]
+    i = int(np.argmax(gains))
+    return float(gains[i]), float(grid[i]), float(grid[i + w])
 
 def extract_segment(points,start_td,end_td):
     def get_t(p):return p.get("time") if isinstance(p,dict) else getattr(p,"time",None)
@@ -1596,6 +1685,69 @@ def compute_vc(distances_m,durations_s):
     if len(T)<2:return None,None,None
     slope,intercept,r,p,se=sp_stats.linregress(T,D)
     return float(slope),float(intercept),float(r**2)
+
+def check_vc_references(refs):
+    """Contrôles de cohérence AVANT de croire la régression. Le modèle D' est une
+    droite entre deux points : une référence aberrante ne casse rien visiblement,
+    elle déplace simplement la pente — donc la vitesse critique — de plusieurs
+    dizaines de secondes au kilomètre. Ces contrôles nomment le problème."""
+    msgs = []
+    pts = [r for r in (refs or []) if r.get("distance", 0) > 0 and r.get("temps", 0) > 0]
+    if len(pts) < 2:
+        return msgs
+    pts = sorted(pts, key=lambda r: r["temps"])
+    # 1) un effort plus long ne peut pas être couru plus vite qu'un effort plus court
+    for a, b in zip(pts, pts[1:]):
+        va = a["distance"] / a["temps"]; vb = b["distance"] / b["temps"]
+        if vb > va * 1.005:
+            msgs.append(
+                f"Référence incohérente : l'effort de {seconds_to_hms(b['temps'])} "
+                f"({pace_str(1000.0 / vb)}/km) est plus RAPIDE que celui de "
+                f"{seconds_to_hms(a['temps'])} ({pace_str(1000.0 / va)}/km). Sur un test maximal, "
+                f"l'allure doit baisser quand la durée augmente — l'un des deux n'était pas maximal, "
+                f"ou une valeur est mal saisie.")
+    # 2) deux références de durées trop proches ne contraignent pas la pente
+    for a, b in zip(pts, pts[1:]):
+        if b["temps"] <= a["temps"] * 1.35:
+            msgs.append(
+                f"Références de durées trop proches ({seconds_to_hms(a['temps'])} et "
+                f"{seconds_to_hms(b['temps'])}) : la pente est mal contrainte. Vise un rapport d'au "
+                f"moins 3 entre le test court et le test long (ex. 3 min et 15 min).")
+    # 3) l'écart de durée global : c'est lui qui fixe la précision de la VC
+    if pts[-1]["temps"] < pts[0]["temps"] * 2.0:
+        msgs.append("Toutes les références tiennent dans un rapport de durée inférieur à 2 : "
+                    "la vitesse critique extrapolée sera très sensible au moindre écart.")
+    return msgs
+
+def check_vc_fit(vc_ms, d_prime, r2, refs):
+    """Contrôles sur le résultat de la régression elle-même."""
+    msgs = []
+    if vc_ms is None:
+        return ["Régression impossible."]
+    pts = [r for r in (refs or []) if r.get("distance", 0) > 0 and r.get("temps", 0) > 0]
+    if vc_ms <= 0:
+        msgs.append("Vitesse critique négative ou nulle : les points fournis décrivent une droite "
+                    "descendante, ce qui est physiquement impossible. Vérifie les distances et les "
+                    "temps saisis — c'est presque toujours une référence inversée ou une durée "
+                    "prise sur le fichier entier au lieu du segment de test.")
+        return msgs
+    if d_prime is not None and d_prime < 0:
+        msgs.append(f"Réserve anaérobie D' négative ({d_prime:.0f} m) : le modèle n'a pas de sens "
+                    f"physiologique. Typiquement, l'effort court n'était pas assez intense, ou "
+                    f"l'effort long l'était trop.")
+    elif d_prime is not None and d_prime > 600:
+        msgs.append(f"D' très élevée ({d_prime:.0f} m — l'usuel va de 100 à 400 m) : souvent le signe "
+                    f"d'un test court exceptionnellement bon, ou d'un test long sous-maximal.")
+    if pts:
+        v_min = min(r["distance"] / r["temps"] for r in pts)
+        if vc_ms > v_min * 1.02:
+            msgs.append("La VC calculée est plus rapide que la plus lente des références : "
+                        "impossible par construction, un point doit être erroné.")
+        elif vc_ms < v_min * 0.80:
+            msgs.append(f"La VC ({pace_str(1000.0 / vc_ms)}/km) est plus de 20 % plus lente que la "
+                        f"plus lente des références ({pace_str(1000.0 / v_min)}/km) — vérifie qu'aucune "
+                        f"référence non maximale ne s'est glissée dans le calcul.")
+    return msgs
 
 # ── v8.2 PATCH : détection du point de rupture sur un test à effort maximal ──
 def compute_pace_series_from_points(points, window_s=20.0, grid_step_s=5.0):
@@ -3709,12 +3861,14 @@ def analyze_metabolic_stages(df_gz, mass_kg=70.0, vc_ms=None, n_prior_tests=0, w
         return [], {"error": "Paliers inexploitables après contrôle des données."}
     proto, proto_msg = detect_protocol([r["duree_s"] for r in rows])
     thresholds = detect_thresholds_co2(rows, vc_ms)
+    rows, _infos_cout = split_aerobic_anaerobic(rows, thresholds, vc_ms, mass_kg)
     infos = {"protocole": proto, "protocole_msg": proto_msg, "n_paliers": len(rows),
              "vo2_source": "mesuré" if vo2_measured else "modélisé",
              "economie_ml_kg_km": round(eco_used, 1) if eco_used else None,
              "economie_calibree": bool(eco_n), "economie_n_paliers": eco_n, "economie_alerte": eco_alerte,
              "economie_fenetre_pct": eco_window,
              "paliers_ecartes": (means[0].get("_paliers_ecartes") if means else None),
+             "cout": _infos_cout, "alerte_rer_tendance": check_rer_trend(rows),
              "economie_dispersion_pct": round(eco_spread_pct, 1) if eco_spread_pct else None,
              "mass_kg": float(mass_kg), "vc_ms": vc_ms, "n_prior_tests": int(n_prior_tests),
              "seuils": thresholds,
@@ -3758,8 +3912,172 @@ def analyze_metabolic_stages(df_gz, mass_kg=70.0, vc_ms=None, n_prior_tests=0, w
                                "inexacte. Ajuste l'économie ou vérifie la colonne vitesse du fichier.")
     return rows, infos
 
-def fueling_plan(stages, vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT, gut_cap_g_h=90.0, mass_kg=70.0,
-                 glycogen_g_per_kg=GLYCOGEN_G_PER_KG):
+# ── v9.5 : coût énergétique total vs part aérobie mesurée ─────────────────
+# Le masque ne voit que la filière aérobie. Au-dessus de VT2, une partie de
+# l'énergie vient de la glycolyse anaérobie : le CO₂ expiré cesse de suivre
+# la vitesse (il plafonne quand le VO₂max est atteint). Résultat, si l'on
+# calcule bêtement « kcal / km » à partir des gaz, le coût par kilomètre se
+# met à DIMINUER quand on accélère — ce qui est faux : courir plus vite ne
+# coûte pas moins cher au kilomètre. Ce qui diminue, c'est la part que la
+# filière aérobie arrive à couvrir.
+AIR_COST_KCAL_KG_KM = 8.844e-4     # résistance de l'air : 0.0037 J/(kg·m) × v² (di Prampero)
+
+def cout_reference_kcal_kg_km(c0, v_kmh):
+    """Coût énergétique attendu au km : un socle propre à l'athlète (son économie)
+    plus la résistance de l'air, qui croît avec le carré de la vitesse. Le coût
+    par km est donc à peu près constant, très légèrement croissant — jamais
+    décroissant."""
+    v_ms = float(v_kmh) / 3.6
+    return float(c0) + AIR_COST_KCAL_KG_KM * v_ms ** 2
+
+def split_aerobic_anaerobic(rows, thresholds=None, vc_ms=None, mass_kg=None):
+    """Sépare, pour chaque palier, ce que les gaz mesurent (part aérobie) de ce
+    que coûte réellement le déplacement (coût total modélisé). Retourne les
+    lignes enrichies et les infos de calage."""
+    infos = {}
+    pts = [r for r in rows if r.get("kcal_kg_km") and r.get("vitesse_kmh")]
+    if len(pts) < 3:
+        return rows, infos
+    # Paliers de calage : sous VT2 (ou sous 85 % de la VC), avec un RER crédible.
+    v_vt2 = ((thresholds or {}).get("vt2") or {}).get("vitesse_kmh")
+    v_lim = v_vt2 if v_vt2 else ((vc_ms * 3.6 * 0.85) if vc_ms else None)
+    base = [r for r in pts
+            if (v_lim is None or r["vitesse_kmh"] <= v_lim)
+            and r.get("rer") is not None and 0.70 <= r["rer"] <= 1.00]
+    if len(base) < 2:
+        base = [r for r in pts if r.get("rer") is not None and 0.70 <= r["rer"] <= 1.00] or pts
+    c0 = float(np.median([r["kcal_kg_km"] - AIR_COST_KCAL_KG_KM * (r["vitesse_kmh"] / 3.6) ** 2
+                          for r in base]))
+    infos["cout_base_kcal_kg_km"] = round(c0, 3)
+    infos["cout_cale_sur"] = len(base)
+    infos["cout_limite_kmh"] = round(float(v_lim), 2) if v_lim else None
+    for r in rows:
+        if not (r.get("kcal_kg_km") and r.get("vitesse_kmh")):
+            continue
+        if r.get("mode") == "rer_trop_bas":
+            # CO₂ en retard sur l'effort (mise en route) : l'écart au coût attendu
+            # n'a rien d'anaérobie, on ne l'interprète pas.
+            r["kcal_kg_km_aero"] = round(float(r["kcal_kg_km"]), 3)
+            r["kcal_kg_km_total"] = round(cout_reference_kcal_kg_km(c0, r["vitesse_kmh"]), 3)
+            r["kcal_km_total"] = (round(r["kcal_kg_km_total"] * float(mass_kg), 1) if mass_kg else None)
+            r["kcal_h_total"] = (round(r["kcal_kg_km_total"] * float(mass_kg) * r["vitesse_kmh"])
+                                 if mass_kg else None)
+            r["part_anaerobie_pct"] = None
+            continue
+        ref = cout_reference_kcal_kg_km(c0, r["vitesse_kmh"])
+        aero = float(r["kcal_kg_km"])
+        total = max(aero, ref)
+        r["kcal_kg_km_aero"] = round(aero, 3)
+        r["kcal_kg_km_total"] = round(total, 3)
+        r["part_anaerobie_pct"] = round(max(0.0, (1.0 - aero / total)) * 100.0, 1)
+        r["kcal_km_total"] = round(total * float(mass_kg), 1) if mass_kg else None
+        r["kcal_h_total"] = (round(total * float(mass_kg) * r["vitesse_kmh"]) if mass_kg else None)
+    _an = [r["part_anaerobie_pct"] for r in rows if r.get("part_anaerobie_pct") is not None]
+    if _an and max(_an) >= 3.0:
+        _v_an = [r["vitesse_kmh"] for r in rows if (r.get("part_anaerobie_pct") or 0) >= 3.0]
+        infos["anaerobie_msg"] = (
+            f"À partir de {min(_v_an):.1f} km/h, les gaz expirés ne suffisent plus à expliquer le coût "
+            f"du déplacement : jusqu'à {max(_an):.0f} % de l'énergie vient de la filière anaérobie, "
+            f"invisible pour un masque. Le coût total au km est donc modélisé (économie + résistance de "
+            f"l'air), pas mesuré, au-delà de cette vitesse.")
+    return rows, infos
+
+def check_rer_trend(rows):
+    """Le RER doit MONTER avec l'intensité. S'il descend, ce n'est pas de la
+    physiologie : c'est soit un VO₂ modélisé au-delà du VO₂max réel, soit un
+    masque qui sous-lit le CO₂ à forte ventilation. Dans les deux cas il faut le
+    dire, parce que tout ce qui dépend du RER en hérite."""
+    pts = [r for r in rows if r.get("rer") and r.get("vitesse_kmh")
+           and r.get("mode") not in ("sans_vo2", "rer_trop_bas")]
+    if len(pts) < 5:
+        return None
+    pts = sorted(pts, key=lambda r: r["vitesse_kmh"])
+    x = np.array([r["vitesse_kmh"] for r in pts], dtype=float)
+    y = np.array([r["rer"] for r in pts], dtype=float)
+    sl, _, _, p, _ = sp_stats.linregress(x, y)
+    _n3 = max(2, len(pts) // 3)
+    hausse = float(np.mean(y[-_n3:]) - np.mean(y[:_n3]))
+    span = float(x[-1] - x[0])
+    _cause = ("Deux causes possibles — le VO₂ modélisé dépasse le VO₂max réel sur les derniers paliers "
+              "(le modèle est linéaire, la physiologie plafonne), ou le masque sous-lit le CO₂ à forte "
+              "ventilation (fuite au visage, temps de réponse du capteur). Conséquence pratique : les "
+              "seuils ventilatoires et le coût énergétique total restent valables, mais la partition "
+              "glucides/lipides des paliers les plus durs est à ignorer.")
+    if sl < -0.004 and p < 0.15:
+        return (f"Le RER modélisé DIMINUE quand la vitesse augmente ({sl*10:+.3f} par 10 km/h) : "
+                f"physiologiquement impossible sur un test incrémental. " + _cause)
+    if span >= 3.0 and hausse < 0.04:
+        return (f"Le RER modélisé reste plat ({hausse:+.02f} entre le bas et le haut du test, sur "
+                f"{span:.1f} km/h d'écart) alors qu'il devrait monter d'environ 0,15 en approchant la "
+                f"vitesse critique. " + _cause)
+    return None
+
+# ── v9.5 : de « ce que tu tolères » à « ce qu'il faut avaler » ────────────
+# L'ancienne logique demandait la tolérance intestinale et plafonnait l'apport
+# dessus. La bonne question du coureur est l'inverse : à cette allure et pour
+# cette durée, COMBIEN faut-il consommer pour ne pas taper dans le mur ? On
+# part donc du besoin (oxydation × durée), on retire ce que les réserves
+# couvrent, et on compare le reste aux plafonds d'absorption connus.
+CHO_ABSORPTION_CEILINGS = [
+    (60.0,  "glucose seul", "un seul transporteur intestinal (SGLT1) — le plafond classique"),
+    (90.0,  "glucose + fructose 2:1", "deux transporteurs (SGLT1 + GLUT5), boisson ou gels mixtes"),
+    (120.0, "glucose + fructose 1:0.8, intestin entraîné",
+     "atteignable seulement après plusieurs semaines d'entraînement digestif"),
+]
+GLYCOGEN_USABLE_FRAC = 0.80     # on ne vide jamais complètement les stocks utiles
+
+def fueling_requirement(cho_g_h, duree_h, mass_kg, glycogen_g_per_kg=GLYCOGEN_G_PER_KG,
+                        usable_frac=GLYCOGEN_USABLE_FRAC, depart_plein=True):
+    """Combien de glucides par heure faut-il ingérer pour tenir `duree_h` à cette
+    intensité ? Renvoie le besoin, ce que les réserves couvrent, l'apport requis,
+    la stratégie d'absorption minimale qui y arrive, et — si rien n'y arrive — la
+    durée réellement tenable."""
+    if not cho_g_h or cho_g_h <= 0 or not duree_h or duree_h <= 0:
+        return None
+    cho_g_h = float(cho_g_h); duree_h = float(duree_h)
+    reserve_g = float(mass_kg) * float(glycogen_g_per_kg) * (1.0 if depart_plein else 0.7)
+    reserve_utile_g = reserve_g * float(usable_frac)
+    besoin_g = cho_g_h * duree_h
+    autonomie_h = reserve_utile_g / cho_g_h
+    deficit_g = max(0.0, besoin_g - reserve_utile_g)
+    apport_requis_g_h = deficit_g / duree_h
+    strategie = next((lab for cap, lab, _ in CHO_ABSORPTION_CEILINGS if apport_requis_g_h <= cap), None)
+    detail = next((d for cap, _, d in CHO_ABSORPTION_CEILINGS if apport_requis_g_h <= cap), None)
+    plafond_max = CHO_ABSORPTION_CEILINGS[-1][0]
+    faisable = apport_requis_g_h <= plafond_max
+    # durée réellement tenable si l'on absorbe au plafond maximal
+    duree_max_h = (reserve_utile_g / max(1e-6, cho_g_h - plafond_max)) if cho_g_h > plafond_max else None
+    # repères de la littérature selon la durée d'effort (ACSM / Jeukendrup)
+    if duree_h < 0.75:
+        repere = (0.0, 0.0, "moins de 45 min : l'apport glucidique n'apporte rien de mesurable, "
+                            "les réserves suffisent largement")
+    elif duree_h < 1.25:
+        repere = (0.0, 30.0, "45 min à 1 h 15 : un simple rinçage de bouche ou 30 g/h suffit — "
+                             "l'effet est nerveux plus que métabolique")
+    elif duree_h < 2.5:
+        repere = (30.0, 60.0, "1 h 15 à 2 h 30 : 30 à 60 g/h, un seul type de glucide suffit")
+    else:
+        repere = (60.0, 90.0, "au-delà de 2 h 30 : 60 à 90 g/h, mélange glucose + fructose")
+    conseil_g_h = min(max(apport_requis_g_h, repere[0]), plafond_max)
+    if conseil_g_h <= 0:
+        strategie, detail = "aucun apport nécessaire", ("les réserves couvrent l'effort — boire suffit, "
+                                                        "manger ne changera rien à la performance")
+    elif not faisable:
+        strategie, detail = None, None
+    return {
+        "cho_g_h": round(cho_g_h, 1), "duree_h": round(duree_h, 2),
+        "besoin_total_g": round(besoin_g), "reserve_g": round(reserve_g),
+        "reserve_utile_g": round(reserve_utile_g),
+        "autonomie_sans_apport_h": round(autonomie_h, 2),
+        "deficit_g": round(deficit_g), "apport_requis_g_h": round(apport_requis_g_h),
+        "conseil_g_h": round(conseil_g_h), "strategie": strategie, "strategie_detail": detail,
+        "faisable": bool(faisable), "duree_max_h": (round(duree_max_h, 2) if duree_max_h else None),
+        "repere_lo": repere[0], "repere_hi": repere[1], "repere_msg": repere[2],
+        "plafond_max_g_h": plafond_max,
+    }
+
+def fueling_plan(stages, vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT, gut_cap_g_h=120.0, mass_kg=70.0,
+                 glycogen_g_per_kg=GLYCOGEN_G_PER_KG, duree_h=3.0):
     """Plan nutritionnel par zone de VC : oxydation glucidique estimée, apport
     conseillé (plafonné par la tolérance intestinale) et autonomie glycogénique."""
     usable = [s for s in stages if s.get("pct_vc") and s.get("cho_g_min") is not None]
@@ -3786,9 +4104,14 @@ def fueling_plan(stages, vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT, gut_cap_g_h=90.0,
         _k = float(np.interp(mid, xs, kcal))
         _conf = float(np.interp(mid, xs, conf)) * (0.75 if extrapolated else 1.0)
         ox_h = _c * 60.0
-        intake = min(float(gut_cap_g_h), ox_h)
+        # v9.5 — l'apport n'est plus « ce que tu tolères » mais ce qu'il FAUT
+        # avaler pour tenir la durée visée, une fois les réserves déduites.
+        _req = fueling_requirement(ox_h, float(duree_h), float(mass_kg),
+                                   glycogen_g_per_kg=glycogen_g_per_kg)
+        intake = float(_req["conseil_g_h"]) if _req else min(float(gut_cap_g_h), ox_h)
         deficit = max(0.0, ox_h - intake)
-        autonomy_h = (stores_g / deficit) if deficit > 1 else None
+        autonomy_h = float(_req["autonomie_sans_apport_h"]) if _req else (
+            (stores_g / deficit) if deficit > 1 else None)
         rows.append({
             "zone": VC_ZONE_LABELS[i] if i < len(VC_ZONE_LABELS) else f"Z{i}",
             "pct_lo": lo_e, "pct_hi": hi_e,
@@ -3799,7 +4122,9 @@ def fueling_plan(stages, vc_ms, bounds=VC_ZONE_BOUNDS_DEFAULT, gut_cap_g_h=90.0,
             "autonomie_h": round(autonomy_h, 1) if autonomy_h else None,
             "confiance": round(_conf), "extrapole": bool(extrapolated),
         })
-    return rows, {"stores_g": round(stores_g), "gut_cap_g_h": float(gut_cap_g_h)}
+    return rows, {"stores_g": round(stores_g), "gut_cap_g_h": float(gut_cap_g_h),
+                  "duree_h": float(duree_h),
+                  "reserve_utile_g": round(stores_g * GLYCOGEN_USABLE_FRAC)}
 
 def plot_ventilatory_thresholds(stages, thresholds, vc_ms=None):
     """Ce que le masque MESURE vraiment : VE/VCO₂ (nadir = VT2) et VCO₂ vs
@@ -3901,22 +4226,35 @@ def plot_energy(stages, vc_ms=None):
     return fig
 
 def plot_economy(stages, mass_kg):
-    """Économie de course : coût énergétique par km selon la vitesse."""
-    pts = [s for s in stages if s.get("kcal_kg_km") and s.get("vitesse_kmh")]
+    """Coût énergétique par km : ce que le masque voit (filière aérobie) et ce que
+    coûte réellement le déplacement. L'écart entre les deux, c'est la part
+    anaérobie — invisible pour un capteur de CO₂, mais bien payée par le coureur."""
+    pts = [s for s in stages if s.get("kcal_kg_km") and s.get("vitesse_kmh")
+           and s.get("mode") != "rer_trop_bas"]
+    pts = sorted(pts, key=lambda s: s["vitesse_kmh"])
     if len(pts) < 2:
         return None
-    fig, ax = plt.subplots(figsize=(11.5, 3.6))
+    fig, ax = plt.subplots(figsize=(11.5, 3.8))
     x = [s["vitesse_kmh"] for s in pts]
-    y = [s["kcal_kg_km"] for s in pts]
-    ax.plot(x, y, "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
-    for s in pts:
-        ax.annotate(f"{s['kcal_kg_km']:.2f}", xy=(s["vitesse_kmh"], s["kcal_kg_km"]), xytext=(0, 9),
+    y_ae = [s.get("kcal_kg_km_aero", s["kcal_kg_km"]) for s in pts]
+    y_to = [s.get("kcal_kg_km_total", s["kcal_kg_km"]) for s in pts]
+    has_split = any(abs(a - b) > 1e-6 for a, b in zip(y_ae, y_to))
+    if has_split:
+        ax.fill_between(x, y_ae, y_to, color=C_RED, alpha=0.18, linewidth=0,
+                        label="Part anaérobie (non vue par le masque)")
+    ax.plot(x, y_to, "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4,
+            label="Coût total du déplacement")
+    ax.plot(x, y_ae, "-o", color=C_WHITE, lw=1.6, ms=5, mec=C_SURFACE, mew=1.2, alpha=0.9,
+            label="Part aérobie mesurée (gaz)")
+    for s, v in zip(pts, y_to):
+        ax.annotate(f"{v:.2f}", xy=(s["vitesse_kmh"], v), xytext=(0, 9),
                     textcoords="offset points", ha="center", fontsize=7.5, color=C_TEXT_MUT)
-    _m = float(np.mean(y))
-    ax.axhline(_m, color=C_TEXT_MUT, lw=1, ls=":")
+    _m = float(np.mean(y_to))
     ax.set_xlabel("Vitesse (km/h)"); ax.set_ylabel("kcal / kg / km")
-    chart_title(ax, "Économie de course",
-                f"Coût énergétique moyen {_m:.2f} kcal/kg/km (≈ {_m*mass_kg:.0f} kcal/km pour {mass_kg:.0f} kg)")
+    ax.legend(fontsize=8, loc="lower right")
+    chart_title(ax, "Coût énergétique de la course",
+                f"Coût total moyen {_m:.2f} kcal/kg/km (≈ {_m*mass_kg:.0f} kcal/km pour {mass_kg:.0f} kg) — "
+                f"il ne baisse pas quand on accélère : courir plus vite ne coûte jamais moins cher au km")
     fig.tight_layout()
     return fig
 
@@ -6223,14 +6561,83 @@ with main_tabs[1]:
 
                     if parsed_vc_i:
                         st.success(f"✅ {file_vc_i.name} — {parsed_vc_i['distance']:.0f} m · {parsed_vc_i['duration_hms']} · D+ {parsed_vc_i['D_up']:.0f} m")
-                        col_vs, col_ve = st.columns(2)
-                        with col_vs:
-                            vc_sh = hms_input("Début segment", "0:00:00", key=f"vc_seg_start_{i}")
-                        with col_ve:
-                            vc_eh = hms_input("Fin segment",   "23:59:59", key=f"vc_seg_end_{i}")
+                        pts_i = parsed_vc_i.get("points", [])
+                        _laps_i = parsed_vc_i.get("laps") or []
+                        _tot_s_i = float(hms_to_seconds(parsed_vc_i["duration_hms"]))
+
+                        # ── v9.5 : le test est rarement le fichier entier ────────────
+                        # Un test de 3 min vit au milieu d'une séance (échauffement,
+                        # récup, retour au calme). Prendre le fichier entier injecte
+                        # une référence lente et fausse la vitesse critique. On offre
+                        # donc trois façons d'isoler l'effort, sans chercher les bornes
+                        # à la main.
+                        # laps assez longs pour être un test (on ignore les fragments de fin)
+                        _med_lap = float(np.median([l["temps"] for l in _laps_i])) if _laps_i else 0.0
+                        _laps_ok = [l for l in _laps_i if l["temps"] >= max(60.0, 0.5 * _med_lap)]
+                        _v_moy_i = (parsed_vc_i["distance"] / _tot_s_i) if _tot_s_i > 0 else 0.0
+                        _lap_fast = max(_laps_ok, key=lambda l: l["vitesse_ms"]) if _laps_ok else None
+                        # Un test noyé dans une séance se reconnaît à ceci : un tour nettement
+                        # plus rapide que la moyenne du fichier, et court devant le total.
+                        # Un test continu (5 km chronométré) n'a pas cette signature — son
+                        # fichier EST le test, et on le laisse entier.
+                        _test_dans_seance = bool(
+                            _lap_fast and _v_moy_i > 0
+                            and _lap_fast["vitesse_ms"] > _v_moy_i * 1.12
+                            and _lap_fast["temps"] < 0.6 * _tot_s_i)
+                        _modes = ["Fichier entier"]
+                        if _laps_i:
+                            _modes.append("Un tour (lap) de la montre")
+                        _modes += ["Meilleur effort sur une durée", "Segment manuel"]
+                        _def_mode = 1 if _test_dans_seance else 0
+                        if _test_dans_seance:
+                            st.warning(
+                                f"⚠️ Ce fichier ressemble à une séance, pas à un test continu : le tour "
+                                f"{_lap_fast['num']} ({pace_str(_lap_fast['temps']/(_lap_fast['distance']/1000.0))}/km) "
+                                f"est {_lap_fast['vitesse_ms']/_v_moy_i:.0%} de la vitesse moyenne du fichier "
+                                f"({pace_str(1000.0/_v_moy_i)}/km). Prendre le fichier entier mélangerait "
+                                f"l'échauffement et le test, et tirerait la vitesse critique vers le bas — "
+                                f"c'est le tour qui est présélectionné.")
+                        _mode_i = st.radio("Partie du fichier à utiliser comme test", _modes,
+                                           index=_def_mode, key=f"vc_mode_{i}", horizontal=False)
+
+                        vc_sh, vc_eh = "0:00:00", "23:59:59"
+                        _lap_pick = None
+                        if _mode_i == "Un tour (lap) de la montre":
+                            _lab = {f"Tour {l['num']} — {l['distance']:.0f} m en "
+                                    f"{seconds_to_hms(l['temps'])} ({pace_str(l['temps']/(l['distance']/1000.0))}/km)": l
+                                    for l in _laps_i}
+                            _pref = _lap_fast or max(_laps_i, key=lambda l: l["vitesse_ms"])
+                            _best_lab = next((k for k, v in _lab.items() if v["num"] == _pref["num"]),
+                                             list(_lab.keys())[0])
+                            _sel = st.selectbox("Tour", list(_lab.keys()),
+                                                index=list(_lab.keys()).index(_best_lab),
+                                                key=f"vc_lap_{i}",
+                                                help="Le tour le plus rapide d'au moins 1 min est présélectionné.")
+                            _lap_pick = _lab[_sel]
+                        elif _mode_i == "Meilleur effort sur une durée":
+                            _bc1, _bc2 = st.columns([1, 2])
+                            _tgt = _bc1.number_input("Durée du test (min)", 1.0, 180.0, 3.0, 0.5,
+                                                     key=f"vc_be_min_{i}")
+                            _be = best_effort_window(pts_i, _tgt * 60.0)
+                            if _be:
+                                _bd, _b0, _b1 = _be
+                                _bc2.caption(f"Meilleur bloc de {_tgt:.0f} min : **{_bd:.0f} m** "
+                                             f"({pace_str(_tgt*60.0/(_bd/1000.0))}/km), de "
+                                             f"{seconds_to_hms(_b0)} à {seconds_to_hms(_b1)} dans le fichier.")
+                                vc_sh, vc_eh = seconds_to_hms(_b0), seconds_to_hms(_b1)
+                            else:
+                                st.warning("Fichier trop court pour cette durée.")
+                        elif _mode_i == "Segment manuel":
+                            col_vs, col_ve = st.columns(2)
+                            with col_vs:
+                                vc_sh = hms_input("Début segment", "0:00:00", key=f"vc_seg_start_{i}")
+                            with col_ve:
+                                vc_eh = hms_input("Fin segment",   "23:59:59", key=f"vc_seg_end_{i}")
+                        if _lap_pick is not None and _lap_pick.get("offset_s") is not None:
+                            vc_sh = seconds_to_hms(_lap_pick["offset_s"])
+                            vc_eh = seconds_to_hms(_lap_pick["offset_s"] + _lap_pick["temps"])
                         start_td_i = hms_to_timedelta(vc_sh)
                         end_td_i   = hms_to_timedelta(vc_eh)
-                        pts_i = parsed_vc_i.get("points", [])
                         if pts_i and (start_td_i.total_seconds() > 0 or end_td_i.total_seconds() < 86399):
                             seg_i = extract_segment(pts_i, start_td_i, end_td_i)
                             # ── fix : seuil adaptatif anti-bruit GPS (médiane × 10), même logique que v8 PATCH 1 ──
@@ -6266,6 +6673,12 @@ with main_tabs[1]:
                             dist_v = float(parsed_vc_i["distance"])
                             dur_i  = parsed_vc_i["duration_hms"]
                             d_up_v = float(parsed_vc_i["D_up"])
+                        if _lap_pick is not None:
+                            # la montre a mesuré ce tour : ses valeurs priment sur une
+                            # distance recalculée depuis le GPS point par point
+                            dist_v = float(round(_lap_pick["distance"]))
+                            dur_i  = seconds_to_hms(_lap_pick["temps"])
+                            d_up_v = float(_lap_pick.get("D_up") or d_up_v or 0.0)
                         secs_v = float(hms_to_seconds(dur_i))
                         hr_ref_vc = parsed_vc_i.get("hr_analysis")
                         # v8.2 — conserve les points pour la détection de rupture (section 4)
@@ -6290,12 +6703,18 @@ with main_tabs[1]:
                                                   value=float(st.session_state.get(f"vc_dist_{i}", 5000)),
                                                   min_value=100.0, key=f"vc_dist_{i}")
                 with c2:
-                    t_v = hms_input("Temps", default="0:20:00", key=f"vc_temps_{i}")
+                    # v9.5 — défaut à 0:00:00 : une référence non renseignée ne doit JAMAIS
+                    # entrer dans la régression. L'ancien défaut (0:20:00) transformait
+                    # chaque emplacement laissé vide en un faux test 5 km / 20 min qui
+                    # tirait la vitesse critique vers le bas sans que rien ne le signale.
+                    t_v = hms_input("Temps", default="0:00:00", key=f"vc_temps_{i}")
                 with c3:
                     d_up_v = st.number_input("D+ (m)", value=0.0, step=10.0, key=f"vc_dup_{i}")
                 secs_v = float(hms_to_seconds(t_v))
                 if dist_v > 0 and secs_v > 0:
                     st.caption(f"Allure : **{pace_str(secs_v/(dist_v/1000))}/km** · Vitesse : **{dist_v/secs_v*3.6:.2f} km/h**")
+                else:
+                    st.caption("⚪ Référence vide — saisis un temps pour qu'elle compte dans le calcul.")
 
             refs_vc.append({
                 "distance": float(dist_v),
@@ -6305,6 +6724,29 @@ with main_tabs[1]:
             })
 
     refs_vc_valid = [r for r in refs_vc if r["distance"] > 0 and r["temps"] > 0]
+
+    # ── v9.5 : récapitulatif explicite de ce qui entre dans la régression ──
+    # La vitesse critique est une pente entre deux points : une seule référence
+    # fantôme suffit à la fausser de 40 s/km sans rien casser visiblement. On
+    # montre donc noir sur blanc la liste retenue, avant tout calcul.
+    if refs_vc_valid:
+        st.markdown("##### 🎯 Références prises en compte dans le calcul")
+        st.dataframe(pd.DataFrame([{
+            "#": _k + 1,
+            "Distance": f"{_r['distance']:.0f} m",
+            "Temps": seconds_to_hms(_r["temps"]),
+            "Allure": pace_str(_r["temps"] / (_r["distance"] / 1000.0)) + "/km",
+            "Vitesse": f"{_r['distance'] / _r['temps'] * 3.6:.2f} km/h",
+            "D+": f"{_r.get('D_up', 0):.0f} m",
+        } for _k, _r in enumerate(refs_vc_valid)]), use_container_width=True, hide_index=True)
+        _n_vides = len(refs_vc) - len(refs_vc_valid)
+        if _n_vides:
+            st.caption(f"{_n_vides} emplacement(s) laissé(s) vide(s) : ignoré(s).")
+        _alertes_refs = check_vc_references(refs_vc_valid)
+        for _a in _alertes_refs:
+            st.warning(f"⚠️ {_a}")
+    else:
+        st.caption("Aucune référence renseignée pour l'instant.")
 
     genre_vc = st.selectbox("Genre (pour les standards)", ["H", "F"], key="genre_vc")
 
@@ -6346,6 +6788,11 @@ with main_tabs[1]:
         c3.metric("D' (réserve anaérobie)", f"{round(d_prime)} m" if d_prime else "—")
         c4.metric("R² (qualité modèle)", f"{r2_vc:.3f}" if r2_vc is not None else "—")
 
+        st.caption("Calculée sur " + ", ".join(
+            f"{_r['distance']:.0f} m en {seconds_to_hms(_r['temps'])} ({pace_str(_r['temps']/(_r['distance']/1000.0))}/km)"
+            for _r in refs_fit_vc) + ".")
+        for _a in check_vc_fit(vc_ms, d_prime, r2_vc, refs_fit_vc):
+            st.error(f"🚨 {_a}")
         if r2_vc is not None and r2_vc < 0.90:
             st.warning("⚠️ R² faible — vérifier la cohérence des références ou exclure des outliers.")
 
@@ -6534,10 +6981,14 @@ with main_tabs[1]:
                                       float((_ath_met or {}).get("mass_kg") or 70.0), 0.5, key="met_mass")
             _vc_met_kmh = _mc2.number_input("Vitesse critique (km/h)", 5.0, 25.0,
                                             float((_vc_last or 3.9) * 3.6), 0.05, key="met_vc")
-            _gut_cap = _mc3.number_input("Tolérance intestinale (g glucides/h)", 30.0, 140.0,
-                                         float((_ath_met or {}).get("gut_cap_g_h") or 90.0), 5.0, key="met_gut",
-                                         help="60 g/h avec un seul type de glucide, 90-120 g/h avec un mélange "
-                                              "glucose+fructose chez un athlète entraîné à s'alimenter.")
+            _duree_cible_h = _mc3.number_input("Durée de la course visée (h)", 0.25, 30.0,
+                                               float((_ath_met or {}).get("duree_cible_h") or 3.0), 0.25,
+                                               key="met_duree",
+                                               help="Sert à calculer ce qu'il FAUT consommer par heure pour "
+                                                    "tenir cette durée — pas ce que tu tolères.")
+            # le plafond d'absorption n'est plus une saisie : c'est une contrainte
+            # physiologique connue, que l'app applique et explique.
+            _gut_cap = CHO_ABSORPTION_CEILINGS[-1][0]
             _win_frac = _mc4.slider("Fenêtre d'analyse (fin de palier)", 0.3, 1.0, 0.5, 0.05, key="met_win",
                                     help="Portion finale de chaque palier utilisée pour les moyennes : la plus "
                                          "proche de l'état stable.")
@@ -6620,7 +7071,7 @@ with main_tabs[1]:
                     _ec2.caption("L'app cale l'économie pour que le RER des paliers faciles retombe sur ~0,82, "
                                  "valeur attendue à basse intensité. C'est ce qui remplace la mesure d'O₂ : on "
                                  "ancre le modèle là où l'on sait ce que le RER doit valoir.")
-            if history_ready() and st.button("📌 Mémoriser masse et tolérance dans le profil de l'athlète",
+            if history_ready() and st.button("📌 Mémoriser la masse dans le profil de l'athlète",
                                              key="met_save_profile"):
                 set_athlete_profile(current_athlete_id(), current_user()["id"], _mass, _gut_cap)
                 st.success("Profil de l'athlète mis à jour.")
@@ -6712,11 +7163,24 @@ with main_tabs[1]:
                     st.caption(_thr.get("message", "Seuils non identifiables sur ce test."))
 
                 # ── 2. dépense énergétique ───────────────────────────────
-                st.markdown("##### 🔥 Dépense énergétique et économie")
+                st.markdown("##### 🔥 Dépense énergétique et coût de course")
                 st.pyplot(plot_energy(_stages_met, _vc_met_kmh / 3.6)); plt.close("all")
                 _fig_eco = plot_economy(_stages_met, _mass)
                 if _fig_eco is not None:
                     st.pyplot(_fig_eco); plt.close("all")
+                _cout = _infos_met.get("cout") or {}
+                if _cout.get("cout_base_kcal_kg_km"):
+                    st.caption(
+                        f"Coût de référence calé sur {_cout['cout_cale_sur']} paliers "
+                        + (f"sous {_cout['cout_limite_kmh']:.1f} km/h (VT2) " if _cout.get("cout_limite_kmh") else "")
+                        + f": **{_cout['cout_base_kcal_kg_km']:.3f} kcal/kg/km** hors résistance de l'air, à quoi "
+                          f"s'ajoute la résistance de l'air (∝ vitesse²). C'est pour cela que le coût total monte "
+                          f"très légèrement avec la vitesse au lieu de descendre.")
+                if _cout.get("anaerobie_msg"):
+                    st.markdown(f'<div class="note-box note-red">{_cout["anaerobie_msg"]}</div>',
+                                unsafe_allow_html=True)
+                if _infos_met.get("alerte_rer_tendance"):
+                    st.warning(f"⚠️ {_infos_met['alerte_rer_tendance']}")
 
                 # ── 3. substrats ─────────────────────────────────────────
                 st.markdown("##### ⚗️ Oxydation des substrats")
@@ -6780,9 +7244,11 @@ with main_tabs[1]:
                                "abaisse la confiance.")
 
                 # ── 4. plan nutritionnel ─────────────────────────────────
-                st.markdown("##### 🥤 Plan nutritionnel par zone")
+                st.markdown(f"##### 🥤 Plan nutritionnel par zone — pour un effort de "
+                            f"{seconds_to_hms(_duree_cible_h*3600)}")
                 _plan_met, _pinfo = fueling_plan(_stages_met, _vc_met_kmh / 3.6,
-                                                 gut_cap_g_h=_gut_cap, mass_kg=_mass)
+                                                 gut_cap_g_h=_gut_cap, mass_kg=_mass,
+                                                 duree_h=_duree_cible_h)
                 if not _plan_met:
                     st.caption(_pinfo.get("error", "Plan indisponible."))
                 else:
@@ -6791,15 +7257,20 @@ with main_tabs[1]:
                         "Allure": (pace_str(r["allure_s_km"]) + "/km") if r.get("allure_s_km") else "—",
                         "Vitesse (km/h)": r["vitesse_kmh"], "Dépense (kcal/h)": r["kcal_h"],
                         "Glucides oxydés (g/h)": f"{r['cho_g_h']}  [{r['cho_g_h_lo']} – {r['cho_g_h_hi']}]",
-                        "Apport conseillé (g/h)": r["apport_g_h"], "Déficit horaire (g/h)": r["deficit_g_h"],
-                        "Autonomie glycogène": f"{r['autonomie_h']} h" if r.get("autonomie_h") else "≥ 24 h",
+                        "À consommer (g/h)": r["apport_g_h"],
+                        "Déficit restant (g/h)": r["deficit_g_h"],
+                        "Autonomie sans manger": (seconds_to_hms(r["autonomie_h"] * 3600)
+                                                  if r.get("autonomie_h") else "≥ 24 h"),
                         "Confiance": f"{r['confiance']:.0f} %" + (" (extrapolé)" if r["extrapole"] else ""),
                     } for r in _plan_met]), use_container_width=True, hide_index=True)
                     st.markdown(
                         f'<div class="note-box">Réserves glycogéniques estimées : <b>{_pinfo["stores_g"]} g</b> '
-                        f'({GLYCOGEN_G_PER_KG:.0f} g/kg) — ordre de grandeur, pas une mesure. L\'apport est '
-                        f'plafonné à <b>{_gut_cap:.0f} g/h</b> : au-delà, ce n\'est plus le métabolisme qui '
-                        f'limite mais l\'absorption. La colonne dépense (kcal/h) est la plus fiable de ce '
+                        f'({GLYCOGEN_G_PER_KG:.0f} g/kg), dont <b>{_pinfo["reserve_utile_g"]} g</b> réellement '
+                        f'mobilisables — ordre de grandeur, pas une mesure. La colonne « à consommer » est '
+                        f'ce qu\'il faut avaler par heure pour couvrir le déficit sur '
+                        f'{seconds_to_hms(_duree_cible_h*3600)}, plafonné à <b>{_gut_cap:.0f} g/h</b> : '
+                        f'au-delà, ce n\'est plus le métabolisme qui limite mais l\'absorption intestinale. '
+                        f'La colonne dépense (kcal/h) est la plus fiable de ce '
                         f'tableau ; les grammes de glucides en héritent de l\'incertitude du VO₂ modélisé.</div>',
                         unsafe_allow_html=True)
 
@@ -6833,20 +7304,73 @@ with main_tabs[1]:
                         _hr_i = (float(np.interp(_pct_target, [s["pct_vc"] for s in _hpts],
                                                  [s["hr"] for s in _hpts])) if len(_hpts) >= 2 else None)
                         _outside = _pct_target < min(_xs_s) - 3 or _pct_target > max(_xs_s) + 3
+                        # dépense TOTALE (aérobie mesurée + part anaérobie modélisée)
+                        _ptot = [s for s in _pts if s.get("kcal_h_total")]
+                        if len(_ptot) >= 2:
+                            _ot = np.argsort([s["pct_vc"] for s in _ptot])
+                            _kcal_tot_i = float(np.interp(
+                                _pct_target, np.array([_ptot[i]["pct_vc"] for i in _ot], dtype=float),
+                                np.array([_ptot[i]["kcal_h_total"] for i in _ot], dtype=float)))
+                        else:
+                            _kcal_tot_i = _kcal_i
                         with _ec2b:
                             kpi_row([
                                 ("Intensité", f"{_pct_target:.0f} % VC", f"{_v_target:.2f} km/h"),
-                                ("Dépense", f"{_kcal_i:.0f} kcal/h",
-                                 f"≈ {_kcal_i/max(0.1,_v_target):.0f} kcal/km · confiance {_conf_i:.0f} %"),
+                                ("Dépense totale", f"{_kcal_tot_i:.0f} kcal/h",
+                                 f"≈ {_kcal_tot_i/max(0.1,_v_target):.0f} kcal/km · "
+                                 f"dont {_kcal_i:.0f} kcal/h vus par le masque"),
                                 ("Glucides oxydés",
                                  f"{_cho_i*60:.0f} g/h" if _cho_i is not None else "—",
-                                 (f"apport conseillé {min(_gut_cap, _cho_i*60):.0f} g/h"
-                                  + (" — valeur invraisemblable, vérifie les vitesses"
-                                     if _cho_i * 60 > 300 else "")
-                                  ) if _cho_i is not None else "partition indisponible"),
+                                 (("valeur invraisemblable, vérifie les vitesses"
+                                   if _cho_i * 60 > 300 else f"confiance {_conf_i:.0f} %")
+                                  if _cho_i is not None else "partition indisponible")),
                                 ("FC attendue", f"{_hr_i:.0f} bpm" if _hr_i else "—",
                                  "extrapolé hors plage testée" if _outside else "dans la plage testée"),
                             ])
+
+                        # ── v9.5 : combien FAUT-IL consommer à cette allure ? ──
+                        if _cho_i is not None and _cho_i * 60 <= 300:
+                            _req = fueling_requirement(_cho_i * 60.0, _duree_cible_h, _mass)
+                            if _req:
+                                st.markdown(f"##### 🥤 Ce qu'il faut consommer pour tenir "
+                                            f"{seconds_to_hms(_duree_cible_h*3600)} à {_target_pace}/km")
+                                kpi_row([
+                                    ("Besoin total", f"{_req['besoin_total_g']} g de glucides",
+                                     f"{_req['cho_g_h']:.0f} g/h oxydés pendant {_req['duree_h']:.2f} h"),
+                                    ("Réserves utilisables", f"{_req['reserve_utile_g']} g",
+                                     f"sur {_req['reserve_g']} g stockés · autonomie sans manger "
+                                     f"{seconds_to_hms(_req['autonomie_sans_apport_h']*3600)}"),
+                                    ("À consommer", f"{_req['conseil_g_h']} g/h",
+                                     (f"strictement nécessaire : {_req['apport_requis_g_h']} g/h"
+                                      if _req['apport_requis_g_h'] > 0 else
+                                      ("les réserves couvriraient l'effort : ce chiffre vient des repères "
+                                       "de la littérature, il protège la fin de course"
+                                       if _req['conseil_g_h'] > 0 else
+                                       "les réserves couvrent l'effort, boire suffit"))),
+                                    ("Stratégie",
+                                     _req["strategie"] or "hors de portée",
+                                     _req["strategie_detail"] or
+                                     f"plafond d'absorption {_req['plafond_max_g_h']:.0f} g/h dépassé"),
+                                ])
+                                if not _req["faisable"]:
+                                    st.error(
+                                        f"🚨 Cette allure n'est pas tenable {_req['duree_h']:.1f} h : il faudrait "
+                                        f"absorber {_req['apport_requis_g_h']} g/h, au-delà de ce que l'intestin "
+                                        f"humain sait faire ({_req['plafond_max_g_h']:.0f} g/h maximum). Même en "
+                                        f"mangeant au plafond, les réserves lâchent vers "
+                                        f"{seconds_to_hms((_req['duree_max_h'] or 0)*3600)}. Soit tu ralentis, "
+                                        f"soit tu vises une durée plus courte.")
+                                st.caption(
+                                    f"Repère de la littérature — {_req['repere_msg']}. "
+                                    f"L'app retient le plus exigeant des deux : le besoin calculé sur TON "
+                                    f"oxydation ({_req['apport_requis_g_h']} g/h) et ce repère "
+                                    f"({_req['repere_lo']:.0f}-{_req['repere_hi']:.0f} g/h). "
+                                    f"Réserves estimées à {GLYCOGEN_G_PER_KG:.0f} g/kg dont "
+                                    f"{GLYCOGEN_USABLE_FRAC*100:.0f} % réellement mobilisables : c'est un ordre "
+                                    f"de grandeur, pas une mesure — et il suppose un départ glycogène plein.")
+                        elif _cho_i is None:
+                            st.caption("Le calcul de l'apport nécessite la partition glucides/lipides, "
+                                       "indisponible sur ce fichier.")
                 else:
                     st.caption("Format attendu : mm:ss (ex. 5:30).")
 
