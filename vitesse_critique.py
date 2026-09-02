@@ -954,8 +954,9 @@ def parse_fit_ref(file, tz_name=TZ_NAME_DEFAULT):
         dist_max = sum(haversine_m(records[i-1][0], records[i-1][1], records[i][0], records[i][1])
                        for i in range(1, len(records)))
 
-    return {"points": [{"lat": r[0], "lon": r[1], "elev": r[2], "dist": r[3], "time": t}
-                       for r, t in zip(records, times_pts)],
+    _hrp = list(hr_records) + [None] * max(0, len(records) - len(hr_records))
+    return {"points": [{"lat": r[0], "lon": r[1], "elev": r[2], "dist": r[3], "time": t, "hr": h}
+                       for r, t, h in zip(records, times_pts, _hrp)],
             "laps": fit_laps(raw_bytes),
             "distance": dist_max, "D_up": dup, "D_down": ddn,
             "duration_hms": seconds_to_hms((end_dt - start_dt).total_seconds()),
@@ -3518,102 +3519,433 @@ def _piecewise_breakpoint(x, y):
             "r2_2seg": round(r2_2seg, 3), "r2_1seg": round(float(r_single ** 2), 3),
             "gain_r2": round(r2_2seg - float(r_single ** 2), 3)}
 
+def _drop_startup_stage(stages, key):
+    """Écarte le tout premier palier quand c'est une mise en route : au démarrage,
+    la ventilation et le CO₂ expiré n'ont pas encore rattrapé l'effort, si bien que
+    ce palier tombe très en dessous de la droite VE/intensité. Laissé en place, il
+    casse toutes les ruptures de pente — donc les deux seuils."""
+    if len(stages) < 6:
+        return stages, None
+    p_first = min(s["palier"] for s in stages)
+    cand = next((s for s in stages if s["palier"] == p_first), None)
+    others = [s for s in stages if s["palier"] != p_first]
+    if cand is None or len(others) < 5:
+        return stages, None
+    try:
+        x = np.array([s[key] for s in others], dtype=float)
+        y = np.array([s["ve_lmin"] for s in others], dtype=float)
+        sl, ic, _, _, _ = sp_stats.linregress(x, y)
+        pred = sl * float(cand[key]) + ic
+        resid = (float(cand["ve_lmin"]) - pred) / max(1e-6, pred)
+    except Exception:
+        return stages, None
+    if resid < -0.12:
+        return others, {"palier": cand["palier"], "ecart_pct": round(resid * 100.0, 1)}
+    return stages, None
+
+def _bp_slope_up(x, y, min_ratio=1.20):
+    """Rupture de pente RETENUE seulement si la pente AUGMENTE : c'est la signature
+    d'un seuil ventilatoire (la ventilation, ou le CO₂, se met à croître plus vite
+    que l'intensité). Une pente qui s'affaisse signale autre chose — un plafond de
+    VO₂max ou un capteur qui sature — et ne doit surtout pas être lue comme un seuil."""
+    bp = _piecewise_breakpoint(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+    if not bp:
+        return None
+    sb, sa = bp.get("slope_before"), bp.get("slope_after")
+    if sb is None or sa is None or sb <= 0:
+        return None
+    if sa < sb * float(min_ratio):
+        return None
+    bp["ratio"] = sa / sb
+    return bp
+
 def detect_thresholds_co2(stages, vc_ms=None):
-    """Seuils ventilatoires SANS oxygène :
-      • VT2 (point de compensation respiratoire) = nadir de VE/VCO₂, puis remontée ;
-      • VT1 = rupture de pente de VCO₂ en fonction de l'intensité.
-    L'axe d'intensité est la vitesse si elle est connue, sinon la FC, sinon le
-    numéro de palier : les seuils restent situables même sans tapis instrumenté."""
+    """Seuils ventilatoires avec un masque CO₂, chacun lu sur le signal qui le porte :
+
+      • VT1 (seuil aérobie) se lit sur la VENTILATION : c'est la première rupture de
+        pente de VE en fonction de l'intensité, quand la ventilation se met à croître
+        plus vite que la vitesse. Deux marqueurs corroborants ne demandent pas non plus
+        d'oxygène : la rupture du VCO₂ (analogue de la V-slope) et la fin de la montée
+        du CO₂ expiré (FeCO₂).
+      • VT2 (compensation respiratoire) se lit sur le CO₂ : la ventilation décroche du
+        VCO₂ qu'elle évacuait proportionnellement jusque-là. Marqueur principal, la
+        rupture de pente de VE en fonction de VCO₂ ; corroborants, le nadir de VE/VCO₂
+        et la chute du CO₂ expiré.
+
+    Quand le test démarre trop haut pour contenir VT1 — cas fréquent d'une rampe qui
+    commence à allure déjà soutenue — un VT1 ESTIMÉ est fourni à partir de VT2 et de la
+    vitesse critique, explicitement étiqueté comme tel, pour que le modèle de
+    performance ait tout de même une entrée."""
     st_ = [s for s in stages if s.get("vco2_lmin") and s.get("ve_lmin")]
     _key = ("vitesse_kmh" if all(s.get("vitesse_kmh") for s in st_) else
             ("hr" if all(s.get("hr") for s in st_) else "palier"))
     _unit = {"vitesse_kmh": "km/h", "hr": "bpm", "palier": "n° de palier"}[_key]
-    st_ = sorted(st_, key=lambda s: s[_key])
     out = {"vt1": None, "vt2": None, "n_paliers": len(st_), "axe": _key, "axe_unite": _unit}
     if len(st_) < 5:
         out["message"] = "Il faut au moins 5 paliers exploitables pour situer les seuils."
         return out
+    st_, _dropped = _drop_startup_stage(sorted(st_, key=lambda s: s["palier"]), _key)
+    if _dropped:
+        out["palier_mise_en_route"] = _dropped
+    st_ = sorted(st_, key=lambda s: s[_key])
     v = np.array([s[_key] for s in st_], dtype=float)
     ve = np.array([s["ve_lmin"] for s in st_], dtype=float)
     vco2 = np.array([s["vco2_lmin"] for s in st_], dtype=float)
     eqco2 = ve / np.maximum(1e-6, vco2)
-    # ── VT2 : minimum de VE/VCO₂ (le nadir), suivi d'une remontée franche ──
-    i_min = int(np.argmin(eqco2))
-    if 0 < i_min < len(v) - 1:
-        rise = float(eqco2[-1] - eqco2[i_min])
-        out["vt2"] = {"x": round(float(v[i_min]), 2), "axe": _key,
-                      "vitesse_kmh": (round(float(v[i_min]), 2) if _key == "vitesse_kmh"
-                                      else st_[i_min].get("vitesse_kmh")),
-                      "eqco2_nadir": round(float(eqco2[i_min]), 2),
-                      "remontee": round(rise, 2), "palier": st_[i_min]["palier"],
-                      "hr": st_[i_min].get("hr"),
-                      "pct_vc": (round(float(v[i_min]) / 3.6 / vc_ms * 100.0, 1)
-                                 if (vc_ms and _key == "vitesse_kmh") else None),
-                      "fiable": bool(rise >= 1.5 and i_min >= 2)}
-    # ── confirmation indépendante de VT2 : après le point de compensation, le CO₂
-    # expiré CHUTE (l'hyperventilation « lave » le CO₂). Deux marqueurs concordants
-    # valent mieux qu'un seul.
-    _fe_all = [s.get("feco2") for s in st_]
-    if all(f is not None for f in _fe_all) and len(_fe_all) >= 5 and out.get("vt2"):
-        _fe_arr = pd.Series(_fe_all, dtype=float).rolling(3, center=True, min_periods=1).mean().values
-        _i_peak = int(np.argmax(_fe_arr))
-        _chute = float(_fe_arr[_i_peak] - _fe_arr[-1]) / max(1e-6, _fe_arr[_i_peak]) * 100.0
-        if _i_peak < len(_fe_arr) - 1 and _chute >= 3.0:
-            _x_peak = float(v[_i_peak])
-            _ecart = abs(_x_peak - out["vt2"]["x"])
-            _pas = float(np.median(np.diff(v))) if len(v) > 2 else 1.0
-            out["vt2"]["confirmation_feco2"] = {"x": round(_x_peak, 2), "chute_pct": round(_chute, 1),
-                                                "concordant": bool(_ecart <= 1.5 * abs(_pas) + 1e-6)}
-            if out["vt2"]["confirmation_feco2"]["concordant"]:
-                out["vt2"]["fiable"] = True
-
-    # ── VT1 : le CO₂ EXPIRÉ (FeCO₂ ≈ PetCO₂) monte jusqu'à VT1 puis fait un plateau,
-    # avant de chuter après VT2. La fin de la montée est donc un marqueur de VT1 qui ne
-    # demande, lui non plus, aucun oxygène. On y recourt en priorité, et l'on retombe sur
-    # la rupture de pente du VCO₂ si le CO₂ expiré n'est pas dans le fichier.
     _fe = [s.get("feco2") for s in st_]
-    bp = None
-    _source_vt1 = None
-    if all(f is not None for f in _fe) and len(_fe) >= 6:
-        _bpf = _piecewise_breakpoint(v, np.array(_fe, dtype=float))
-        # plateau/chute après le point de rupture : la pente doit nettement s'affaisser
-        if _bpf and _bpf["slope_before"] > 0 and _bpf["slope_after"] < _bpf["slope_before"] * 0.4:
-            bp = {"x_break": _bpf["x_break"], "slope_before": _bpf["slope_after"],
-                  "slope_after": _bpf["slope_before"], "gain_r2": _bpf["gain_r2"], "r2_2seg": _bpf["r2_2seg"]}
-            _source_vt1 = "plateau du CO₂ expiré (FeCO₂)"
-    if bp is None:
-        bp = _piecewise_breakpoint(v, vco2)
-        _source_vt1 = "rupture de pente du VCO₂"
-    if bp and bp["slope_after"] > bp["slope_before"] * 1.05:
-        i_bp = int(np.argmin(np.abs(v - bp["x_break"])))
-        _vt2_v = (out.get("vt2") or {}).get("x")
-        # garde-fou : un VT1 situé au-dessus du VT2 n'a pas de sens physiologique
-        _coherent = (_vt2_v is None) or (bp["x_break"] < _vt2_v - 0.05)
-        out["vt1"] = {"x": round(bp["x_break"], 2), "axe": _key,
-                      "vitesse_kmh": (round(bp["x_break"], 2) if _key == "vitesse_kmh"
-                                      else st_[i_bp].get("vitesse_kmh")),
-                      "palier": st_[i_bp]["palier"], "hr": st_[i_bp].get("hr"),
-                      "pct_vc": (round(bp["x_break"] / 3.6 / vc_ms * 100.0, 1)
-                                 if (vc_ms and _key == "vitesse_kmh") else None),
-                      "gain_r2": bp["gain_r2"], "r2": bp["r2_2seg"], "coherent_vs_vt2": bool(_coherent),
-                      "methode": _source_vt1,
-                      "fiable": bool(bp["gain_r2"] >= 0.02 and bp["r2_2seg"] >= 0.95 and _coherent)}
-        out["vt1_note"] = (f"VT1 obtenu par {_source_vt1}. Sans oxygène, la méthode de référence (V-slope, "
-                           "qui compare VCO₂ et VO₂) est inapplicable : ce repère est indicatif, contrairement "
-                           "à VT2 que le nadir de VE/VCO₂ situe directement.")
-    if out.get("vt1") is None or not (out.get("vt1") or {}).get("fiable"):
+    _has_fe = all(f is not None for f in _fe) and len(_fe) >= 5
+    _pas = float(np.median(np.diff(v))) if len(v) > 2 else 1.0
+    _tol = 1.5 * abs(_pas) + 1e-6
+
+    def _fiche(x_val, extra=None):
+        i = int(np.argmin(np.abs(v - float(x_val))))
+        d = {"x": round(float(x_val), 2), "axe": _key,
+             "vitesse_kmh": (round(float(x_val), 2) if _key == "vitesse_kmh"
+                             else st_[i].get("vitesse_kmh")),
+             "palier": st_[i]["palier"], "hr": st_[i].get("hr"),
+             "pct_vc": (round(float(x_val) / 3.6 / vc_ms * 100.0, 1)
+                        if (vc_ms and _key == "vitesse_kmh") else None)}
+        d.update(extra or {})
+        return d
+
+    # ══ VT2 — signal CO₂ ═════════════════════════════════════════════════
+    marq2 = []
+    # marqueur principal : VE décroche de VCO₂ (perte du tamponnement isocapnique)
+    bp2 = _bp_slope_up(vco2, ve, 1.25)
+    x_bp2 = None
+    if bp2 and bp2["r2_2seg"] >= 0.90:
+        j = int(np.argmin(np.abs(vco2 - bp2["x_break"])))
+        x_bp2 = float(v[j])
+        marq2.append({"nom": "rupture de VE en fonction de VCO₂", "x": round(x_bp2, 2),
+                      "detail": f"pente ×{bp2['ratio']:.2f} (R² {bp2['r2_2seg']:.3f})"})
+    # corroborant : nadir de VE/VCO₂ puis remontée
+    i_min = int(np.argmin(eqco2))
+    x_nadir = None
+    if 0 < i_min < len(v) - 1 and float(eqco2[-1] - eqco2[i_min]) >= 1.0:
+        x_nadir = float(v[i_min])
+        marq2.append({"nom": "nadir de VE/VCO₂", "x": round(x_nadir, 2),
+                      "detail": f"minimum {eqco2[i_min]:.1f}, remontée +{eqco2[-1]-eqco2[i_min]:.1f}"})
+    # corroborant : chute du CO₂ expiré après la compensation
+    x_fe2 = None
+    if _has_fe:
+        _fa = pd.Series(_fe, dtype=float).rolling(3, center=True, min_periods=1).mean().values
+        i_pk = int(np.argmax(_fa))
+        chute = float(_fa[i_pk] - _fa[-1]) / max(1e-6, _fa[i_pk]) * 100.0
+        if i_pk < len(_fa) - 1 and chute >= 3.0:
+            x_fe2 = float(v[i_pk])
+            marq2.append({"nom": "chute du CO₂ expiré (FeCO₂)", "x": round(x_fe2, 2),
+                          "detail": f"−{chute:.0f} % après ce point"})
+    x_vt2 = x_bp2 if x_bp2 is not None else x_nadir
+    if x_vt2 is not None:
+        concord = [m for m in marq2 if abs(m["x"] - x_vt2) <= _tol]
+        out["vt2"] = _fiche(x_vt2, {
+            "source": "mesuré", "marqueurs": marq2, "n_concordants": len(concord),
+            "methode": (marq2[0]["nom"] if marq2 else "nadir de VE/VCO₂"),
+            "eqco2_nadir": round(float(eqco2[i_min]), 2),
+            "remontee": round(float(eqco2[-1] - eqco2[i_min]), 2),
+            "fiable": bool(len(concord) >= 2 or (bp2 is not None and bp2["r2_2seg"] >= 0.95))})
+
+    # ══ VT1 — signal VENTILATION ════════════════════════════════════════
+    marq1 = []
+    _v2 = (out.get("vt2") or {}).get("x")
+    # VT1 se cherche STRICTEMENT sous VT2 : sur la plage entière, la rupture
+    # dominante est celle de la compensation respiratoire, et l'ajustement
+    # renverrait VT2 une seconde fois au lieu du premier seuil.
+    _sel = np.ones(len(v), dtype=bool) if _v2 is None else (v <= _v2 - 0.5 * abs(_pas))
+    if _sel.sum() >= 6:
+        v1, ve1, vc1 = v[_sel], ve[_sel], vco2[_sel]
+        fe1 = np.array(_fe, dtype=float)[_sel] if _has_fe else None
+        bp1 = _bp_slope_up(v1, ve1, 1.25)     # LA méthode : rupture de VE vs intensité
+        if bp1 and bp1["r2_2seg"] >= 0.92:
+            marq1.append({"nom": "rupture de pente de la ventilation (VE)", "x": round(bp1["x_break"], 2),
+                          "detail": f"pente ×{bp1['ratio']:.2f} (R² {bp1['r2_2seg']:.3f})", "poids": 3})
+        bp1b = _bp_slope_up(v1, vc1, 1.12)    # analogue de la V-slope, sans O₂
+        if bp1b and bp1b["r2_2seg"] >= 0.92:
+            marq1.append({"nom": "rupture de pente du VCO₂ (analogue V-slope)",
+                          "x": round(bp1b["x_break"], 2),
+                          "detail": f"pente ×{bp1b['ratio']:.2f} (R² {bp1b['r2_2seg']:.3f})", "poids": 2})
+        if fe1 is not None and len(fe1) >= 6:  # fin de la montée du CO₂ expiré
+            _bpf = _piecewise_breakpoint(v1, fe1)
+            if _bpf and _bpf["slope_before"] > 0 and _bpf["slope_after"] < _bpf["slope_before"] * 0.4:
+                marq1.append({"nom": "plateau du CO₂ expiré (FeCO₂)", "x": round(_bpf["x_break"], 2),
+                              "detail": "fin de la montée du FeCO₂", "poids": 1})
+    if marq1:
+        # on s'ancre sur le marqueur le plus fort (la ventilation), et l'on ne
+        # moyenne qu'avec ceux qui tombent au même endroit : un marqueur isolé
+        # loin des autres n'a pas à déplacer le seuil.
+        _anchor = max(marq1, key=lambda m: m["poids"])
+        concord1 = [m for m in marq1 if abs(m["x"] - _anchor["x"]) <= _tol]
+        _poids = float(sum(m["poids"] for m in concord1))
+        x_vt1 = float(sum(m["x"] * m["poids"] for m in concord1) / _poids)
+        out["vt1"] = _fiche(x_vt1, {
+            "source": "mesuré", "marqueurs": marq1, "n_concordants": len(concord1),
+            "methode": marq1[0]["nom"],
+            "fiable": bool(any(m["poids"] == 3 for m in marq1) and len(concord1) >= 2)})
+        out["vt1_note"] = (
+            "VT1 est lu sur la ventilation : la première rupture de pente de VE en fonction de "
+            "l'intensité. C'est la méthode de référence quand l'oxygène n'est pas mesuré — le V-slope "
+            "classique (VCO₂ contre VO₂) est inapplicable ici, mais la rupture du VCO₂ en fonction de "
+            "l'intensité en est l'analogue direct et sert de corroboration.")
+
+    # ══ VT1 estimé quand le test ne le contient pas ═════════════════════
+    if out.get("vt1") is None and _v2 and _key == "vitesse_kmh":
+        est, plages, bases = [], [], []
+        est.append(0.84 * float(_v2)); plages.append((0.75 * float(_v2), 0.92 * float(_v2)))
+        bases.append("VT2 mesuré")
+        if vc_ms:
+            _cs = float(vc_ms) * 3.6
+            est.append(0.80 * _cs); plages.append((0.74 * _cs, 0.86 * _cs))
+            bases.append("vitesse critique")
+        x_est = float(np.mean(est))
+        lo = float(np.mean([p[0] for p in plages])); hi = float(np.mean([p[1] for p in plages]))
+        hr_est = None
+        _hp = [(s[_key], s["hr"]) for s in st_ if s.get("hr")]
+        if len(_hp) >= 3:                     # FC au VT1 estimé, via la droite FC/vitesse du test
+            _sl, _ic, _, _, _ = sp_stats.linregress([a for a, _ in _hp], [b for _, b in _hp])
+            hr_est = int(round(_sl * x_est + _ic))
+        out["vt1"] = {"x": round(x_est, 2), "axe": _key, "vitesse_kmh": round(x_est, 2),
+                      "palier": None, "hr": hr_est, "source": "estimé",
+                      "plage": [round(lo, 2), round(hi, 2)],
+                      "pct_vc": (round(x_est / 3.6 / vc_ms * 100.0, 1) if vc_ms else None),
+                      "pct_vt2": round(x_est / float(_v2) * 100.0, 1),
+                      "methode": "estimation à partir de " + " et de la ".join(bases),
+                      "fiable": False, "marqueurs": []}
+        out["vt1_estime_note"] = (
+            f"VT1 n'est pas dans ce test : il est ESTIMÉ à {x_est:.1f} {_unit} "
+            f"(plage plausible {lo:.1f}–{hi:.1f}), à partir de "
+            + " et de la ".join(bases) +
+            f". Chez un coureur entraîné, VT1 tombe entre 75 et 92 % de la vitesse à VT2. "
+            f"C'est une estimation de cadrage, utilisable pour poser des zones, pas une mesure — "
+            f"pour la mesurer, refais un test en démarrant 2 à 3 paliers plus bas.")
+
+    # ══ cohérence VT2 / vitesse critique ════════════════════════════════
+    # Chez le même athlète, VT2 et vitesse critique désignent presque le même
+    # point : la plus haute intensité soutenable en état stable. Un écart franc
+    # veut dire que l'un des deux tests ne mesure pas ce qu'on croit.
+    if out.get("vt2") and vc_ms and _key == "vitesse_kmh":
+        _r = float(out["vt2"]["x"]) / (float(vc_ms) * 3.6) * 100.0
+        out["vt2"]["pct_vc"] = round(_r, 1)
+        if _r < 88.0:
+            out["vt2_vs_vc"] = (
+                f"VT2 tombe à {_r:.0f} % de la vitesse critique, alors que les deux coïncident "
+                f"habituellement (95-105 %). Soit la VC est surestimée — un test court très réussi "
+                f"la tire vers le haut —, soit le test au masque a été arrêté avant la vraie "
+                f"compensation respiratoire, soit il a été couru sur tapis alors que la VC vient de "
+                f"la route. À trancher avant de poser des zones sur l'un ou sur l'autre.")
+        elif _r > 112.0:
+            out["vt2_vs_vc"] = (
+                f"VT2 ressort à {_r:.0f} % de la vitesse critique, nettement au-dessus de l'attendu "
+                f"(95-105 %). La VC est probablement sous-estimée : vérifie que les deux références "
+                f"utilisées étaient bien des efforts maximaux.")
+
+    if out.get("vt1") is None or (out.get("vt1") or {}).get("source") == "estimé":
         _vt2x = (out.get("vt2") or {}).get("x")
         if _vt2x and float(v[0]) >= 0.72 * float(_vt2x):
             out["vt1_message"] = (
-                f"VT1 non identifiable : le test démarre déjà à {v[0]:.1f} {_unit}, soit "
-                f"{float(v[0])/float(_vt2x)*100:.0f} % de l'intensité de VT2. Le premier seuil est "
-                f"vraisemblablement SOUS la plage testée — pour le capter, il faudrait commencer le "
-                f"protocole nettement plus bas (2 à 3 paliers très faciles).")
-        else:
-            out["vt1_message"] = ("VT1 non identifiable : aucune rupture nette dans le CO₂ produit ni dans le "
-                                  "CO₂ expiré. Des paliers plus longs (3-5 min) rendraient ce signal plus lisible.")
+                f"VT1 non mesurable : le test démarre déjà à {v[0]:.1f} {_unit}, soit "
+                f"{float(v[0])/float(_vt2x)*100:.0f} % de l'intensité de VT2, et la ventilation y est "
+                f"déjà à {ve[0]:.0f} L/min. Le premier seuil est SOUS la plage testée — pour le capter, "
+                f"il faut démarrer le protocole nettement plus bas (2 à 3 paliers très faciles, "
+                f"ventilation de départ autour de 35-45 L/min).")
+        elif not out.get("vt1"):
+            if _key != "vitesse_kmh":
+                out["vt1_message"] = (
+                    "VT1 non identifiable : aucune rupture nette dans la ventilation, et sans vitesse "
+                    "par palier l'app ne peut pas non plus l'estimer à partir de VT2. Renseigne les "
+                    "vitesses (section « Vitesse de chaque palier ») pour débloquer l'estimation.")
+            else:
+                out["vt1_message"] = ("VT1 non identifiable : aucune rupture nette dans la ventilation ni dans "
+                                      "le CO₂. Des paliers plus longs (3-5 min) rendraient ce signal lisible.")
     out["eqco2_curve"] = [{"x": round(float(a), 2), "eqco2": round(float(b), 2)}
                           for a, b in zip(v, eqco2)]
+    return out
+
+# ── v9.6 : situer les seuils les uns par rapport aux autres ───────────────
+# La hiérarchie physiologique est bien établie et vaut contrôle croisé :
+#   VT1  <  MLSS  ≤  VT2/RCP  ≈  vitesse critique
+# MLSS (le plus haut palier où le lactate se stabilise encore) tombe quelques
+# pour cent SOUS la vitesse critique ; VT2 et la vitesse critique, eux, sont le
+# plus souvent indiscernables. Un VT2 mesuré loin sous la VC ne s'explique donc
+# pas par « c'est en fait le MLSS » : l'écart serait de 4 à 10 %, pas davantage.
+MLSS_FRAC_CS = (0.90, 0.96)        # MLSS ≈ 90-96 % de la vitesse critique
+RCP_FRAC_CS = (0.95, 1.05)         # VT2/RCP ≈ vitesse critique
+
+def hierarchie_seuils(thresholds, vc_ms, refs=None):
+    """Place VT1, MLSS estimé, VT2 et la vitesse critique sur la même échelle,
+    et dit lequel sort de l'ordre attendu. Retourne (lignes, diagnostics)."""
+    if not vc_ms:
+        return [], []
+    cs = float(vc_ms) * 3.6
+    t1 = (thresholds or {}).get("vt1") or {}
+    t2 = (thresholds or {}).get("vt2") or {}
+    v1, v2 = t1.get("vitesse_kmh"), t2.get("vitesse_kmh")
+    mlss_lo, mlss_hi = cs * MLSS_FRAC_CS[0], cs * MLSS_FRAC_CS[1]
+    rows = []
+    if v1:
+        rows.append({"repere": "VT1 — seuil aérobie", "v": float(v1),
+                     "source": t1.get("source") or "mesuré",
+                     "attendu": "≈ 75-92 % de VT2"})
+    rows.append({"repere": "MLSS — dernier état stable du lactate",
+                 "v": (mlss_lo + mlss_hi) / 2.0, "source": "estimé depuis la VC",
+                 "attendu": f"{MLSS_FRAC_CS[0]*100:.0f}-{MLSS_FRAC_CS[1]*100:.0f} % de la VC "
+                            f"({mlss_lo:.1f}-{mlss_hi:.1f} km/h)"})
+    if v2:
+        rows.append({"repere": "VT2 — compensation respiratoire", "v": float(v2),
+                     "source": t2.get("source") or "mesuré",
+                     "attendu": f"{RCP_FRAC_CS[0]*100:.0f}-{RCP_FRAC_CS[1]*100:.0f} % de la VC"})
+    rows.append({"repere": "Vitesse critique", "v": cs, "source": "tests de terrain",
+                 "attendu": "asymptote de la relation distance-temps"})
+    for r in (refs or []):
+        if r.get("distance", 0) > 0 and r.get("temps", 0) > 0:
+            rows.append({"repere": f"Référence {r['distance']/1000:.1f} km",
+                         "v": r["distance"] / r["temps"] * 3.6, "source": "course réelle",
+                         "attendu": "—"})
+    rows.sort(key=lambda r: r["v"])
+    for r in rows:
+        r["pct_vc"] = round(r["v"] / cs * 100.0, 1)
+
+    diags = []
+    if v2:
+        pv = float(v2) / cs
+        if pv < RCP_FRAC_CS[0] - 0.02:
+            manque = (mlss_lo - float(v2)) / max(1e-6, float(v2)) * 100.0
+            diags.append(
+                f"VT2 ressort à {pv*100:.0f} % de la vitesse critique. Même en supposant que le masque "
+                f"détecte en réalité le MLSS — l'hypothèse la plus favorable, puisque le MLSS est le plus "
+                f"bas des deux — il devrait tomber vers {mlss_lo:.1f}-{mlss_hi:.1f} km/h. Il manque encore "
+                f"{manque:.0f} % : la différence MLSS/VC n'explique pas l'écart, il faut chercher ailleurs "
+                f"(échelle de vitesse du tapis, test arrêté trop tôt, ou vitesse critique surestimée).")
+        elif pv > RCP_FRAC_CS[1] + 0.02:
+            diags.append(f"VT2 ressort à {pv*100:.0f} % de la vitesse critique, au-dessus de l'attendu : "
+                         f"la vitesse critique est probablement sous-estimée.")
+        else:
+            diags.append(f"VT2 tombe à {pv*100:.0f} % de la vitesse critique — cohérent avec l'attendu "
+                         f"({RCP_FRAC_CS[0]*100:.0f}-{RCP_FRAC_CS[1]*100:.0f} %). Le MLSS, lui, se situe "
+                         f"un cran plus bas, vers {mlss_lo:.1f}-{mlss_hi:.1f} km/h.")
+    return rows, diags
+
+def calage_terrain(stages, refs):
+    """Le test au masque et les courses sur le terrain sont-ils sur la même échelle
+    de vitesse ? On compare à FRÉQUENCE CARDIAQUE ÉGALE : la FC, elle, ne dépend ni
+    de l'étalonnage du tapis ni du vent. Un écart systématique signale que les
+    vitesses du test ne sont pas transposables au terrain — et qu'il faut lire les
+    seuils en FC plutôt qu'en allure."""
+    pts = [(s["vitesse_kmh"], s["hr"]) for s in (stages or [])
+           if s.get("vitesse_kmh") and s.get("hr") and s.get("mode") != "rer_trop_bas"]
+    if len(pts) < 4:
+        return None
+    pts.sort()
+    vs = np.array([a for a, _ in pts], dtype=float)
+    hs = np.array([b for _, b in pts], dtype=float)
+    try:
+        sl, ic, r, _, _ = sp_stats.linregress(hs, vs)      # vitesse au masque = f(FC)
+    except Exception:
+        return None
+    if abs(r) < 0.7:
+        return None
+    comps = []
+    for rf in (refs or []):
+        hr = ((rf.get("hr_analysis") or {}).get("hr_avg"))
+        if not hr or not rf.get("distance") or not rf.get("temps"):
+            continue
+        v_field = rf["distance"] / rf["temps"] * 3.6
+        v_mask = sl * float(hr) + ic
+        if v_mask <= 1.0:
+            continue
+        comps.append({"label": f"{rf['distance']/1000:.1f} km en {seconds_to_hms(rf['temps'])}",
+                      "hr": int(hr), "v_terrain": round(v_field, 2), "v_masque": round(v_mask, 2),
+                      "ecart_kmh": round(v_field - v_mask, 2),
+                      "ecart_pct": round((v_field - v_mask) / v_mask * 100.0, 1),
+                      "extrapole": bool(hr < hs.min() - 3 or hr > hs.max() + 3)})
+    if not comps:
+        return None
+    # une FC hors de la plage réellement testée oblige à extrapoler la droite :
+    # on l'affiche, mais elle ne pèse pas dans l'écart moyen.
+    _dedans = [c for c in comps if not c["extrapole"]]
+    ecart_moy = float(np.mean([c["ecart_pct"] for c in (_dedans or comps)]))
+    return {"pente_kmh_par_bpm": round(float(sl), 4), "r": round(float(r), 3),
+            "hr_min": int(hs.min()), "hr_max": int(hs.max()),
+            "comparaisons": comps, "ecart_moyen_pct": round(ecart_moy, 1),
+            "significatif": bool(abs(ecart_moy) >= 5.0)}
+
+def vitesse_terrain_du_seuil(thr_hr, calage):
+    """Transpose la vitesse d'un seuil du tapis vers le terrain, à FC égale."""
+    if not thr_hr or not calage or not calage.get("significatif"):
+        return None
+    return None if not calage.get("comparaisons") else round(
+        float(np.mean([c["v_terrain"] / max(1e-6, c["v_masque"]) for c in calage["comparaisons"]])), 4)
+
+def plot_hierarchie(rows, cs_kmh):
+    """Tous les repères sur un seul axe de vitesse : c'est là qu'un seuil mal placé
+    saute aux yeux, bien plus que dans un tableau."""
+    if not rows or len(rows) < 3:
+        return None
+    fig, ax = plt.subplots(figsize=(11.5, 2.5 + 0.32 * len(rows)))
+    ys = list(range(len(rows)))[::-1]
+    for y, r in zip(ys, rows):
+        _mesure = r["source"] in ("mesuré", "course réelle", "tests de terrain")
+        col = C_RED if _mesure else C_GREY
+        ax.plot([0, r["v"]], [y, y], color=col, lw=1.0, alpha=0.28)
+        ax.plot([r["v"]], [y], "o" if _mesure else "D", color=col, ms=9,
+                mec=C_SURFACE, mew=1.4)
+        ax.annotate(f"{r['v']:.1f} km/h · {pace_str(3600.0/r['v'])}/km · {r['pct_vc']:.0f} % VC",
+                    xy=(r["v"], y), xytext=(10, 0), textcoords="offset points",
+                    va="center", fontsize=8.5, color=C_TEXT)
+    ax.axvline(cs_kmh, color=C_RED, lw=1.2, ls=":", alpha=0.6)
+    ax.axvspan(cs_kmh * MLSS_FRAC_CS[0], cs_kmh * MLSS_FRAC_CS[1],
+               color=C_WHITE, alpha=0.09, linewidth=0)
+    ax.axvspan(cs_kmh * RCP_FRAC_CS[0], cs_kmh * RCP_FRAC_CS[1],
+               color=C_RED, alpha=0.10, linewidth=0)
+    ax.set_yticks(ys); ax.set_yticklabels([r["repere"] for r in rows], fontsize=8.5)
+    ax.set_xlabel("Vitesse (km/h)")
+    ax.set_xlim(min(r["v"] for r in rows) * 0.88, max(r["v"] for r in rows) * 1.22)
+    ax.grid(axis="x", alpha=0.25); ax.grid(axis="y", alpha=0)
+    chart_title(ax, "Où tombe chaque repère",
+                "Bande claire : plage attendue du MLSS · bande rouge : plage attendue de VT2 — "
+                "cercles = mesuré, losanges = estimé")
+    fig.tight_layout()
+    return fig
+
+def zones_vt1_vt2(thresholds, stages=None):
+    """Modèle à trois zones, celui que les seuils servent à poser : sous VT1 le
+    métabolisme est stable et le lactate reste au niveau de repos ; entre VT1 et
+    VT2 il s'élève mais reste tamponné (état stable haut) ; au-dessus de VT2 rien
+    ne se stabilise plus. Les bornes sont des vitesses, avec la FC correspondante
+    quand le test en a une."""
+    t1 = (thresholds or {}).get("vt1") or {}
+    t2 = (thresholds or {}).get("vt2") or {}
+    v1, v2 = t1.get("vitesse_kmh"), t2.get("vitesse_kmh")
+    if not v2:
+        return None
+    def _hr_at(v):
+        if not v or not stages:
+            return None
+        pts = [(s["vitesse_kmh"], s["hr"]) for s in stages if s.get("vitesse_kmh") and s.get("hr")]
+        if len(pts) < 3:
+            return None
+        pts.sort()
+        sl, ic, _, _, _ = sp_stats.linregress([a for a, _ in pts], [b for _, b in pts])
+        return int(round(sl * float(v) + ic))
+    h1 = t1.get("hr") or _hr_at(v1)
+    h2 = t2.get("hr") or _hr_at(v2)
+    def _p(v):
+        return (pace_str(3600.0 / float(v)) + "/km") if v else "—"
+    out = []
+    if v1:
+        out.append({"nom": "Z1 — endurance fondamentale", "bornes_kmh": f"< {v1:.1f}",
+                    "allure": f"plus lent que {_p(v1)}", "fc": (f"< {h1} bpm" if h1 else "—"),
+                    "role": "durée, capacité aérobie, oxydation des lipides — le gros du volume"})
+        out.append({"nom": "Z2 — entre les seuils", "bornes_kmh": f"{v1:.1f} – {v2:.1f}",
+                    "allure": f"{_p(v2)} – {_p(v1)}",
+                    "fc": (f"{h1} – {h2} bpm" if (h1 and h2) else "—"),
+                    "role": "allure spécifique semi/marathon, tempo, sorties longues rapides"})
+    else:
+        out.append({"nom": "Z1+Z2 — sous VT2", "bornes_kmh": f"< {v2:.1f}",
+                    "allure": f"plus lent que {_p(v2)}", "fc": (f"< {h2} bpm" if h2 else "—"),
+                    "role": "VT1 inconnu : impossible de séparer l'endurance fondamentale du tempo"})
+    out.append({"nom": "Z3 — au-dessus de VT2", "bornes_kmh": f"> {v2:.1f}",
+                "allure": f"plus rapide que {_p(v2)}", "fc": (f"> {h2} bpm" if h2 else "—"),
+                "role": "VMA, intervalles courts — rien ne s'y stabilise, la durée est limitée"})
     return out
 
 def _confidences(dur_s, cv_mean_pct, rer, n_prior_tests, n_samples, missing_frac,
@@ -3816,11 +4148,17 @@ def analyze_metabolic_stages(df_gz, mass_kg=70.0, vc_ms=None, n_prior_tests=0, w
             lo = substrate_from_gas(vo2 + vo2_sem + vo2_model_unc, max(0.01, vco2 - vco2_sem))
             hi = substrate_from_gas(max(0.01, vo2 - vo2_sem - vo2_model_unc), vco2 + vco2_sem)
             widen = (1.0 - conf["conf_substrats"] / 100.0) * 0.25
-            if (sub_m.get("cho_g_min") is None or lo.get("cho_g_min") is None
-                    or hi.get("cho_g_min") is None):
+            if sub_m.get("cho_g_min") is None:
                 # palier hors plage physiologique : pas de partition, donc pas de plage
                 cho_lo = cho_hi = fat_lo = fat_hi = None
                 conf["conf_substrats"] = 0.0
+            elif lo.get("cho_g_min") is None or hi.get("cho_g_min") is None:
+                # la valeur centrale tient, mais une des bornes perturbées sort de la
+                # plage physiologique : on garde le point sans plage plutôt que de le
+                # perdre — et la confiance en prend acte.
+                cho_lo = cho_hi = float(sub_m["cho_g_min"])
+                fat_lo = fat_hi = float(sub_m["fat_g_min"])
+                conf["conf_substrats"] = min(conf["conf_substrats"], 40.0)
             else:
                 cho_lo = max(0.0, min(lo["cho_g_min"], hi["cho_g_min"]) * (1 - widen))
                 cho_hi = max(cho_lo, max(lo["cho_g_min"], hi["cho_g_min"]) * (1 + widen))
@@ -4132,6 +4470,11 @@ def plot_ventilatory_thresholds(stages, thresholds, vc_ms=None):
     _key = (thresholds or {}).get("axe") or "vitesse_kmh"
     _unit = (thresholds or {}).get("axe_unite") or "km/h"
     st_ = [s for s in stages if s.get(_key) is not None and s.get("eqco2")]
+    # le palier de mise en route, écarté de la détection, l'est aussi du tracé :
+    # sinon il y laisse un pic qui n'a aucune signification physiologique
+    _pm = (thresholds or {}).get("palier_mise_en_route")
+    if _pm:
+        st_ = [s for s in st_ if s.get("palier") != _pm.get("palier")]
     st_ = sorted(st_, key=lambda s: s[_key])
     if len(st_) < 4:
         return None
@@ -4140,8 +4483,8 @@ def plot_ventilatory_thresholds(stages, thresholds, vc_ms=None):
     a1.plot(x, [s["eqco2"] for s in st_], "-o", color=C_RED, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
     a1.set_ylabel("VE / VCO₂")
     chart_title(a1, "Seuils ventilatoires — mesure directe du masque",
-                "Le minimum de VE/VCO₂ marque le point de compensation respiratoire (VT2) ; "
-                "la rupture de pente du VCO₂ marque VT1")
+                "VT2 se lit sur le CO₂ (VE décroche de VCO₂, nadir de VE/VCO₂) ; "
+                "VT1 se lit sur la ventilation (première rupture de pente de VE)")
     a2.plot(x, [s["vco2_lmin"] for s in st_], "-o", color=C_WHITE, lw=2, ms=6, mec=C_SURFACE, mew=1.4)
     a2.set_ylabel("VCO₂ (L/min)")
     a2.set_xlabel({"vitesse_kmh": "Vitesse (km/h)", "hr": "Fréquence cardiaque (bpm)",
@@ -4149,15 +4492,23 @@ def plot_ventilatory_thresholds(stages, thresholds, vc_ms=None):
     for key, color, label, dy in (("vt1", C_WHITE, "VT1", -12), ("vt2", C_RED, "VT2", -32)):
         th = (thresholds or {}).get(key)
         if th and th.get("x") is not None:
+            _estime = th.get("source") == "estimé"
+            if _estime and th.get("plage"):
+                # un seuil estimé se dessine comme une plage, pas comme un trait net
+                for _a in (a1, a2):
+                    _a.axvspan(th["plage"][0], th["plage"][1], color=color, alpha=0.10, linewidth=0)
             for _a in (a1, a2):
                 _a.axvline(th["x"], color=color, lw=1.4,
-                           ls="--" if key == "vt1" else ":", alpha=0.85)
+                           ls=(":" if key == "vt2" else ("-." if _estime else "--")),
+                           alpha=0.55 if _estime else 0.85)
             _txt = f"{label} {th['x']:.1f} {_unit}"
             if th.get("hr"):
                 _txt += f" · {th['hr']} bpm"
             if th.get("pct_vc"):
                 _txt += f" · {th['pct_vc']:.0f} % VC"
-            if not th.get("fiable"):
+            if _estime:
+                _txt += " (estimé)"
+            elif not th.get("fiable"):
                 _txt += " (signal faible)"
             # étiquettes décalées l'une sous l'autre : les deux seuils sont souvent proches
             a1.annotate(_txt, xy=(th["x"], a1.get_ylim()[1]), xytext=(5, dy),
@@ -6562,6 +6913,7 @@ with main_tabs[1]:
                     if parsed_vc_i:
                         st.success(f"✅ {file_vc_i.name} — {parsed_vc_i['distance']:.0f} m · {parsed_vc_i['duration_hms']} · D+ {parsed_vc_i['D_up']:.0f} m")
                         pts_i = parsed_vc_i.get("points", [])
+                        seg_i = None
                         _laps_i = parsed_vc_i.get("laps") or []
                         _tot_s_i = float(hms_to_seconds(parsed_vc_i["duration_hms"]))
 
@@ -6681,6 +7033,16 @@ with main_tabs[1]:
                             d_up_v = float(_lap_pick.get("D_up") or d_up_v or 0.0)
                         secs_v = float(hms_to_seconds(dur_i))
                         hr_ref_vc = parsed_vc_i.get("hr_analysis")
+                        # la FC doit décrire LE SEGMENT retenu, pas toute la séance :
+                        # sinon un test de 3 min au milieu d'une sortie hérite de la FC
+                        # moyenne de l'échauffement, et toute comparaison à FC égale
+                        # devient fausse.
+                        if _lap_pick is not None or start_td_i.total_seconds() > 0 or \
+                           end_td_i.total_seconds() < 86399:
+                            _seg_hr = [p.get("hr") for p in (seg_i or [])
+                                       if isinstance(p, dict) and p.get("hr")]
+                            if len(_seg_hr) >= 10:
+                                hr_ref_vc = analyze_hr_v3(_seg_hr)
                         # v8.2 — conserve les points pour la détection de rupture (section 4)
                         st.session_state[f"vc_points_{i}"] = (
                             seg_i if pts_i and (start_td_i.total_seconds() > 0 or end_td_i.total_seconds() < 86399) else pts_i)
@@ -6958,7 +7320,11 @@ with main_tabs[1]:
             st.markdown("---")
             st.subheader("🍬 Profil métabolique, économie et nutrition")
             _ath_met = get_athlete(current_athlete_id()) if history_ready() else None
-            _vc_last = last_vc_ms(current_athlete_id()) if history_ready() else None
+            # VC de référence : celle calculée plus haut dans la session en priorité,
+            # sinon le dernier test enregistré de l'athlète. Sans ça, la comparaison
+            # seuils / vitesse critique se ferait contre une valeur par défaut.
+            _vc_last = (st.session_state.get("vc_ms")
+                        or (last_vc_ms(current_athlete_id()) if history_ready() else None))
             _n_prior = count_metabolic_tests(current_athlete_id()) if history_ready() else 0
             if _has_o2:
                 st.caption("Fichier avec oxygène mesuré : la partition glucides/lipides repose sur des gaz "
@@ -7129,38 +7495,129 @@ with main_tabs[1]:
                 if _fig_thr is not None:
                     st.pyplot(_fig_thr); plt.close("all")
                 _rows_thr = []
-                for _k, _lab in (("vt1", "VT1 — seuil aérobie (indicatif)"),
+                for _k, _lab in (("vt1", "VT1 — seuil aérobie"),
                                  ("vt2", "VT2 — compensation respiratoire")):
                     _t = _thr.get(_k)
                     if _t:
                         # sans tapis instrumenté, le seuil est situé sur l'axe disponible
                         # (FC ou n° de palier) : la ligne s'adapte au lieu de planter
                         _v_thr = _t.get("vitesse_kmh")
+                        _est = _t.get("source") == "estimé"
                         _rows_thr.append({
-                            "Seuil": _lab,
+                            "Seuil": _lab + (" (estimé)" if _est else ""),
+                            "Lu sur": ("la ventilation (VE)" if _k == "vt1" and not _est
+                                       else ("VT2 + vitesse critique" if _est else "le CO₂ (VE vs VCO₂)")),
                             "Situé à": f"{_t.get('x', '—')} {_thr.get('axe_unite', '')}",
                             "Vitesse (km/h)": _v_thr if _v_thr else "—",
                             "Allure": (pace_str(3600.0 / _v_thr) + "/km") if _v_thr else "—",
                             "% VC": _t.get("pct_vc") or "—", "FC": _t.get("hr") or "—",
-                            "Palier": _t.get("palier"),
-                            "Qualité du signal": ("solide" if _t.get("fiable") else "faible — à confirmer"),
+                            "Marqueurs concordants": (f"{_t.get('n_concordants', 0)} / "
+                                                      f"{len(_t.get('marqueurs') or [])}" if not _est else "—"),
+                            "Qualité": ("solide" if _t.get("fiable")
+                                        else ("estimation de cadrage" if _est else "faible — à confirmer")),
                         })
                 if _rows_thr:
                     st.dataframe(pd.DataFrame(_rows_thr), use_container_width=True, hide_index=True)
-                if _thr.get("vt1_note") and _thr.get("vt1"):
+                # détail des marqueurs : quel signal a donné quoi
+                for _k, _nm in (("vt1", "VT1"), ("vt2", "VT2")):
+                    _mk = (_thr.get(_k) or {}).get("marqueurs") or []
+                    if _mk:
+                        with st.expander(f"🔎 Marqueurs de {_nm} — quel signal a donné quoi"):
+                            st.dataframe(pd.DataFrame([{
+                                "Marqueur": _m["nom"],
+                                "Situé à": f"{_m['x']} {_thr.get('axe_unite','')}",
+                                "Détail": _m["detail"],
+                            } for _m in _mk]), use_container_width=True, hide_index=True)
+                if _thr.get("palier_mise_en_route"):
+                    _pm = _thr["palier_mise_en_route"]
+                    st.caption(f"Palier {_pm['palier']} écarté de la détection des seuils : sa ventilation est "
+                               f"{abs(_pm['ecart_pct']):.0f} % sous la droite VE/intensité — c'est une mise en "
+                               f"route, le souffle n'a pas encore rattrapé l'effort. Le laisser fausserait les "
+                               f"deux ruptures de pente.")
+                if _thr.get("vt1_note") and (_thr.get("vt1") or {}).get("source") == "mesuré":
                     st.caption("ℹ️ " + _thr["vt1_note"])
+                if _thr.get("vt1_estime_note"):
+                    st.markdown(f'<div class="note-box">{_thr["vt1_estime_note"]}</div>',
+                                unsafe_allow_html=True)
                 if _thr.get("vt1_message"):
                     st.caption("ℹ️ " + _thr["vt1_message"])
-                _cf = ((_thr.get("vt2") or {}).get("confirmation_feco2"))
-                if _cf:
-                    st.caption(("✅ VT2 confirmé par un second marqueur indépendant : le CO₂ expiré chute de "
-                                f"{_cf['chute_pct']:.0f} % à partir de {_cf['x']:.1f} {_thr.get('axe_unite','')}."
-                                ) if _cf.get("concordant") else
-                               ("ℹ️ Le CO₂ expiré chute à partir de "
-                                f"{_cf['x']:.1f} {_thr.get('axe_unite','')}, soit un peu après le nadir de "
-                                f"VE/VCO₂ : les deux marqueurs encadrent VT2 sans se superposer exactement."))
+                if _thr.get("vt2_vs_vc"):
+                    st.warning(f"⚠️ {_thr['vt2_vs_vc']}")
                 if not _rows_thr:
                     st.caption(_thr.get("message", "Seuils non identifiables sur ce test."))
+
+                # ── modèle à 3 zones : c'est ce que VT1 et VT2 servent à poser ──
+                _z = zones_vt1_vt2(_thr, _stages_met)
+                if _z:
+                    st.markdown("###### 🎚️ Zones d'entraînement issues des seuils")
+                    st.dataframe(pd.DataFrame([{
+                        "Zone": z["nom"],
+                        "Bornes (km/h)": z["bornes_kmh"],
+                        "Allure": z["allure"],
+                        "FC": z["fc"],
+                        "Ce qu'on y travaille": z["role"],
+                    } for z in _z]), use_container_width=True, hide_index=True)
+                    if (_thr.get("vt1") or {}).get("source") == "estimé":
+                        st.caption("La frontière Z1/Z2 repose sur le VT1 estimé : elle est à prendre comme un "
+                                   "ordre de grandeur tant que VT1 n'a pas été mesuré. La frontière Z2/Z3, "
+                                   "elle, vient d'un VT2 réellement mesuré.")
+
+                # ── où tombe chaque repère : VT1 < MLSS ≤ VT2 ≈ VC ──────────────
+                _refs_terrain = st.session_state.get("refs_fit_vc") or []
+                _hrows, _hdiags = hierarchie_seuils(_thr, _vc_met_kmh / 3.6, _refs_terrain)
+                if _hrows:
+                    st.markdown("###### 🧭 Où tombe chaque repère")
+                    _fig_h = plot_hierarchie(_hrows, _vc_met_kmh)
+                    if _fig_h is not None:
+                        st.pyplot(_fig_h); plt.close("all")
+                    st.dataframe(pd.DataFrame([{
+                        "Repère": r["repere"], "Vitesse (km/h)": round(r["v"], 2),
+                        "Allure": pace_str(3600.0 / r["v"]) + "/km",
+                        "% VC": r["pct_vc"], "Origine": r["source"], "Attendu": r["attendu"],
+                    } for r in _hrows]), use_container_width=True, hide_index=True)
+                    st.caption("Hiérarchie physiologique de référence : VT1 < MLSS ≤ VT2 ≈ vitesse critique. "
+                               "Le MLSS — dernier palier où le lactate se stabilise encore — tombe 4 à 10 % "
+                               "sous la vitesse critique ; VT2 et la VC, eux, sont le plus souvent "
+                               "indiscernables l'un de l'autre.")
+                    for _d in _hdiags:
+                        if ("manque encore" in _d) or ("sous-estimée" in _d):
+                            st.warning(f"⚠️ {_d}")
+                        else:
+                            st.info(f"ℹ️ {_d}")
+
+                # ── le test au masque et le terrain sont-ils sur la même échelle ? ──
+                _cal = calage_terrain(_stages_met, _refs_terrain)
+                if _cal:
+                    with st.expander("🔀 Le test au masque et tes courses sont-ils sur la même échelle "
+                                     + ("de vitesse ? — écart significatif" if _cal["significatif"]
+                                        else "de vitesse ? — cohérents"),
+                                     expanded=bool(_cal["significatif"])):
+                        st.caption(f"Comparaison à fréquence cardiaque égale — la FC ne dépend ni de "
+                                   f"l'étalonnage du tapis ni du vent. Relation FC→vitesse du test : "
+                                   f"{_cal['pente_kmh_par_bpm']:.3f} km/h par bpm (r = {_cal['r']:.3f}, "
+                                   f"FC testées {_cal['hr_min']}–{_cal['hr_max']} bpm).")
+                        st.dataframe(pd.DataFrame([{
+                            "Effort de terrain": c["label"], "FC moy.": c["hr"],
+                            "Vitesse terrain": f"{c['v_terrain']:.2f} km/h",
+                            "Vitesse du test à cette FC": f"{c['v_masque']:.2f} km/h",
+                            "Écart": f"{c['ecart_pct']:+.1f} %"
+                                     + (" (FC hors plage testée)" if c["extrapole"] else ""),
+                        } for c in _cal["comparaisons"]]), use_container_width=True, hide_index=True)
+                        if _cal["significatif"]:
+                            _f = 1.0 + _cal["ecart_moyen_pct"] / 100.0
+                            _v2m = (_thr.get("vt2") or {}).get("vitesse_kmh")
+                            st.error(
+                                f"🚨 À FC égale, tu cours **{_cal['ecart_moyen_pct']:+.0f} %** plus vite sur le "
+                                f"terrain que ce que le test indique. Les deux ne sont pas sur la même échelle "
+                                f"de vitesse : tapis non étalonné, pente résiduelle, ou colonne vitesse du "
+                                f"fichier qui n'est pas la vitesse réelle. Conséquence directe : les seuils de "
+                                f"ce test sont **fiables en FC, pas en allure**."
+                                + (f" Transposé au terrain à FC égale, VT2 correspondrait à environ "
+                                   f"**{_v2m*_f:.1f} km/h** ({pace_str(3600.0/(_v2m*_f))}/km) au lieu de "
+                                   f"{_v2m:.1f} km/h." if _v2m else ""))
+                        else:
+                            st.success("✅ Les deux échelles concordent : les allures issues du test sont "
+                                       "directement utilisables sur le terrain.")
 
                 # ── 2. dépense énergétique ───────────────────────────────
                 st.markdown("##### 🔥 Dépense énergétique et coût de course")
