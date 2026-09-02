@@ -336,6 +336,58 @@ def pace_str(secs_per_km):
     t=int(round(float(secs_per_km)))
     return f"{t//60}:{t%60:02d}"
 
+# ── v9.9 : toute vitesse s'affiche AUSSI en allure ────────────────────────
+# Personne ne lit une montre en km/h. Ces trois helpers sont le seul endroit
+# où la conversion est écrite, pour qu'aucun affichage ne puisse l'oublier.
+def pace_of(v_kmh, suffix="/km"):
+    """Allure correspondant à une vitesse en km/h : '3:14/km'."""
+    try:
+        v = float(v_kmh)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v) or v <= 0.05:
+        return "—"
+    return pace_str(3600.0 / v) + suffix
+
+def fmt_kmh(v_kmh, dec=2, sep=" · ", parentheses=False):
+    """Vitesse ET allure, toujours ensemble : '18.55 km/h · 3:14/km'."""
+    try:
+        v = float(v_kmh)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(v) or v <= 0.05:
+        return "—"
+    p = pace_of(v)
+    return f"{v:.{dec}f} km/h ({p})" if parentheses else f"{v:.{dec}f} km/h{sep}{p}"
+
+def add_pace_axis(ax, which="x", label="Allure (min/km)"):
+    """Double l'axe des vitesses d'un axe en allure : la même courbe se lit dans
+    les deux unités sans conversion mentale."""
+    try:
+        if which == "x":
+            lo, hi = ax.get_xlim()
+            ticks = [t for t in ax.get_xticks() if lo <= t <= hi and t > 0.3]
+            tw = ax.twiny()
+            tw.set_xlim(lo, hi)
+            tw.set_xticks(ticks)
+            tw.set_xticklabels([pace_str(3600.0 / t) for t in ticks], fontsize=7.5)
+            tw.set_xlabel(label, fontsize=8, color=C_TEXT_MUT)
+        else:
+            lo, hi = ax.get_ylim()
+            ticks = [t for t in ax.get_yticks() if lo <= t <= hi and t > 0.3]
+            tw = ax.twinx()
+            tw.set_ylim(lo, hi)
+            tw.set_yticks(ticks)
+            tw.set_yticklabels([pace_str(3600.0 / t) for t in ticks], fontsize=7.5)
+            tw.set_ylabel(label, fontsize=8, color=C_TEXT_MUT)
+        tw.tick_params(colors=C_TEXT_MUT, labelsize=7.5)
+        tw.grid(False)
+        for _sp in tw.spines.values():
+            _sp.set_visible(False)
+        tw.patch.set_alpha(0.0)
+    except Exception:
+        pass
+
 def haversine_m(lat1,lon1,lat2,lon2):
     R=6371000.0
     p1,p2=math.radians(lat1),math.radians(lat2)
@@ -1494,7 +1546,7 @@ def plot_biomecanique(samples, transition, summary, infos, method,
         ax.plot(gb["grade"], gb["speed"], color=C_TEXT, lw=2.0, zorder=5,
                 label="Vitesse médiane par pente")
     ax.axvline(0, color=C_LINE, lw=1.0)
-    ax.set_ylabel("Vitesse réelle (km/h)")
+    ax.set_ylabel("Vitesse réelle (km/h)"); add_pace_axis(ax, "y")
     ax.set_ylim(bottom=0)
     chart_title(ax, "Biomécanique course / marche",
                 "Un point toutes les 2 s, hors pauses · couleur = cadence · la zone rouge est la bascule vers la marche")
@@ -3412,12 +3464,13 @@ def plot_records_curve(records, vc_ms=None, compare=None, title_suffix=""):
                     xytext=(0, 10), textcoords="offset points", ha="center", fontsize=7, color=C_TEXT_MUT)
     if vc_ms:
         ax.axhline(vc_ms * 3.6, color=C_WHITE, lw=1.2, ls=":",
-                   label=f"Vitesse critique ({vc_ms*3.6:.2f} km/h)")
+                   label=f"Vitesse critique ({fmt_kmh(vc_ms*3.6)})")
     ax.set_xscale("log")
     ax.set_xticks([r["duree_s"] / 60.0 for r in records])
     ax.set_xticklabels([(f"{r['duree_s']//60} min" if r["duree_s"] < 3600 else f"{r['duree_s']//3600} h")
                         for r in records], fontsize=8)
     ax.set_xlabel("Durée tenue"); ax.set_ylabel("Vitesse moyenne (km/h)")
+    add_pace_axis(ax, "y")
     chart_title(ax, "Temps de maintien — meilleures vitesses tenues",
                 "Pour chaque durée, la meilleure moyenne réellement réalisée dans la séance" + title_suffix)
     if ax.get_legend_handles_labels()[0]:
@@ -3536,7 +3589,7 @@ def plot_vc_zones(zones, vc_ms, used_vap=True):
     ax.set_xlabel("Temps (min)")
     ax.set_xlim(0, max(vals) * 1.45 if max(vals) > 0 else 1)
     chart_title(ax, "Temps par zone d'intensité — référence vitesse critique",
-                f"VC = {vc_ms*3.6:.2f} km/h ({pace_str(1000.0/vc_ms)}/km)" +
+                f"VC = {fmt_kmh(vc_ms*3.6)}" +
                 (" · calculé sur la VAP (vitesse ramenée au plat)" if used_vap else " · vitesse brute"))
     ax.grid(axis="y", alpha=0)
     fig.tight_layout()
@@ -3993,7 +4046,8 @@ def hierarchie_seuils(thresholds, vc_ms, refs=None):
     rows.append({"repere": "MLSS — dernier état stable du lactate",
                  "v": (mlss_lo + mlss_hi) / 2.0, "source": "estimé depuis la VC",
                  "attendu": f"{MLSS_FRAC_CS[0]*100:.0f}-{MLSS_FRAC_CS[1]*100:.0f} % de la VC "
-                            f"({mlss_lo:.1f}-{mlss_hi:.1f} km/h)"})
+                            f"({mlss_lo:.1f}-{mlss_hi:.1f} km/h, soit {pace_of(mlss_hi)}"
+                            f"-{pace_of(mlss_lo)})"})
     if v2:
         rows.append({"repere": "VT2 — compensation respiratoire", "v": float(v2),
                      "source": t2.get("source") or "mesuré",
@@ -4017,7 +4071,8 @@ def hierarchie_seuils(thresholds, vc_ms, refs=None):
             diags.append(
                 f"VT2 ressort à {pv*100:.0f} % de la vitesse critique. Même en supposant que le masque "
                 f"détecte en réalité le MLSS — l'hypothèse la plus favorable, puisque le MLSS est le plus "
-                f"bas des deux — il devrait tomber vers {mlss_lo:.1f}-{mlss_hi:.1f} km/h. Il manque encore "
+                f"bas des deux — il devrait tomber vers {mlss_lo:.1f}-{mlss_hi:.1f} km/h "
+                f"({pace_of(mlss_hi)}-{pace_of(mlss_lo)}). Il manque encore "
                 f"{manque:.0f} % : la différence MLSS/VC n'explique pas l'écart, il faut chercher ailleurs "
                 f"(échelle de vitesse du tapis, test arrêté trop tôt, ou vitesse critique surestimée).")
         elif pv > RCP_FRAC_CS[1] + 0.02:
@@ -4026,7 +4081,8 @@ def hierarchie_seuils(thresholds, vc_ms, refs=None):
         else:
             diags.append(f"VT2 tombe à {pv*100:.0f} % de la vitesse critique — cohérent avec l'attendu "
                          f"({RCP_FRAC_CS[0]*100:.0f}-{RCP_FRAC_CS[1]*100:.0f} %). Le MLSS, lui, se situe "
-                         f"un cran plus bas, vers {mlss_lo:.1f}-{mlss_hi:.1f} km/h.")
+                         f"un cran plus bas, vers {mlss_lo:.1f}-{mlss_hi:.1f} km/h "
+                         f"({pace_of(mlss_hi)}-{pace_of(mlss_lo)}).")
     return rows, diags
 
 def calage_terrain(stages, refs):
@@ -4105,6 +4161,7 @@ def plot_hierarchie(rows, cs_kmh):
     ax.set_xlabel("Vitesse (km/h)")
     ax.set_xlim(min(r["v"] for r in rows) * 0.88, max(r["v"] for r in rows) * 1.22)
     ax.grid(axis="x", alpha=0.25); ax.grid(axis="y", alpha=0)
+    add_pace_axis(ax, "x")
     chart_title(ax, "Où tombe chaque repère",
                 "Bande claire : plage attendue du MLSS · bande rouge : plage attendue de VT2 — "
                 "cercles = mesuré, losanges = estimé")
@@ -4519,7 +4576,8 @@ def split_aerobic_anaerobic(rows, thresholds=None, vc_ms=None, mass_kg=None):
     if _an and max(_an) >= 3.0:
         _v_an = [r["vitesse_kmh"] for r in rows if (r.get("part_anaerobie_pct") or 0) >= 3.0]
         infos["anaerobie_msg"] = (
-            f"À partir de {min(_v_an):.1f} km/h, les gaz expirés ne suffisent plus à expliquer le coût "
+            f"À partir de {min(_v_an):.1f} km/h ({pace_of(min(_v_an))}), les gaz expirés ne suffisent "
+            f"plus à expliquer le coût "
             f"du déplacement : jusqu'à {max(_an):.0f} % de l'énergie vient de la filière anaérobie, "
             f"invisible pour un masque. Le coût total au km est donc modélisé (économie + résistance de "
             f"l'air), pas mesuré, au-delà de cette vitesse.")
@@ -4694,6 +4752,8 @@ def plot_ventilatory_thresholds(stages, thresholds, vc_ms=None):
     a2.set_ylabel("VCO₂ (L/min)")
     a2.set_xlabel({"vitesse_kmh": "Vitesse (km/h)", "hr": "Fréquence cardiaque (bpm)",
                    "palier": "Palier"}[_key])
+    if _key == "vitesse_kmh":
+        add_pace_axis(a1, "x")
     for key, color, label, dy in (("vt1", C_WHITE, "VT1", -12), ("vt2", C_RED, "VT2", -32)):
         th = (thresholds or {}).get(key)
         if th and th.get("x") is not None:
@@ -4807,6 +4867,7 @@ def plot_economy(stages, mass_kg):
                     textcoords="offset points", ha="center", fontsize=7.5, color=C_TEXT_MUT)
     _m = float(np.mean(y_to))
     ax.set_xlabel("Vitesse (km/h)"); ax.set_ylabel("kcal / kg / km")
+    add_pace_axis(ax, "x")
     ax.legend(fontsize=8, loc="lower right")
     chart_title(ax, "Coût énergétique de la course",
                 f"Coût total moyen {_m:.2f} kcal/kg/km (≈ {_m*mass_kg:.0f} kcal/km pour {mass_kg:.0f} kg) — "
@@ -7279,7 +7340,8 @@ with main_tabs[1]:
                     d_up_v = st.number_input("D+ (m)", value=0.0, step=10.0, key=f"vc_dup_{i}")
                 secs_v = float(hms_to_seconds(t_v))
                 if dist_v > 0 and secs_v > 0:
-                    st.caption(f"Allure : **{pace_str(secs_v/(dist_v/1000))}/km** · Vitesse : **{dist_v/secs_v*3.6:.2f} km/h**")
+                    st.caption(f"Allure : **{pace_str(secs_v/(dist_v/1000))}/km** · "
+                               f"Vitesse : **{dist_v/secs_v*3.6:.2f} km/h**")
                 else:
                     st.caption("⚪ Référence vide — saisis un temps pour qu'elle compte dans le calcul.")
 
@@ -7304,6 +7366,7 @@ with main_tabs[1]:
             "Temps": seconds_to_hms(_r["temps"]),
             "Allure": pace_str(_r["temps"] / (_r["distance"] / 1000.0)) + "/km",
             "Vitesse": f"{_r['distance'] / _r['temps'] * 3.6:.2f} km/h",
+            "Allure ": pace_of(_r['distance'] / _r['temps'] * 3.6),
             "D+": f"{_r.get('D_up', 0):.0f} m",
         } for _k, _r in enumerate(refs_vc_valid)]), use_container_width=True, hide_index=True)
         _n_vides = len(refs_vc) - len(refs_vc_valid)
@@ -7350,7 +7413,8 @@ with main_tabs[1]:
 
         st.subheader("📊 Résultats — Modèle linéaire D'")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("VC (Vitesse Critique)", f"{vc_ms*3.6:.2f} km/h")
+        c1.metric("VC (Vitesse Critique)", f"{vc_ms*3.6:.2f} km/h", pace_of(vc_ms*3.6) + " — allure critique",
+                  delta_color="off")
         c2.metric("Allure VC", pace_str(1000.0/vc_ms)+"/km")
         c3.metric("D' (réserve anaérobie)", f"{round(d_prime)} m" if d_prime else "—")
         c4.metric("R² (qualité modèle)", f"{r2_vc:.3f}" if r2_vc is not None else "—")
@@ -7425,6 +7489,7 @@ with main_tabs[1]:
                                    float(round(vc_ms * 3.6 * 0.55, 1)), 0.5, key="dp_v_rec",
                                    help="0 = arrêt complet. Plus la récup est rapide, plus D′ met "
                                         "longtemps à se reconstituer.")
+        _dt1.caption(f"➜ {pace_of(_v_rec)}" if _v_rec > 0.3 else "➜ arrêt complet")
         _dp_start = _dt2.slider("D′ restant au départ de la récup (%)", 0, 95, 0, 5, key="dp_start")
         _tau_mode = _dt3.radio("Constante de temps τ", ["Modèle", "Saisir τ"], key="dp_tau_mode",
                                horizontal=True)
@@ -7440,9 +7505,8 @@ with main_tabs[1]:
         kpi_row([
             ("D′ total", f"{d_prime:.0f} m",
              f"soit {seconds_to_hms(d_prime / max(0.01, (vc_ms * 1.05) - vc_ms))} à 105 % de VC"),
-            ("Récup à", f"{_v_rec:.1f} km/h",
-             f"{_info_rec['pct_vc']:.0f} % de la VC" + (f" · {pace_str(3600.0/_v_rec)}/km" if _v_rec > 0.3
-                                                        else " · arrêt complet")),
+            ("Récup à", f"{_v_rec:.1f} km/h" + (f" · {pace_of(_v_rec)}" if _v_rec > 0.3 else ""),
+             f"{_info_rec['pct_vc']:.0f} % de la VC" + ("" if _v_rec > 0.3 else " · arrêt complet")),
             ("τ — constante de temps", f"{_info_rec['tau_s']/60:.1f} min",
              f"{_info_rec['tau_s']:.0f} s" + (" (saisi)" if _tau_over else " (modèle)")),
             ("Demi-vie", f"{_info_rec['tau_s']*0.693/60:.1f} min",
@@ -7466,6 +7530,7 @@ with main_tabs[1]:
         _n_reps = _s1.number_input("Répétitions", 1, 40, 8, 1, key="dp_n")
         _v_work = _s2.number_input("Vitesse d'effort (km/h)", float(vc_ms * 3.6 * 0.8), 35.0,
                                    float(round(vc_ms * 3.6 * 1.12, 1)), 0.1, key="dp_vw")
+        _s2.caption(f"➜ {pace_of(_v_work)} · {_v_work/(vc_ms*3.6)*100:.0f} % de la VC")
         _mode_dur = _s3.radio("Durée définie par", ["Distance", "Temps"], key="dp_mode", horizontal=True)
         if _mode_dur == "Distance":
             _d_work = _s4.number_input("Distance d'effort (m)", 50.0, 5000.0, 400.0, 50.0, key="dp_dw")
@@ -7480,8 +7545,8 @@ with main_tabs[1]:
         _g_rec = _r3.number_input("Pente en récup (%)", -20.0, 30.0, 0.0, 0.5, key="dp_gr")
         st.caption(f"Effort : {_d_work:.0f} m en {seconds_to_hms(_t_work)} "
                    f"({pace_str(3600.0/_v_work)}/km, {_v_work/(vc_ms*3.6)*100:.0f} % de la VC)"
-                   + (f" — équivalent plat {_v_work*vap_cost_ratio(_g_work):.1f} km/h" if _g_work else "")
-                   + f" · récup {seconds_to_hms(_t_rec)} à {_v_rec:.1f} km/h.")
+                   + (f" — équivalent plat {fmt_kmh(_v_work*vap_cost_ratio(_g_work), 1)}" if _g_work else "")
+                   + f" · récup {seconds_to_hms(_t_rec)} à {fmt_kmh(_v_rec, 1)}.")
 
         _segs = interval_segments(int(_n_reps), _v_work, _t_work, _v_rec, _t_rec, _g_work, _g_rec)
         _sim = simulate_dprime(_segs, vc_ms, d_prime, tau_override=_tau_over)
@@ -7550,12 +7615,17 @@ with main_tabs[1]:
         st.subheader("📈 Courbe vitesse-endurance")
         fig_vc, ax_vc = plt.subplots(figsize=(11, 4))
         t_arr = np.linspace(60, 18000, 300)
-        v_riegel = [a_r * (t/1000.0)**K_r / t * 1000.0 * 3.6 if a_r > 0 else 0 for t in t_arr]
+        # Riegel donne le TEMPS pour une distance : t = a·d^K (d en km, t en s).
+        # Pour tracer une vitesse en fonction de la durée il faut l'inverser —
+        # l'ancienne version appliquait la formule à l'endroit et sortait des
+        # vitesses de 700 km/h, ce qui écrasait toute la courbe utile.
+        v_riegel = [((t / a_r) ** (1.0 / K_r)) * 3600.0 / t if (a_r > 0 and K_r > 0) else 0.0
+                    for t in t_arr]
         ax_vc.plot(t_arr/60, v_riegel, lw=2, color=C_WHITE, label=f"Riegel K={K_r:.3f}")
         if vc_ms > 0:
             v_vc_line = [vc_ms * 3.6 + (d_prime / t * 3.6 if d_prime and t > 0 else 0) for t in t_arr]
             ax_vc.plot(t_arr/60, v_vc_line, lw=2, ls="--", color=C_RED,
-                       label=f"Modèle D' (VC={vc_ms*3.6:.2f} km/h, D'={round(d_prime)}m)")
+                       label=f"Modèle D' (VC={fmt_kmh(vc_ms*3.6)}, D'={round(d_prime)}m)")
             ax_vc.axhline(vc_ms * 3.6, color=C_RED, lw=1.5, ls=":", label="VC")
         for r in refs_fit_vc:
             if r["distance"] > 0 and r["temps"] > 0:
@@ -7564,6 +7634,12 @@ with main_tabs[1]:
                 ax_vc.annotate(f"{r['distance']/1000:.1f}km", (r["temps"]/60, v_ref),
                                textcoords="offset points", xytext=(5, 5), fontsize=8)
         ax_vc.set_xlabel("Durée (min)"); ax_vc.set_ylabel("Vitesse (km/h)")
+        _vs_plot = [v for v in list(v_riegel) + [r["distance"]/r["temps"]*3.6 for r in refs_fit_vc
+                                                 if r["distance"] > 0 and r["temps"] > 0]
+                    if v and math.isfinite(v)]
+        if _vs_plot:
+            ax_vc.set_ylim(max(0.0, min(_vs_plot) * 0.85), max(_vs_plot) * 1.12)
+        add_pace_axis(ax_vc, "y")
         ax_vc.set_title("Courbe vitesse-endurance personnalisée")
         ax_vc.legend(fontsize=8); ax_vc.grid(alpha=0.3); fig_vc.tight_layout()
         st.pyplot(fig_vc); plt.close(fig_vc)
@@ -7623,7 +7699,9 @@ with main_tabs[1]:
                     st.metric("FC", f"{sv1['HR']} bpm"); st.metric("Palier", str(sv1["palier"]))
                     st.metric("VO₂", f"{sv1['VO2']:.3f} L/min"); st.metric("RQ", f"{sv1['RQ']:.3f}")
                     st.metric("VE", f"{sv1['VE']:.1f} L/min")
-                    if sv1.get("Cadence", 0) > 0: st.metric("Vitesse / Cadence", f"{sv1['Cadence']:.2f} km/h")
+                    if sv1.get("Cadence", 0) > 0:
+                        st.metric("Vitesse / Cadence", f"{sv1['Cadence']:.2f} km/h", pace_of(sv1["Cadence"]),
+                                  delta_color="off")
                     st.markdown("</div>", unsafe_allow_html=True)
                 elif _show_sv: st.info("SV1 non détecté automatiquement.")
             with col_sv2:
@@ -7633,7 +7711,9 @@ with main_tabs[1]:
                     st.metric("FC", f"{sv2['HR']} bpm"); st.metric("Palier", str(sv2["palier"]))
                     st.metric("VO₂", f"{sv2['VO2']:.3f} L/min"); st.metric("RQ", f"{sv2['RQ']:.3f}")
                     st.metric("VE", f"{sv2['VE']:.1f} L/min")
-                    if sv2.get("Cadence", 0) > 0: st.metric("Vitesse / Cadence", f"{sv2['Cadence']:.2f} km/h")
+                    if sv2.get("Cadence", 0) > 0:
+                        st.metric("Vitesse / Cadence", f"{sv2['Cadence']:.2f} km/h", pace_of(sv2["Cadence"]),
+                                  delta_color="off")
                     st.markdown("</div>", unsafe_allow_html=True)
                 elif _show_sv: st.info("SV2 non détecté automatiquement.")
 
@@ -7696,6 +7776,7 @@ with main_tabs[1]:
                                       float((_ath_met or {}).get("mass_kg") or 70.0), 0.5, key="met_mass")
             _vc_met_kmh = _mc2.number_input("Vitesse critique (km/h)", 5.0, 25.0,
                                             float((_vc_last or 3.9) * 3.6), 0.05, key="met_vc")
+            _mc2.caption(f"➜ {pace_of(_vc_met_kmh)}")
             _duree_cible_h = _mc3.number_input("Durée de la course visée (h)", 0.25, 30.0,
                                                float((_ath_met or {}).get("duree_cible_h") or 3.0), 0.25,
                                                key="met_duree",
@@ -7729,6 +7810,7 @@ with main_tabs[1]:
                            "Si le tapis n'était pas connecté, saisis les vitesses ici.")
                 _rc1, _rc2, _rc3 = st.columns([1, 1, 1.3])
                 _v0 = _rc1.number_input("Vitesse du 1er palier (km/h)", 3.0, 25.0, 8.0, 0.1, key="met_ramp_v0")
+                _rc1.caption(f"➜ {pace_of(_v0)}")
                 _dv = _rc2.number_input("Incrément par palier (km/h)", 0.0, 3.0, 0.5, 0.1, key="met_ramp_dv")
                 with _rc3:
                     st.caption(" ")
@@ -7745,11 +7827,12 @@ with main_tabs[1]:
                     "VE (L/min)": round(m["ve_lmin"], 1) if m.get("ve_lmin") else None,
                     "FC": (float(m["hr"]) if m.get("hr") else None) if _hr_col else None,
                     "Vitesse (km/h)": float(st.session_state[_skey].get(int(m["palier"]), 0.0) or 0.0),
+                    "Allure": pace_of(st.session_state[_skey].get(int(m["palier"]), 0.0)),
                 }.items() if _hr_col or k != "FC"} for m in _pv])
                 _edited = st.data_editor(
                     _df_sp, hide_index=True, use_container_width=True,
                     key=f"met_speed_editor_{gazoz_file.name}_{st.session_state.get(_vkey, 0)}",
-                    disabled=[c for c in ["Palier", "Durée", "VCO₂ (L/min)", "VE (L/min)", "FC"]
+                    disabled=[c for c in ["Palier", "Durée", "VCO₂ (L/min)", "VE (L/min)", "FC", "Allure"]
                               if c in _df_sp.columns],
                     column_config={
                         "Vitesse (km/h)": st.column_config.NumberColumn(
@@ -7947,8 +8030,8 @@ with main_tabs[1]:
                                    f"FC testées {_cal['hr_min']}–{_cal['hr_max']} bpm).")
                         st.dataframe(pd.DataFrame([{
                             "Effort de terrain": c["label"], "FC moy.": c["hr"],
-                            "Vitesse terrain": f"{c['v_terrain']:.2f} km/h",
-                            "Vitesse du test à cette FC": f"{c['v_masque']:.2f} km/h",
+                            "Vitesse terrain": fmt_kmh(c['v_terrain'], 2, parentheses=True),
+                            "Vitesse du test à cette FC": fmt_kmh(c['v_masque'], 2, parentheses=True),
                             "Écart": f"{c['ecart_pct']:+.1f} %"
                                      + (" (FC hors plage testée)" if c["extrapole"] else ""),
                         } for c in _cal["comparaisons"]]), use_container_width=True, hide_index=True)
@@ -7962,8 +8045,8 @@ with main_tabs[1]:
                                 f"fichier qui n'est pas la vitesse réelle. Conséquence directe : les seuils de "
                                 f"ce test sont **fiables en FC, pas en allure**."
                                 + (f" Transposé au terrain à FC égale, VT2 correspondrait à environ "
-                                   f"**{_v2m*_f:.1f} km/h** ({pace_str(3600.0/(_v2m*_f))}/km) au lieu de "
-                                   f"{_v2m:.1f} km/h." if _v2m else ""))
+                                   f"**{_v2m*_f:.1f} km/h** ({pace_of(_v2m*_f)}) au lieu de "
+                                   f"{_v2m:.1f} km/h ({pace_of(_v2m)})." if _v2m else ""))
                         else:
                             st.success("✅ Les deux échelles concordent : les allures issues du test sont "
                                        "directement utilisables sur le terrain.")
@@ -7978,7 +8061,8 @@ with main_tabs[1]:
                 if _cout.get("cout_base_kcal_kg_km"):
                     st.caption(
                         f"Coût de référence calé sur {_cout['cout_cale_sur']} paliers "
-                        + (f"sous {_cout['cout_limite_kmh']:.1f} km/h (VT2) " if _cout.get("cout_limite_kmh") else "")
+                        + (f"sous {_cout['cout_limite_kmh']:.1f} km/h ({pace_of(_cout['cout_limite_kmh'])}, "
+                           f"VT2) " if _cout.get("cout_limite_kmh") else "")
                         + f": **{_cout['cout_base_kcal_kg_km']:.3f} kcal/kg/km** hors résistance de l'air, à quoi "
                           f"s'ajoute la résistance de l'air (∝ vitesse²). C'est pour cela que le coût total monte "
                           f"très légèrement avec la vitesse au lieu de descendre.")
@@ -8018,7 +8102,7 @@ with main_tabs[1]:
                                 unsafe_allow_html=True)
                 if _fm and _substrats_ok:
                     st.markdown(f'<div class="note-box note-red">FatMax estimé à <b>{_fm.get("fat_g_min", 0):.2f} '
-                                f'g/min</b> vers <b>{_fm.get("vitesse_kmh", 0):.1f} km/h</b>'
+                                f'g/min</b> vers <b>{_fm.get("vitesse_kmh", 0):.1f} km/h ({pace_of(_fm.get("vitesse_kmh"))})</b>'
                                 + (f" ({_fm['pct_vc']:.0f} % de la VC)" if _fm.get("pct_vc") else "")
                                 + (f", FC ≈ {_fm['hr']} bpm" if _fm.get("hr") else "")
                                 + ".</div>", unsafe_allow_html=True)
@@ -8026,7 +8110,8 @@ with main_tabs[1]:
                 st.markdown("##### Détail par palier")
                 st.dataframe(pd.DataFrame([{
                     "Palier": s["palier"], "Durée": seconds_to_hms(s["duree_s"]),
-                    "Vitesse (km/h)": s.get("vitesse_kmh", "—"), "% VC": s.get("pct_vc", "—"),
+                    "Vitesse (km/h)": s.get("vitesse_kmh", "—"),
+                    "Allure": pace_of(s.get("vitesse_kmh")), "% VC": s.get("pct_vc", "—"),
                     "FC": s.get("hr", "—"),
                     "VE (L/min)": s.get("ve_lmin", "—"), "VCO₂ (L/min)": s["vco2_lmin"],
                     "VE/VCO₂": s.get("eqco2", "—"),
@@ -8121,7 +8206,7 @@ with main_tabs[1]:
                             _kcal_tot_i = _kcal_i
                         with _ec2b:
                             kpi_row([
-                                ("Intensité", f"{_pct_target:.0f} % VC", f"{_v_target:.2f} km/h"),
+                                ("Intensité", f"{_pct_target:.0f} % VC", fmt_kmh(_v_target)),
                                 ("Dépense totale", f"{_kcal_tot_i:.0f} kcal/h",
                                  f"≈ {_kcal_tot_i/max(0.1,_v_target):.0f} kcal/km · "
                                  f"dont {_kcal_i:.0f} kcal/h vus par le masque"),
@@ -8382,6 +8467,7 @@ with main_tabs[2]:
                         "Allure": pace_str(q["allure_s_km"]) + "/km" if q.get("allure_s_km") else "—",
                         "Δ allure": f"{q['derive_allure_pct']:+.1f} %" if q.get("derive_allure_pct") is not None else "—",
                         "VAP (km/h)": q.get("vap_kmh", "—"),
+                        "Allure VAP": pace_of(q.get("vap_kmh")),
                         "Δ VAP": f"{q['derive_vap_pct']:+.1f} %" if q.get("derive_vap_pct") is not None else "—",
                         "D+ (m)": q.get("d_plus", "—"), "D- (m)": q.get("d_moins", "—"),
                         "FC moy": q.get("fc_moy", "—"), "FC max": q.get("fc_max", "—"),
@@ -8444,14 +8530,14 @@ with main_tabs[2]:
                 _vc_ref = last_vc_ms(current_athlete_id()) if history_ready() else None
                 _by_dur = {r["duree_s"]: r for r in _records_tr}
                 kpi_row([(f"Best {d//60} min",
-                          f"{_by_dur[d]['vitesse_kmh']:.2f} km/h" if d in _by_dur else "—",
+                          (f"{_by_dur[d]['vitesse_kmh']:.2f} km/h" if d in _by_dur else "—"),
                           (pace_str(_by_dur[d]["allure_s_km"]) + "/km · " +
                            f"{_by_dur[d]['distance_m']:.0f} m") if d in _by_dur else "durée non atteinte")
                          for d in (300, 1200, 1800, 3600)])
                 st.pyplot(plot_records_curve(_records_tr, vc_ms=_vc_ref)); plt.close("all")
                 if _vc_ref:
                     st.caption(f"Repère : dernière vitesse critique enregistrée pour cet athlète — "
-                               f"{_vc_ref*3.6:.2f} km/h ({pace_str(1000.0/_vc_ref)}/km).")
+                               f"{fmt_kmh(_vc_ref*3.6)}.")
             else:
                 st.caption("Pas assez de données de distance pour calculer les temps de maintien.")
             # ── v9.2 : zones d'intensité calibrées sur la VITESSE CRITIQUE ──────
@@ -8462,6 +8548,7 @@ with main_tabs[2]:
                                            float((_vc_athlete or 3.9) * 3.6), 0.05, key="vc_zone_ref",
                                            help="Reprise du dernier test de VC enregistré pour l'athlète ; "
                                                 "modifiable ici pour une simulation.")
+            _vz1.caption(f"➜ {pace_of(_vc_manual)}")
             _vc_use = float(_vc_manual) / 3.6
             with _vz2:
                 _use_vap_zones = st.checkbox("Calculer sur la VAP (vitesse ramenée au plat) — recommandé en trail",
@@ -8606,9 +8693,9 @@ with main_tabs[2]:
                             st.caption(f"Point de bascule stable sur la sortie : {tz_tr['mid_start']:.0f} % "
                                        f"(1er tiers) → {tz_tr['mid_end']:.0f} % (dernier tiers).")
                     if wr_sum and wr_sum.get("walk_speed_med") and wr_sum.get("run_speed_med"):
-                        st.caption(f"Vitesse médiane en marche : **{wr_sum['walk_speed_med']:.1f} km/h** "
+                        st.caption(f"Vitesse médiane en marche : **{fmt_kmh(wr_sum['walk_speed_med'], 1)}** "
                                    f"(pente médiane {wr_sum['walk_grade_med']:.0f} %) · en course : "
-                                   f"**{wr_sum['run_speed_med']:.1f} km/h**.")
+                                   f"**{fmt_kmh(wr_sum['run_speed_med'], 1)}**.")
                 else:
                     st.caption("Pas assez de contraste course / marche sur cette sortie pour situer une zone de "
                                "transition (sortie trop roulante, ou cadence peu exploitable).")
@@ -8641,7 +8728,8 @@ with main_tabs[2]:
                          "Début (effort)": seconds_to_hms(p["t_start_s"]), "Durée": seconds_to_hms(p["dur_s"]),
                          "Dist (km)": round(p["dist_m"] / 1000.0, 2), "D+ (m)": round(p["d_plus"]),
                          "Pente méd. (%)": round(p["grade_med"], 1),
-                         "Vitesse (km/h)": round(p["speed_kmh"], 2), "VAP (km/h)": round(p["vap_kmh"], 2),
+                         "Vitesse (km/h)": round(p["speed_kmh"], 2), "Allure": pace_of(p["speed_kmh"]),
+                         "VAP (km/h)": round(p["vap_kmh"], 2), "Allure VAP": pace_of(p["vap_kmh"]),
                          "% réf. famille": round(p["index_pct"], 1)} for p in portions_tr]
                     _kpis = []
                     for _fam, _color, _pref in TERRAIN_FAMILIES:
@@ -8681,8 +8769,9 @@ with main_tabs[2]:
                             "D+ (m)": round(p["d_plus"]), "D- (m)": round(p["d_moins"]),
                             "Pente méd. (%)": round(p["grade_med"], 1),
                             "Vitesse réelle (km/h)": round(p["speed_kmh"], 2),
+                            "Allure réelle": pace_of(p["speed_kmh"]),
                             "Allure réelle": pace_str(3600.0 / max(0.1, p["speed_kmh"])) + "/km",
-                            "VAP (km/h)": round(p["vap_kmh"], 2),
+                            "VAP (km/h)": round(p["vap_kmh"], 2), "Allure VAP": pace_of(p["vap_kmh"]),
                             "VAP (allure)": pace_str(3600.0 / max(0.1, p["vap_kmh"])) + "/km",
                             "% réf. famille": round(p["index_pct"], 1),
                             "FC moy.": round(p["hr"]) if p.get("hr") else "—",
@@ -9287,7 +9376,7 @@ with main_tabs[4]:
 
         _last_vc = _vc[0] if _vc else None
         kpi_row([
-            ("Dernière VC", f"{_last_vc['vc_ms']*3.6:.2f} km/h" if (_last_vc and _last_vc.get("vc_ms")) else "—",
+            ("Dernière VC", fmt_kmh(_last_vc['vc_ms']*3.6) if (_last_vc and _last_vc.get("vc_ms")) else "—",
              f"{_last_vc['date']} · {pace_str(1000.0/_last_vc['vc_ms'])}/km" if (_last_vc and _last_vc.get("vc_ms")) else "aucun test enregistré"),
             ("Tests VC", str(len(_vc)), "évolution suivie dans le temps"),
             ("Séances", str(len(_wk)), "analyses trail & intervalles"),
@@ -9307,6 +9396,7 @@ with main_tabs[4]:
                 df_vc = pd.DataFrame([{
                     "Date": r["date"], "Test": r["label"] or "—",
                     "VC (km/h)": round(r["vc_ms"] * 3.6, 2) if r["vc_ms"] else None,
+                    "Allure VC": pace_of(r["vc_ms"] * 3.6) if r["vc_ms"] else "—",
                     "Allure VC": pace_str(1000.0 / r["vc_ms"]) + "/km" if r["vc_ms"] else "—",
                     "D' (m)": round(r["d_prime"]) if r["d_prime"] else None,
                     "R²": round(r["r2"], 3) if r["r2"] else None,
@@ -9326,7 +9416,7 @@ with main_tabs[4]:
                     for _xi, _r in zip(_x, _plot):
                         axa.annotate(f"{_r['vc_ms']*3.6:.2f}", xy=(_xi, _r["vc_ms"] * 3.6), xytext=(0, 9),
                                      textcoords="offset points", ha="center", fontsize=7.5, color=C_TEXT_MUT)
-                    axa.set_ylabel("VC (km/h)")
+                    axa.set_ylabel("VC (km/h)"); add_pace_axis(axa, "y")
                     chart_title(axa, "Évolution de la vitesse critique",
                                 f"{_aname} · {len(_plot)} tests enregistrés")
                     axb.plot(_x, [r["d_prime"] or 0 for r in _plot], "-o", color=C_WHITE, lw=1.8, ms=6,
@@ -9339,7 +9429,9 @@ with main_tabs[4]:
                     _days = max(1, (_x[-1] - _x[0]).days)
                     st.markdown(f'<div class="note-box note-red">Entre le <b>{_plot[0]["date"]}</b> et le '
                                 f'<b>{_plot[-1]["date"]}</b> ({_days} jours), la VC évolue de '
-                                f'<b>{_delta:+.2f} km/h</b> ({_delta/max(1e-6,_plot[0]["vc_ms"]*3.6)*100:+.1f} %).'
+                                f'<b>{_delta:+.2f} km/h</b> ({_delta/max(1e-6,_plot[0]["vc_ms"]*3.6)*100:+.1f} %), '
+                                f'soit une allure critique qui passe de <b>{pace_of(_plot[0]["vc_ms"]*3.6)}</b> '
+                                f'à <b>{pace_of(_plot[-1]["vc_ms"]*3.6)}</b>.'
                                 f'</div>', unsafe_allow_html=True)
                 else:
                     st.caption("Un second test enregistré fera apparaître la courbe d'évolution.")
@@ -9445,7 +9537,9 @@ with main_tabs[4]:
                     "Dérive FC": round(r["hr_drift"], 1) if r["hr_drift"] is not None else None,
                     "Z4+Z5 (min)": round(r["_z45"]) if r["_z45"] is not None else None,
                     "Best 10 min (km/h)": round(r["_v10"], 2) if r["_v10"] else None,
+                    "Best 10 min (allure)": pace_of(r["_v10"]),
                     "Best 30 min (km/h)": round(r["_v30"], 2) if r["_v30"] else None,
+                    "Best 30 min (allure)": pace_of(r["_v30"]),
                     "% marche": round(r["pct_walk"]) if r["pct_walk"] is not None else None,
                     "Bascule (%)": round(r["trans_mid"], 1) if r["trans_mid"] is not None else None,
                     "VAP montée fin (%)": round(r["vap_last_montee"]) if r["vap_last_montee"] is not None else None,
@@ -9564,6 +9658,7 @@ with main_tabs[4]:
                             "Allure": pace_str(q["allure_s_km"]) + "/km" if q.get("allure_s_km") else "—",
                             "Δ allure": f"{q['derive_allure_pct']:+.1f} %" if q.get("derive_allure_pct") is not None else "—",
                             "VAP (km/h)": q.get("vap_kmh", "—"),
+                        "Allure VAP": pace_of(q.get("vap_kmh")),
                             "Δ VAP": f"{q['derive_vap_pct']:+.1f} %" if q.get("derive_vap_pct") is not None else "—",
                             "D+ (m)": q.get("d_plus", "—"), "FC moy": q.get("fc_moy", "—"),
                             "Δ FC": f"{q['derive_fc_bpm']:+.0f}" if q.get("derive_fc_bpm") is not None else "—",
@@ -9715,6 +9810,7 @@ with main_tabs[4]:
                     "Paliers": r["n_paliers"],
                     "Masse (kg)": round(r["mass_kg"], 1) if r["mass_kg"] else None,
                     "VC (km/h)": round(r["vc_ms"] * 3.6, 2) if r["vc_ms"] else None,
+                    "Allure VC": pace_of(r["vc_ms"] * 3.6) if r["vc_ms"] else "—",
                     "FatMax (g/min)": round(r["fatmax_g_min"], 2) if r["fatmax_g_min"] else None,
                     "FatMax (% VC)": round(r["fatmax_pct_vc"]) if r["fatmax_pct_vc"] else None,
                     "Économie (kcal/kg/km)": round(r["eco_kcal_kg_km"], 3) if r["eco_kcal_kg_km"] else None,
@@ -9767,6 +9863,7 @@ with main_tabs[4]:
                         st.markdown("**Paliers enregistrés**")
                         st.dataframe(pd.DataFrame([{
                             "Palier": x["palier"], "Vitesse (km/h)": x.get("vitesse_kmh", "—"),
+                            "Allure": pace_of(x.get("vitesse_kmh")),
                             "% VC": x.get("pct_vc", "—"), "FC": x.get("hr", "—"), "RER": x.get("rer"),
                             "Glucides (g/min)": f"{x['cho_g_min']:.2f} [{x['cho_lo']:.2f}–{x['cho_hi']:.2f}]",
                             "Lipides (g/min)": f"{x['fat_g_min']:.2f} [{x['fat_lo']:.2f}–{x['fat_hi']:.2f}]",
@@ -9777,7 +9874,7 @@ with main_tabs[4]:
                         st.markdown("**Plan nutritionnel enregistré**")
                         st.dataframe(pd.DataFrame([{
                             "Zone": x["zone"], "% VC": f"{x['pct_lo']:.0f}–{x['pct_hi']:.0f} %",
-                            "Vitesse (km/h)": x.get("vitesse_kmh"),
+                            "Vitesse (km/h)": x.get("vitesse_kmh"), "Allure": pace_of(x.get("vitesse_kmh")),
                             "kcal/h": x.get("kcal_h"),
                             "Glucides oxydés (g/h)": f"{x['cho_g_h']} [{x['cho_g_h_lo']}–{x['cho_g_h_hi']}]",
                             "Apport conseillé (g/h)": x["apport_g_h"], "Déficit (g/h)": x["deficit_g_h"],
