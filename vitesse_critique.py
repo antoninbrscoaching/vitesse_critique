@@ -1687,6 +1687,211 @@ def compute_vc(distances_m,durations_s):
     slope,intercept,r,p,se=sp_stats.linregress(T,D)
     return float(slope),float(intercept),float(r**2)
 
+# ══════════════════════════════════════════════════════════════════════════
+# D′ BALANCE — dépense et reconstitution de la réserve anaérobie
+# ══════════════════════════════════════════════════════════════════════════
+# Le modèle à deux paramètres (VC, D′) dit combien de mètres on peut courir
+# AU-DESSUS de la vitesse critique, mais il ne dit rien du temps qu'il faut
+# pour les récupérer. C'est pourtant ce qui décide si une séance de fractionné
+# tient debout ou casse à la 6ᵉ répétition.
+#
+#   • Au-dessus de VC : D′ se vide au rythme (v − VC), en mètres par seconde.
+#     Temps de maintien = D′bal / (v − VC). C'est de l'arithmétique, pas un modèle.
+#   • En dessous de VC : D′ se reconstitue de façon exponentielle, avec une
+#     constante de temps τ qui dépend de l'intensité de la récupération —
+#     plus on court vite en récup, plus τ est long (Skiba et al. 2012, 2015).
+#
+# τ est le seul paramètre incertain du modèle. Il est donc : (a) affiché,
+# (b) réglable, (c) calibrable sur une séance réellement observée.
+DPRIME_TAU_CP_REF_W = 250.0       # puissance critique de référence pour transposer
+DPRIME_TAU_A = 546.0              # τ = A·exp(−0.01·ΔP) + B   (Skiba 2012)
+DPRIME_TAU_B = 316.0
+
+def dprime_tau(v_rec_kmh, cs_kmh, tau_override=None):
+    """Constante de temps de reconstitution de D′, en secondes, pour une vitesse
+    de récupération donnée. Transposition de la forme empirique de Skiba (établie
+    en watts sur cycliste) au coureur, via le déficit RELATIF d'intensité :
+    ΔP ≈ CP_réf × (1 − v_récup / VC). À récupération complète τ ≈ 360 s ; juste
+    sous la VC, τ dépasse 800 s — autrement dit on ne récupère quasiment plus."""
+    if tau_override:
+        return float(tau_override)
+    if not cs_kmh or cs_kmh <= 0:
+        return DPRIME_TAU_A + DPRIME_TAU_B
+    r = float(np.clip(float(v_rec_kmh) / float(cs_kmh), 0.0, 1.0))
+    d_cp = DPRIME_TAU_CP_REF_W * (1.0 - r)
+    return float(DPRIME_TAU_A * math.exp(-0.01 * d_cp) + DPRIME_TAU_B)
+
+def dprime_recovery_table(d_prime, cs_kmh, v_rec_kmh, fractions=(0.25, 0.50, 0.63, 0.75, 0.90, 0.95),
+                          depart_pct=0.0, tau_override=None):
+    """Temps nécessaire pour remonter D′ jusqu'à X % de sa valeur pleine, à une
+    intensité de récupération donnée. Part de `depart_pct` % de D′ (0 = vidé)."""
+    tau = dprime_tau(v_rec_kmh, cs_kmh, tau_override)
+    b0 = float(np.clip(depart_pct, 0.0, 99.0)) / 100.0
+    rows = []
+    for f in fractions:
+        if f <= b0 + 1e-9:
+            rows.append({"cible_pct": round(f * 100), "temps_s": 0.0, "atteignable": True,
+                         "metres": round(float(d_prime) * f)})
+            continue
+        # D′bal(t) = D′ − (D′ − D′bal0)·e^(−t/τ)  ⇒  t = −τ·ln((1−f)/(1−b0))
+        t = -tau * math.log((1.0 - f) / (1.0 - b0))
+        rows.append({"cible_pct": round(f * 100), "temps_s": float(t), "atteignable": True,
+                     "metres": round(float(d_prime) * f)})
+    return rows, {"tau_s": round(tau, 1), "v_rec_kmh": float(v_rec_kmh),
+                  "pct_vc": round(float(v_rec_kmh) / float(cs_kmh) * 100.0, 1) if cs_kmh else None,
+                  "depart_pct": round(b0 * 100, 1)}
+
+def simulate_dprime(segments, cs_ms, d_prime, tau_override=None, dt=1.0, d_start=None):
+    """Déroule D′bal seconde par seconde sur une suite de segments
+    [{'v_ms':…, 'duree_s':…, 'label':…}, …]. Retourne la trace complète et le
+    moment d'épuisement s'il y en a un."""
+    cs = float(cs_ms); dp = float(d_prime)
+    if cs <= 0 or dp <= 0:
+        return None
+    bal = float(dp if d_start is None else d_start)
+    t = 0.0
+    ts, bals, labels = [0.0], [bal], []
+    epuisement = None
+    cs_kmh = cs * 3.6
+    for seg in segments:
+        v = float(seg["v_ms"]); n = int(round(float(seg["duree_s"]) / dt))
+        tau = dprime_tau(v * 3.6, cs_kmh, tau_override)
+        t_seg0 = t
+        for _ in range(max(0, n)):
+            if v > cs:
+                bal -= (v - cs) * dt
+            else:
+                bal += (dp - bal) / max(1e-6, tau) * dt
+            bal = float(np.clip(bal, 0.0, dp))
+            t += dt
+            ts.append(t); bals.append(bal)
+            if bal <= 1e-6 and epuisement is None and v > cs:
+                epuisement = {"t_s": t, "label": seg.get("label", ""), "segment": len(labels) + 1}
+        labels.append({"label": seg.get("label", ""), "t0": t_seg0, "t1": t,
+                       "v_ms": v, "au_dessus_vc": bool(v > cs)})
+    return {"t": np.array(ts), "bal": np.array(bals), "segments": labels,
+            "d_prime": dp, "cs_ms": cs, "epuisement": epuisement,
+            "bal_final": bals[-1], "bal_min": float(np.min(bals)),
+            "bal_min_pct": round(float(np.min(bals)) / dp * 100.0, 1)}
+
+def interval_segments(n_reps, v_work_kmh, t_work_s, v_rec_kmh, t_rec_s,
+                      grade_work=0.0, grade_rec=0.0, derniere_recup=False):
+    """Construit la suite de segments d'une séance de fractionné. Les pentes sont
+    ramenées à leur équivalent plat (VAP) : le modèle D′ raisonne en vitesse plate."""
+    segs = []
+    vw = float(v_work_kmh) / 3.6 * vap_cost_ratio(float(grade_work))
+    vr = float(v_rec_kmh) / 3.6 * vap_cost_ratio(float(grade_rec))
+    for i in range(int(n_reps)):
+        segs.append({"v_ms": vw, "duree_s": float(t_work_s), "label": f"Rep {i+1}"})
+        if i < int(n_reps) - 1 or derniere_recup:
+            segs.append({"v_ms": vr, "duree_s": float(t_rec_s), "label": f"Récup {i+1}"})
+    return segs
+
+def solve_recovery_duration(n_reps, v_work_kmh, t_work_s, v_rec_kmh, cs_ms, d_prime,
+                            grade_work=0.0, grade_rec=0.0, tau_override=None,
+                            marge_pct=5.0, t_max_s=1800.0):
+    """Durée de récupération MINIMALE pour boucler la séance sans vider D′ (avec
+    une marge de sécurité). Recherche par dichotomie sur la simulation."""
+    def _ok(t_rec):
+        sim = simulate_dprime(interval_segments(n_reps, v_work_kmh, t_work_s, v_rec_kmh, t_rec,
+                                                grade_work, grade_rec),
+                              cs_ms, d_prime, tau_override)
+        return sim is not None and sim["bal_min"] >= d_prime * marge_pct / 100.0
+    if _ok(0.0):
+        return 0.0
+    if not _ok(t_max_s):
+        return None
+    lo, hi = 0.0, float(t_max_s)
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        if _ok(mid):
+            hi = mid
+        else:
+            lo = mid
+    return round(hi)
+
+def calibrate_tau(n_reps_reussies, v_work_kmh, t_work_s, v_rec_kmh, t_rec_s, cs_ms, d_prime,
+                  grade_work=0.0, grade_rec=0.0):
+    """Cale τ sur une séance réellement observée : « il a tenu N répétitions puis a
+    lâché ». C'est la seule façon honnête de personnaliser la reconstitution —
+    la valeur théorique n'est qu'un point de départ."""
+    if not n_reps_reussies or n_reps_reussies < 2:
+        return None
+    def _reps_tenues(tau):
+        sim = simulate_dprime(interval_segments(int(n_reps_reussies) + 3, v_work_kmh, t_work_s,
+                                                v_rec_kmh, t_rec_s, grade_work, grade_rec),
+                              cs_ms, d_prime, tau_override=tau)
+        if sim is None:
+            return None
+        if sim["epuisement"] is None:
+            return int(n_reps_reussies) + 3
+        return max(1, int(math.ceil(sim["epuisement"]["segment"] / 2.0)))
+    lo, hi = 60.0, 2400.0
+    best = None
+    for _ in range(45):
+        mid = (lo + hi) / 2.0
+        r = _reps_tenues(mid)
+        if r is None:
+            return None
+        if r >= int(n_reps_reussies):
+            lo = mid           # τ plus grand = récup plus lente = moins de reps
+        else:
+            hi = mid
+        best = mid
+    tau = round(lo)
+    _borne = (tau <= 65) or (tau >= 2390)
+    return {"tau_s": tau, "tau_theorique_s": round(dprime_tau(v_rec_kmh, cs_ms * 3.6), 1),
+            "reps_verifiees": _reps_tenues(lo), "bute_sur_borne": bool(_borne),
+            "ecart_vs_theorie_pct": round((tau / max(1e-6, dprime_tau(v_rec_kmh, cs_ms * 3.6)) - 1) * 100.0)}
+
+def dprime_plausibilite(d_prime, cs_kmh=None):
+    """D′ typique d'un coureur : 100 à 400 m (150-250 m chez la plupart des adultes
+    entraînés). En dehors, ce n'est presque jamais la physiologie : c'est que l'un
+    des deux tests de référence n'était pas maximal."""
+    if not d_prime:
+        return None
+    d = float(d_prime)
+    if d < 100:
+        return (f"D′ = {d:.0f} m, très bas (l'usuel va de 100 à 400 m). Cela veut dire que le test COURT "
+                f"n'était pas assez rapide par rapport au long : la droite distance-temps passe presque par "
+                f"l'origine. Toutes les simulations de fractionné qui suivent en héritent — elles annonceront "
+                f"un épuisement irréaliste dès les premières répétitions. Refais un test court vraiment "
+                f"maximal (2 à 4 min) avant de t'appuyer dessus.")
+    if d > 450:
+        return (f"D′ = {d:.0f} m, très élevé (l'usuel va de 100 à 400 m). Le test LONG était probablement "
+                f"sous-maximal, ou le court exceptionnellement bon : la VC est alors sous-estimée et D′ "
+                f"gonflé d'autant.")
+    return None
+
+def plot_dprime_balance(sim, titre="Réserve anaérobie D′ au fil de la séance"):
+    """Trace D′bal seconde par seconde : les creux sont les répétitions, les
+    remontées les récupérations. Toucher zéro, c'est l'arrêt."""
+    if not sim:
+        return None
+    fig, ax = plt.subplots(figsize=(11.5, 3.8))
+    t_min = sim["t"] / 60.0
+    pct = sim["bal"] / sim["d_prime"] * 100.0
+    for s in sim["segments"]:
+        if s["au_dessus_vc"]:
+            ax.axvspan(s["t0"] / 60.0, s["t1"] / 60.0, color=C_RED, alpha=0.10, linewidth=0)
+    ax.plot(t_min, pct, color=C_RED, lw=2)
+    ax.fill_between(t_min, 0, pct, color=C_RED, alpha=0.13, linewidth=0)
+    ax.axhline(100, color=C_TEXT_MUT, lw=1, ls=":")
+    if sim.get("epuisement"):
+        ax.axvline(sim["epuisement"]["t_s"] / 60.0, color=C_RED_SOFT, lw=1.6, ls="--")
+        ax.annotate(f"épuisement — {sim['epuisement']['label']}",
+                    xy=(sim["epuisement"]["t_s"] / 60.0, 50), xytext=(8, 0),
+                    textcoords="offset points", fontsize=8.5, color=C_RED_SOFT, va="center")
+    ax.set_ylim(0, 108)
+    ax.set_xlabel("Temps (min)"); ax.set_ylabel("D′ disponible (%)")
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _p: f"{v:.0f} %"))
+    chart_title(ax, titre,
+                f"D′ = {sim['d_prime']:.0f} m · minimum atteint {sim['bal_min_pct']:.0f} % · "
+                + ("séance bouclée" if not sim.get("epuisement") else "séance non tenable en l'état")
+                + " — bandes rouges : répétitions au-dessus de la vitesse critique")
+    fig.tight_layout()
+    return fig
+
 def check_vc_references(refs):
     """Contrôles de cohérence AVANT de croire la régression. Le modèle D' est une
     droite entre deux points : une référence aberrante ne casse rien visiblement,
@@ -7197,6 +7402,150 @@ with main_tabs[1]:
         df_holding = build_holding_table(vc_ms, d_prime, refs_fit_vc, K_r)
         if not df_holding.empty:
             st.dataframe(df_holding, use_container_width=True, hide_index=True)
+
+        # ══ v9.8 : D′ balance — dépense et reconstitution de la réserve ══════
+        st.markdown("---")
+        st.subheader("🔋 Réserve anaérobie D′ — dépense et reconstitution")
+        st.markdown(
+            '<div class="note-box">Le modèle VC/D′ dit combien de mètres tu peux courir '
+            '<b>au-dessus</b> de la vitesse critique, mais rien sur le temps qu\'il faut pour les '
+            'récupérer. C\'est pourtant ça qui décide si une séance de fractionné tient debout.<br>'
+            '• <b>Au-dessus de VC</b> : D′ se vide de (v − VC) mètres par seconde. '
+            'Temps de maintien = D′ restant ÷ (v − VC). C\'est de l\'arithmétique.<br>'
+            '• <b>En dessous de VC</b> : D′ se reconstitue de façon exponentielle, avec une constante '
+            'de temps τ qui s\'allonge quand la récup est rapide. τ est le seul paramètre incertain : '
+            'il est affiché, réglable, et calibrable sur une séance réellement observée.</div>',
+            unsafe_allow_html=True)
+        _dp_alerte = dprime_plausibilite(d_prime, vc_ms * 3.6)
+        if _dp_alerte:
+            st.warning(f"⚠️ {_dp_alerte}")
+
+        _dt1, _dt2, _dt3 = st.columns([1, 1, 1])
+        _v_rec = _dt1.number_input("Vitesse de récupération (km/h)", 0.0, float(vc_ms * 3.6),
+                                   float(round(vc_ms * 3.6 * 0.55, 1)), 0.5, key="dp_v_rec",
+                                   help="0 = arrêt complet. Plus la récup est rapide, plus D′ met "
+                                        "longtemps à se reconstituer.")
+        _dp_start = _dt2.slider("D′ restant au départ de la récup (%)", 0, 95, 0, 5, key="dp_start")
+        _tau_mode = _dt3.radio("Constante de temps τ", ["Modèle", "Saisir τ"], key="dp_tau_mode",
+                               horizontal=True)
+        _tau_over = None
+        if _tau_mode == "Saisir τ":
+            _tau_over = st.number_input("τ (secondes)", 30.0, 2400.0,
+                                        float(round(dprime_tau(_v_rec, vc_ms * 3.6))), 10.0,
+                                        key="dp_tau_val",
+                                        help="Calibre-le sur une séance réelle avec l'outil plus bas.")
+
+        _rows_rec, _info_rec = dprime_recovery_table(d_prime, vc_ms * 3.6, _v_rec,
+                                                    depart_pct=float(_dp_start), tau_override=_tau_over)
+        kpi_row([
+            ("D′ total", f"{d_prime:.0f} m",
+             f"soit {seconds_to_hms(d_prime / max(0.01, (vc_ms * 1.05) - vc_ms))} à 105 % de VC"),
+            ("Récup à", f"{_v_rec:.1f} km/h",
+             f"{_info_rec['pct_vc']:.0f} % de la VC" + (f" · {pace_str(3600.0/_v_rec)}/km" if _v_rec > 0.3
+                                                        else " · arrêt complet")),
+            ("τ — constante de temps", f"{_info_rec['tau_s']/60:.1f} min",
+             f"{_info_rec['tau_s']:.0f} s" + (" (saisi)" if _tau_over else " (modèle)")),
+            ("Demi-vie", f"{_info_rec['tau_s']*0.693/60:.1f} min",
+             "temps pour récupérer la moitié de ce qui manque"),
+        ])
+        st.dataframe(pd.DataFrame([{
+            "Cible": f"{r['cible_pct']} % de D′",
+            "Soit": f"{r['metres']} m",
+            "Temps de récup nécessaire": seconds_to_hms(r["temps_s"]),
+            "Ce que ça permet ensuite": (
+                f"{r['metres'] / max(0.01, (vc_ms*1.10 - vc_ms)):.0f} s à 110 % de VC "
+                f"({pace_str(3600.0/(vc_ms*3.6*1.10))}/km)"),
+        } for r in _rows_rec]), use_container_width=True, hide_index=True)
+        st.caption("Lecture : la reconstitution est exponentielle, donc les premiers pourcents reviennent "
+                   "vite et les derniers coûtent très cher. Récupérer 95 % de D′ prend trois fois plus "
+                   "longtemps que d'en récupérer 63 %.")
+
+        # ── simulateur de séance ─────────────────────────────────────────
+        st.markdown("##### 🎽 Simuler une séance de fractionné")
+        _s1, _s2, _s3, _s4 = st.columns(4)
+        _n_reps = _s1.number_input("Répétitions", 1, 40, 8, 1, key="dp_n")
+        _v_work = _s2.number_input("Vitesse d'effort (km/h)", float(vc_ms * 3.6 * 0.8), 35.0,
+                                   float(round(vc_ms * 3.6 * 1.12, 1)), 0.1, key="dp_vw")
+        _mode_dur = _s3.radio("Durée définie par", ["Distance", "Temps"], key="dp_mode", horizontal=True)
+        if _mode_dur == "Distance":
+            _d_work = _s4.number_input("Distance d'effort (m)", 50.0, 5000.0, 400.0, 50.0, key="dp_dw")
+            _t_work = _d_work / max(0.1, _v_work / 3.6)
+        else:
+            _t_work = _s4.number_input("Durée d'effort (s)", 10.0, 1800.0, 90.0, 5.0, key="dp_tw")
+            _d_work = _t_work * _v_work / 3.6
+        _r1, _r2, _r3 = st.columns(3)
+        _t_rec = _r1.number_input("Durée de récup (s)", 5.0, 1800.0, 90.0, 5.0, key="dp_tr")
+        _g_work = _r2.number_input("Pente à l'effort (%)", -20.0, 30.0, 0.0, 0.5, key="dp_gw",
+                                   help="Ramenée à son équivalent plat (VAP) avant simulation.")
+        _g_rec = _r3.number_input("Pente en récup (%)", -20.0, 30.0, 0.0, 0.5, key="dp_gr")
+        st.caption(f"Effort : {_d_work:.0f} m en {seconds_to_hms(_t_work)} "
+                   f"({pace_str(3600.0/_v_work)}/km, {_v_work/(vc_ms*3.6)*100:.0f} % de la VC)"
+                   + (f" — équivalent plat {_v_work*vap_cost_ratio(_g_work):.1f} km/h" if _g_work else "")
+                   + f" · récup {seconds_to_hms(_t_rec)} à {_v_rec:.1f} km/h.")
+
+        _segs = interval_segments(int(_n_reps), _v_work, _t_work, _v_rec, _t_rec, _g_work, _g_rec)
+        _sim = simulate_dprime(_segs, vc_ms, d_prime, tau_override=_tau_over)
+        if _sim:
+            _fig_dp = plot_dprime_balance(_sim)
+            if _fig_dp is not None:
+                st.pyplot(_fig_dp); plt.close("all")
+            if _sim["epuisement"]:
+                _rep_ko = _sim["epuisement"]["label"]
+                _tmin = solve_recovery_duration(int(_n_reps), _v_work, _t_work, _v_rec,
+                                                vc_ms, d_prime, _g_work, _g_rec, _tau_over)
+                st.error(
+                    f"🚨 D′ tombe à zéro pendant **{_rep_ko}**, à {_sim['epuisement']['t_s']/60:.1f} min : "
+                    f"la séance n'est pas tenable telle quelle."
+                    + (f" Pour boucler les {int(_n_reps)} répétitions, il faudrait porter la récup à "
+                       f"**{seconds_to_hms(_tmin)}** (au lieu de {seconds_to_hms(_t_rec)})."
+                       if _tmin else
+                       " Même 30 min de récup entre les répétitions n'y suffiraient pas : c'est la vitesse "
+                       "d'effort ou la longueur des répétitions qu'il faut revoir."))
+            else:
+                st.success(f"✅ Séance bouclée — D′ descend au plus bas à **{_sim['bal_min_pct']:.0f} %** "
+                           f"({_sim['bal_min']:.0f} m restants) et termine à "
+                           f"{_sim['bal_final']/d_prime*100:.0f} %."
+                           + ("  Marge très confortable : la séance est probablement trop facile pour "
+                              "solliciter la filière anaérobie." if _sim["bal_min_pct"] > 55 else
+                              "  Sollicitation franche sans rupture — c'est le dosage recherché."
+                              if _sim["bal_min_pct"] > 12 else
+                              "  Séance sur le fil : la moindre baisse de forme la fait basculer."))
+            _tot_h = _sim["t"][-1]
+            st.caption(f"Durée totale {seconds_to_hms(_tot_h)} · "
+                       f"{int(_n_reps)} × {_d_work:.0f} m = {int(_n_reps)*_d_work/1000:.2f} km d'effort "
+                       f"· D′ dépensé par répétition ≈ "
+                       f"{max(0.0, (_v_work/3.6*vap_cost_ratio(_g_work) - vc_ms))*_t_work:.0f} m.")
+
+        # ── calibration de τ sur une séance observée ─────────────────────
+        with st.expander("🎯 Calibrer τ sur une séance réellement observée"):
+            st.caption("La valeur théorique de τ vient d'un modèle établi sur cyclistes, transposé au "
+                       "coureur. Si tu as vu un athlète lâcher à une répétition précise sur la séance "
+                       "ci-dessus, l'app peut en déduire SON τ — c'est la seule personnalisation honnête.")
+            _cc1, _cc2 = st.columns([1, 2])
+            _reps_ok = _cc1.number_input("Répétitions réellement tenues", 2, 40, 6, 1, key="dp_cal_n")
+            if _cc2.button("Calibrer τ sur cette observation", key="dp_cal_btn"):
+                _cal = calibrate_tau(int(_reps_ok), _v_work, _t_work, _v_rec, _t_rec,
+                                     vc_ms, d_prime, _g_work, _g_rec)
+                if not _cal:
+                    st.warning("Calibration impossible avec ces paramètres.")
+                elif _cal["bute_sur_borne"]:
+                    st.error(
+                        f"Aucune valeur de τ ne reproduit {int(_reps_ok)} répétitions dans ces conditions "
+                        f"(la recherche bute sur {_cal['tau_s']} s). Concrètement, le modèle n'explique pas "
+                        f"la performance observée : le plus probable est que D′ ({d_prime:.0f} m) ou la VC "
+                        f"soient faux — vérifie d'abord les deux tests de référence.")
+                else:
+                    st.success(
+                        f"τ calibré à **{_cal['tau_s']} s** ({_cal['tau_s']/60:.1f} min) contre "
+                        f"{_cal['tau_theorique_s']:.0f} s en théorie, soit "
+                        f"{_cal['ecart_vs_theorie_pct']:+d} %. "
+                        + ("Cet athlète récupère plus VITE que le modèle générique."
+                           if _cal["ecart_vs_theorie_pct"] < -10 else
+                           "Cet athlète récupère plus LENTEMENT que le modèle générique."
+                           if _cal["ecart_vs_theorie_pct"] > 10 else
+                           "Le modèle générique lui va bien.")
+                        + f" Reporte {_cal['tau_s']} s dans « Saisir τ » pour que toutes les simulations "
+                          f"l'utilisent.")
 
         st.subheader("📈 Courbe vitesse-endurance")
         fig_vc, ax_vc = plt.subplots(figsize=(11, 4))
