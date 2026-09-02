@@ -91,9 +91,19 @@ import streamlit as st
 import math
 import re
 import gpxpy
-from fitparse import FitFile
+
+# ── v10.1 : dépendances optionnelles ─────────────────────────────────────
+# Trois bibliothèques n'étaient pas indispensables mais étaient importées en
+# dur : si l'une manquait sur la machine d'hébergement, l'app entière refusait
+# de démarrer. Elles sont maintenant facultatives, avec une dégradation propre.
 try:
-    import fitdecode
+    from fitparse import FitFile          # lecteur FIT n°1 (pas de wheel sur PyPI)
+    HAS_FITPARSE = True
+except Exception:
+    FitFile = None
+    HAS_FITPARSE = False
+try:
+    import fitdecode                       # lecteur FIT n°2 — pur Python, suffit à tout
     HAS_FITDECODE = True
 except ImportError:
     HAS_FITDECODE = False
@@ -101,13 +111,23 @@ except ImportError:
 from datetime import datetime, timedelta, date, time
 import pandas as pd
 import numpy as np
-import pydeck as pdk
+try:
+    import pydeck as pdk                    # cartes : agrément, jamais un calcul
+    HAS_PYDECK = True
+except Exception:
+    pdk = None
+    HAS_PYDECK = False
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import xml.etree.ElementTree as ET
-import requests
+try:
+    import requests                         # météo en ligne ; sans elle, modèle diurne interne
+    HAS_REQUESTS = True
+except Exception:
+    requests = None
+    HAS_REQUESTS = False
 import io
 import os
 import glob
@@ -662,6 +682,8 @@ def _fetch_openmeteo_forecast(lat, lon, tz_name):
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
                "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
                f"&forecast_days=16&timezone={tz_name}")
+        if not HAS_REQUESTS:
+            return None
         r = requests.get(url, timeout=12)
         if r.status_code != 200: return None
         d = r.json()
@@ -678,6 +700,8 @@ def _fetch_openmeteo_archive(lat, lon, date_str, tz_name):
                f"&start_date={date_str}&end_date={date_str}"
                "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
                f"&timezone={tz_name}")
+        if not HAS_REQUESTS:
+            return None
         r = requests.get(url, timeout=12)
         if r.status_code != 200: return None
         d = r.json()
@@ -695,6 +719,8 @@ def _fetch_openmeteo_histforecast(lat, lon, date_str, tz_name):
                f"&start_date={date_str}&end_date={date_str}"
                "&hourly=temperature_2m,relativehumidity_2m,wind_speed_10m,wind_direction_10m"
                f"&timezone={tz_name}")
+        if not HAS_REQUESTS:
+            return None
         r = requests.get(url, timeout=12)
         if r.status_code != 200: return None
         d = r.json()
@@ -873,7 +899,10 @@ def _fit_read_bytes(file):
     return data
 
 def _fit_extract_fitparse(raw_bytes):
-    """Extraction via fitparse (moteur historique de l'app)."""
+    """Extraction via fitparse (moteur historique de l'app). Absent, on bascule
+    silencieusement sur fitdecode, qui lit les mêmes fichiers."""
+    if not HAS_FITPARSE:
+        raise RuntimeError("fitparse non installé")
     fit = FitFile(io.BytesIO(raw_bytes))
     fit.parse()
     records, times_pts, hr_records = [], [], []
@@ -1944,6 +1973,302 @@ def plot_dprime_balance(sim, titre="Réserve anaérobie D′ au fil de la séanc
     fig.tight_layout()
     return fig
 
+# ══════════════════════════════════════════════════════════════════════════
+# AUDIT DE COHÉRENCE — ce qu'il faut corriger EN PREMIER
+# ══════════════════════════════════════════════════════════════════════════
+# Tous les chiffres de l'app descendent de quelques tests. Quand l'un d'eux est
+# faux, l'erreur ne s'annonce pas : elle se propage en silence dans la VC, D′,
+# les zones, la nutrition, les simulations de séance. L'audit remonte la chaîne
+# et classe les problèmes par ce qu'ils CONTAMINENT, pas par ordre d'apparition.
+AUDIT_GRAVITES = {"bloquant": 3, "important": 2, "mineur": 1, "ok": 0}
+# Vocabulaire FERMÉ des sorties contaminables : sans ça, une même chose apparaît
+# sous deux noms et se retrouve à la fois dans « contaminé » et dans « sain ».
+AUDIT_SORTIES = ["VC", "D′", "Zones", "Prédictions", "Allures des seuils",
+                 "Substrats", "Économie", "Nutrition", "Séances"]
+
+def _phrase1(txt):
+    """Première phrase d'un message, sans couper sur les décimales."""
+    t = str(txt or "").strip()
+    for i in range(len(t) - 1):
+        if t[i] == "." and (i + 1 >= len(t) or t[i + 1] in " \n"):
+            return t[:i + 1]
+    return t
+DPRIME_PLAUSIBLE = (120.0, 400.0)      # fourchette usuelle chez le coureur adulte entraîné
+
+def _audit_num(x, d=None):
+    """Conversion numérique tolérante. Nom volontairement long : un helper appelé
+    `_f` au niveau module se fait écraser par la première variable de boucle `_f`
+    d'un bloc Streamlit — c'est déjà arrivé deux fois dans ce fichier."""
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else d
+    except (TypeError, ValueError):
+        return d
+
+def audit_references(refs, vc_ms=None, d_prime=None, r2=None):
+    """Contrôles sur les tests de terrain — la racine de toute la chaîne."""
+    out = []
+    pts = [r for r in (refs or []) if _audit_num(r.get("distance"), 0) > 0 and _audit_num(r.get("temps"), 0) > 0]
+    if len(pts) < 2:
+        out.append({"id": "REF_NB", "gravite": "bloquant", "domaine": "Tests de référence",
+                    "titre": "Moins de deux références exploitables",
+                    "constat": f"{len(pts)} référence(s) renseignée(s).",
+                    "consequence": "Aucune vitesse critique n'est calculable.",
+                    "action": "Importe deux efforts maximaux : un court (2-4 min) et un long (12-30 min).",
+                    "contamine": ["VC", "D′", "Zones", "Prédictions", "Nutrition", "Séances"]})
+        return out
+    pts = sorted(pts, key=lambda r: r["temps"])
+    court, long_ = pts[0], pts[-1]
+    t1, t2 = float(court["temps"]), float(long_["temps"])
+    d1, d2 = float(court["distance"]), float(long_["distance"])
+    v1, v2 = d1 / t1 * 3.6, d2 / t2 * 3.6
+
+    # 1) durées trop rapprochées : la pente est mal contrainte
+    ratio = t2 / max(1e-6, t1)
+    if ratio < 3.0:
+        out.append({"id": "REF_RATIO",
+                    "gravite": "bloquant" if ratio < 2.0 else "important",
+                    "domaine": "Tests de référence",
+                    "titre": f"Durées trop proches (rapport {ratio:.1f})",
+                    "constat": f"{seconds_to_hms(t1)} et {seconds_to_hms(t2)}.",
+                    "consequence": "La droite distance-temps s'appuie sur deux points voisins : une "
+                                   "seconde d'écart sur l'un déplace fortement l'asymptote, donc la VC.",
+                    "action": "Vise un rapport d'au moins 3 : par exemple 3 min et 15 min, ou 4 min et 20 min.",
+                    "contamine": ["VC", "D′", "Zones", "Séances"]})
+
+    # 2) test court sous-maximal — détecté par un D′ anormalement bas
+    dp = _audit_num(d_prime)
+    if dp is not None and vc_ms:
+        if dp < DPRIME_PLAUSIBLE[0]:
+            dp_cible = 200.0
+            cs_c = (d2 - dp_cible) / t2                      # VC qu'impliquerait un D′ normal
+            d1_c = cs_c * t1 + dp_cible                      # distance attendue sur le test court
+            v1_c = d1_c / t1 * 3.6
+            out.append({"id": "REF_COURT", "gravite": "bloquant",
+                        "domaine": "Tests de référence",
+                        "titre": f"Le test court n'était pas maximal (D′ = {dp:.0f} m)",
+                        "constat": f"D′ = {dp:.0f} m, très en dessous de la fourchette usuelle "
+                                   f"({DPRIME_PLAUSIBLE[0]:.0f}-{DPRIME_PLAUSIBLE[1]:.0f} m). "
+                                   f"Ton {seconds_to_hms(t1)} à {fmt_kmh(v1)} n'est que "
+                                   f"{(v1/v2-1)*100:.0f} % plus rapide que ton {seconds_to_hms(t2)} "
+                                   f"à {fmt_kmh(v2)}.",
+                        "consequence": "La droite distance-temps passe presque par l'origine : la VC est "
+                                       "tirée vers le haut (elle colle au test long) et D′ est écrasé. "
+                                       "Tout ce qui compare quelque chose à la VC en hérite — d'où un VT2 "
+                                       "qui paraît trop bas et des séances de fractionné qui cassent dès "
+                                       "les premières répétitions.",
+                        "action": f"Refais le test court à fond. Pour un D′ normal (~200 m), il faudrait "
+                                  f"couvrir environ {d1_c:.0f} m en {seconds_to_hms(t1)}, soit "
+                                  f"{fmt_kmh(v1_c)} — contre {d1:.0f} m ({pace_of(v1)}) cette fois. "
+                                  f"Départ lancé, sur piste, à l'épuisement.",
+                        "contamine": ["VC", "D′", "Zones", "Zones", "Séances", "Prédictions"]})
+        elif dp > DPRIME_PLAUSIBLE[1]:
+            out.append({"id": "REF_LONG", "gravite": "important",
+                        "domaine": "Tests de référence",
+                        "titre": f"Le test long n'était probablement pas maximal (D′ = {dp:.0f} m)",
+                        "constat": f"D′ = {dp:.0f} m, au-dessus de la fourchette usuelle.",
+                        "consequence": "La VC est sous-estimée : les zones et les prédictions longues "
+                                       "seront trop lentes.",
+                        "action": f"Refais l'effort long ({seconds_to_hms(t2)}) en vrai contre-la-montre, "
+                                  f"sur parcours plat et sans relance.",
+                        "contamine": ["VC", "D′", "Zones", "Prédictions"]})
+
+    # 3) incohérence physiologique entre références
+    for a, b in zip(pts, pts[1:]):
+        va, vb = a["distance"] / a["temps"] * 3.6, b["distance"] / b["temps"] * 3.6
+        if vb > va * 1.005:
+            out.append({"id": "REF_ORDRE", "gravite": "bloquant",
+                        "domaine": "Tests de référence",
+                        "titre": "Un effort plus long est plus rapide qu'un effort plus court",
+                        "constat": f"{seconds_to_hms(b['temps'])} à {fmt_kmh(vb)} contre "
+                                   f"{seconds_to_hms(a['temps'])} à {fmt_kmh(va)}.",
+                        "consequence": "La régression a une pente incohérente : VC et D′ n'ont aucun sens.",
+                        "action": "L'un des deux n'était pas maximal, ou une distance/durée est mal saisie.",
+                        "contamine": ["VC", "D′", "Zones", "Prédictions", "Séances"]})
+            break
+
+    # 4) fenêtre de durées idéale pour estimer une asymptote
+    if t1 > 300:
+        out.append({"id": "REF_COURT_LONG", "gravite": "mineur", "domaine": "Tests de référence",
+                    "titre": "Le test court est trop long",
+                    "constat": f"{seconds_to_hms(t1)} pour l'effort court.",
+                    "consequence": "Sans effort de 2 à 4 min, D′ est mal identifié (c'est là qu'il pèse "
+                                   "le plus dans la performance).",
+                    "action": "Ajoute un test de 3 min à fond.",
+                    "contamine": ["D′", "Séances"]})
+    if t2 < 600:
+        out.append({"id": "REF_LONG_COURT", "gravite": "important", "domaine": "Tests de référence",
+                    "titre": "Le test long est trop court",
+                    "constat": f"{seconds_to_hms(t2)} pour l'effort long.",
+                    "consequence": "L'asymptote est extrapolée loin des données : la VC est incertaine.",
+                    "action": "Ajoute un effort de 15 à 30 min (10 km ou test de 30 min).",
+                    "contamine": ["VC", "Zones", "Prédictions"]})
+    if len(pts) == 2:
+        out.append({"id": "REF_2PTS", "gravite": "mineur", "domaine": "Tests de référence",
+                    "titre": "Seulement deux références : aucun contrôle possible",
+                    "constat": "Avec deux points, le R² vaut toujours 1 — il ne prouve rien.",
+                    "consequence": "Impossible de détecter une référence aberrante ou de croiser les tests.",
+                    "action": "Une troisième référence (durée intermédiaire) rend la validation croisée "
+                              "possible et donne une vraie mesure d'incertitude.",
+                    "contamine": ["VC", "D′"]})
+    _r2 = _audit_num(r2)
+    if _r2 is not None and len(pts) >= 3 and _r2 < 0.95:
+        out.append({"id": "REF_R2", "gravite": "important", "domaine": "Tests de référence",
+                    "titre": f"Ajustement médiocre (R² = {_r2:.3f})",
+                    "constat": "Les références ne s'alignent pas sur une droite distance-temps.",
+                    "consequence": "Le modèle à deux paramètres ne décrit pas cet athlète, ou une "
+                                   "référence est fausse.",
+                    "action": "Lance la validation croisée LOO pour identifier la référence qui dévie.",
+                    "contamine": ["VC", "D′"]})
+    return out
+
+def audit_masque(thresholds, infos_met, calage=None, vc_ms=None):
+    """Contrôles sur le test à échanges gazeux et son recoupement avec le terrain."""
+    out = []
+    if not infos_met:
+        return out
+    thr = thresholds or {}
+    # calage tapis / terrain : c'est LUI qui décide si les allures du test valent quelque chose
+    if calage and calage.get("significatif"):
+        e = calage["ecart_moyen_pct"]
+        out.append({"id": "MASK_ECHELLE", "gravite": "bloquant", "domaine": "Test au masque",
+                    "titre": f"Le test et le terrain ne sont pas sur la même échelle de vitesse "
+                             f"({e:+.0f} %)",
+                    "constat": f"À fréquence cardiaque égale, l'athlète court {e:+.0f} % plus vite sur le "
+                               f"terrain que ce que le test indique "
+                               f"(relation FC→vitesse du test : r = {calage['r']:.3f}).",
+                    "consequence": "Toutes les ALLURES issues du test sont fausses d'autant : seuils, "
+                                   "zones, coût énergétique au km. Les valeurs en FC, elles, restent bonnes.",
+                    "action": "Étalonne le tapis (chrono sur une distance connue), vérifie qu'il est bien à "
+                              "0 % de pente, et regarde si la colonne vitesse du fichier est celle du tapis. "
+                              "En attendant, pilote cet athlète à la FC, pas à l'allure.",
+                    "contamine": ["Allures des seuils", "Zones", "Économie", "Économie"]})
+    if thr.get("vt2_vs_vc"):
+        _est_bas = "surestimée" in thr["vt2_vs_vc"] or "manque" in thr["vt2_vs_vc"]
+        out.append({"id": "MASK_VT2VC", "gravite": "important", "domaine": "Test au masque",
+                    "titre": "VT2 et vitesse critique ne concordent pas",
+                    "constat": _phrase1(thr["vt2_vs_vc"]),
+                    "consequence": "Les zones seront très différentes selon qu'on les pose sur VT2 ou sur "
+                                   "la VC — il faut trancher avant de programmer quoi que ce soit.",
+                    "action": "Corrige d'abord les tests de référence et l'échelle du tapis : les deux "
+                              "causes ci-dessus expliquent presque toujours cet écart.",
+                    "contamine": ["Zones", "Zones"]})
+    if (thr.get("vt1") or {}).get("source") == "estimé" or thr.get("vt1_message"):
+        out.append({"id": "MASK_VT1", "gravite": "important", "domaine": "Test au masque",
+                    "titre": "VT1 n'est pas mesuré, seulement estimé",
+                    "constat": thr.get("vt1_message") or "Le test ne descend pas assez bas pour capter "
+                                                         "la première rupture ventilatoire.",
+                    "consequence": "La frontière entre endurance fondamentale et tempo (Z1/Z2) repose sur "
+                                   "une estimation : c'est la zone où se fait le gros du volume.",
+                    "action": "Refais le protocole en démarrant 2 à 3 paliers plus bas — assez bas pour "
+                              "que la ventilation de départ soit autour de 35-45 L/min.",
+                    "contamine": ["Zones"]})
+    if infos_met.get("alerte_rer_tendance"):
+        out.append({"id": "MASK_RER", "gravite": "important", "domaine": "Test au masque",
+                    "titre": "Le RER modélisé ne se comporte pas comme il devrait",
+                    "constat": _phrase1(infos_met["alerte_rer_tendance"]),
+                    "consequence": "La partition glucides/lipides des paliers durs n'est pas exploitable, "
+                                   "donc les grammes de glucides par heure non plus à haute intensité.",
+                    "action": "Vérifie l'ajustement du masque (fuite au visage) et la vitesse des paliers ; "
+                              "les seuils et la dépense énergétique restent utilisables.",
+                    "contamine": ["Substrats", "Nutrition"]})
+    if infos_met.get("economie_alerte"):
+        _n = infos_met.get("economie_n_paliers") or 0
+        out.append({"id": "MASK_ECO", "gravite": "mineur" if _n >= 3 else "important",
+                    "domaine": "Test au masque",
+                    "titre": "L'économie de course calée sort de la fourchette usuelle",
+                    "constat": _phrase1(infos_met["economie_alerte"]),
+                    "consequence": "Le VO₂ modélisé — donc la partition des substrats — est décalé. La "
+                                   "dépense énergétique, elle, bouge peu.",
+                    "action": "Vérifie la masse de l'athlète et les vitesses des paliers ; si tu as un test "
+                              "labo avec VO₂ mesuré, saisis l'économie exacte.",
+                    "contamine": ["Substrats", "Nutrition"]})
+    if not infos_met.get("substrats_possibles", True):
+        out.append({"id": "MASK_VITESSE", "gravite": "important", "domaine": "Test au masque",
+                    "titre": "Aucune vitesse par palier dans le fichier",
+                    "constat": "Ni oxygène mesuré, ni vitesse : le RER n'est pas calculable.",
+                    "consequence": "Pas de substrats, pas d'économie, pas de plan nutritionnel.",
+                    "action": "Saisis les vitesses dans « Vitesse de chaque palier » (le bouton "
+                              "« Remplir en rampe » suffit si le protocole était régulier).",
+                    "contamine": ["Substrats", "Économie", "Nutrition"]})
+    if infos_met.get("protocole") == "ramp":
+        out.append({"id": "MASK_PROTO", "gravite": "mineur", "domaine": "Test au masque",
+                    "titre": "Protocole en rampe : état stable non atteint",
+                    "constat": "Paliers d'environ une minute.",
+                    "consequence": "Excellent pour situer les seuils, insuffisant pour chiffrer les "
+                                   "substrats autrement qu'en plages larges.",
+                    "action": "Pour la nutrition, double le test avec 3 ou 4 paliers de 5 min autour des "
+                              "allures de course visées.",
+                    "contamine": ["Substrats"]})
+    return out
+
+def audit_athlete(refs=None, vc_ms=None, d_prime=None, r2=None,
+                  thresholds=None, infos_met=None, calage=None):
+    """Rassemble tous les contrôles et les classe : d'abord ce qui bloque, puis ce
+    qui contamine le plus de sorties. Retourne (findings, synthèse)."""
+    findings = audit_references(refs, vc_ms, d_prime, r2) + \
+               audit_masque(thresholds, infos_met, calage, vc_ms)
+    for f in findings:            # vocabulaire fermé + dédoublonnage, ordre d'affichage stable
+        f["contamine"] = [c for c in AUDIT_SORTIES if c in set(f.get("contamine") or [])]
+    findings.sort(key=lambda f: (-AUDIT_GRAVITES.get(f["gravite"], 0), -len(f.get("contamine") or [])))
+    for i, f in enumerate(findings, 1):
+        f["rang"] = i
+    n_bloq = sum(1 for f in findings if f["gravite"] == "bloquant")
+    n_imp = sum(1 for f in findings if f["gravite"] == "important")
+    n_min = sum(1 for f in findings if f["gravite"] == "mineur")
+    # score : chaque problème coûte, pondéré par sa gravité et son étendue
+    cout = sum(AUDIT_GRAVITES.get(f["gravite"], 0) * (1 + 0.25 * len(f.get("contamine") or []))
+               for f in findings)
+    score = int(round(float(np.clip(100.0 - 7.0 * cout, 0.0, 100.0))))
+    contamines = sorted({c for f in findings if f["gravite"] in ("bloquant", "important")
+                         for c in (f.get("contamine") or [])})
+    contamines = [c for c in AUDIT_SORTIES if c in contamines]
+    sains = [c for c in AUDIT_SORTIES if c not in contamines]
+    if n_bloq:
+        verdict = ("Au moins un problème bloquant : les chiffres qui en dépendent ne doivent pas servir "
+                   "à programmer tant qu'il n'est pas corrigé.")
+    elif n_imp:
+        verdict = ("Rien de bloquant, mais des réserves sérieuses : utilisable pour orienter, pas pour "
+                   "trancher au détail près.")
+    elif n_min:
+        verdict = "Données saines, quelques limites de protocole à connaître."
+    else:
+        verdict = "Aucune incohérence détectée sur les données disponibles."
+    return findings, {"score": score, "n_bloquant": n_bloq, "n_important": n_imp, "n_mineur": n_min,
+                      "verdict": verdict, "contamines": contamines, "sains": sains,
+                      "premier": findings[0] if findings else None}
+
+def plot_audit(findings, synth):
+    """Une barre par sortie de l'app : verte si aucune alerte ne la touche, rouge
+    si un problème bloquant la contamine. C'est la carte de ce à quoi on peut se fier."""
+    sorties = list(AUDIT_SORTIES)
+    niveau = {}
+    for s in sorties:
+        g = 0
+        for f in findings:
+            if s in (f.get("contamine") or []):
+                g = max(g, AUDIT_GRAVITES.get(f["gravite"], 0))
+        niveau[s] = g
+    fig, ax = plt.subplots(figsize=(11.5, 2.6 + 0.22 * len(sorties)))
+    ys = list(range(len(sorties)))[::-1]
+    cols = {0: C_GREY, 1: C_WHITE, 2: C_RED_SOFT, 3: C_RED}
+    labs = {0: "aucune réserve", 1: "limite mineure", 2: "réserve sérieuse", 3: "contaminé"}
+    for y, s in zip(ys, sorties):
+        g = niveau[s]
+        ax.barh([y], [g if g else 0.25], color=cols[g], alpha=0.85 if g else 0.35, height=0.6)
+        ax.annotate(labs[g], xy=(max(g, 0.25), y), xytext=(8, 0), textcoords="offset points",
+                    va="center", fontsize=8.5, color=cols[g] if g else C_TEXT_MUT)
+    ax.set_yticks(ys); ax.set_yticklabels(sorties, fontsize=9)
+    ax.set_xticks([]); ax.set_xlim(0, 4.6)
+    ax.grid(False)
+    for _sp in ax.spines.values():
+        _sp.set_visible(False)
+    chart_title(ax, "À quoi peut-on se fier aujourd'hui",
+                f"Confiance globale {synth['score']} / 100 — chaque barre montre la pire alerte "
+                f"qui touche cette sortie")
+    fig.tight_layout()
+    return fig
+
 def check_vc_references(refs):
     """Contrôles de cohérence AVANT de croire la régression. Le modèle D' est une
     droite entre deux points : une référence aberrante ne casse rien visiblement,
@@ -2907,6 +3232,7 @@ out body geom;"""
         data = None; last_err = None
         for ep in OVERPASS_ENDPOINTS:
             try:
+                if not HAS_REQUESTS: continue
                 resp=requests.post(ep,data={"data":query},timeout=25); resp.raise_for_status()
                 data=resp.json(); break
             except Exception as e: last_err=e; continue
@@ -5086,6 +5412,129 @@ def parse_splits_strava(raw):
             out.append({"km": km, "dist": dist, "secs": secs, "elev": elev, "hr": hr})
     return out
 
+
+# ── v10.2 : saisie des ravitos par COLLAGE ───────────────────────────────
+# Entrer les ravitaillements un par un relançait tout le calcul de la page à
+# chaque ajout. On accepte donc une liste collée — depuis le road-book de
+# l'organisateur, une page Live-trail/ITRA, ou un tableur — et on crée tout
+# d'un coup. Le parseur est volontairement tolérant : les road-books ne
+# suivent aucun format commun.
+_CP_TYPES_MOTS = [
+    (("ravito", "ravitaillement", "refreshment", "aid", "base vie", "basevie", "eau", "water"),
+     "🥤 Ravitaillement"),
+    (("sommet", "summit", "pic", "mont ", "cime"), "🏔 Sommet"),
+    (("col ", "col de", "collet", "pass "), "🔻 Col"),
+    (("arrivee", "arrivée", "finish", "depart", "départ", "start"), "🏁 Intermédiaire"),
+    (("attention", "danger", "technique", "cle", "clé"), "⚠️ Point clé"),
+]
+
+def _cp_devine_type(nom):
+    n = (nom or "").lower()
+    for mots, t in _CP_TYPES_MOTS:
+        if any(m in n for m in mots):
+            return t
+    return "🥤 Ravitaillement"      # le cas de loin le plus fréquent
+
+_CP_DIST_RE = re.compile(r"^\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:km|k)?\s*$", re.I)
+_CP_LIGNE_RE = re.compile(
+    r"^\s*(?:(?P<d1>\d{1,3}(?:[.,]\d{1,2})?)\s*(?:km|k)?\b[\s;,:|\-–—]*(?P<n1>.+?)"
+    r"|(?P<n2>.+?)[\s;,:|\-–—]+(?P<d2>\d{1,3}(?:[.,]\d{1,2})?)\s*(?:km|k)?)\s*$", re.I)
+_CP_BRUIT_RE = re.compile(
+    r"^\s*(?:\d{1,2}:\d{2}(?::\d{2})?|[a-zéû]{3}\.?\s+\d{1,2}:\d{2}|[\d.,]+\s*(?:km/h|m\+|m-|m)|"
+    r"km|dist(?:ance)?|nom|name|lieu|temps|altitude|d\+|d-|\d+e?|—|-)\s*$", re.I)
+
+def _cp_nombre(s):
+    try:
+        v = float(str(s).replace(",", "."))
+        return v if 0.0 <= v <= 1000.0 else None
+    except (TypeError, ValueError):
+        return None
+
+def parse_checkpoints_colles(raw, total_dist_km=None):
+    """Transforme un texte collé en liste de checkpoints [{dist_km, label, type}].
+
+    Trois formes acceptées, dans cet ordre :
+      1. une ligne par point  — « 12.5 km Ravito Arzon », « Ravito Arzon ; 12,5 »
+      2. bloc Live-trail/ITRA — une ligne de distance, puis le nom en dessous
+      3. tableur collé        — colonnes séparées par des tabulations
+    Retourne (checkpoints, message). Les doublons de distance sont fusionnés et
+    tout ce qui dépasse la longueur du parcours est écarté."""
+    if not raw or not str(raw).strip():
+        return [], ""
+    lignes = [l.strip() for l in str(raw).replace("\t", "  |  ").split("\n") if l.strip()]
+    trouves = []
+
+    # ── forme 1 : distance ET nom sur la même ligne ──────────────────────
+    for l in lignes:
+        if _CP_BRUIT_RE.match(l):
+            continue
+        m = _CP_LIGNE_RE.match(l)
+        if not m:
+            continue
+        d = _cp_nombre(m.group("d1") or m.group("d2"))
+        nom = (m.group("n1") or m.group("n2") or "").strip(" |;:,-–—")
+        if d is None or not nom:
+            continue
+        nom = re.sub(r"\s*\|\s*", " ", nom).strip()
+        # « 3.1 km » seul laisse « km » comme nom : ce n'est pas un point, c'est
+        # une ligne de distance d'un tableau à lire en blocs (forme 2).
+        if re.fullmatch(r"(?:km|k|m|m\+|m-|d\+|d-)\.?", nom, re.I):
+            continue
+        if not re.search(r"[A-Za-zÀ-ÿ]{2,}", nom):
+            continue
+        # une deuxième distance dans le nom (« 3.1 km | 20.1 km ») = ligne de tableau
+        if _CP_DIST_RE.match(nom) or len(nom) < 2:
+            continue
+        nom = re.sub(r"^\s*(?:\d{1,3}[.,]?\d*\s*km\b[\s|;,-]*)+", "", nom, flags=re.I).strip()
+        if len(nom) < 2:
+            continue
+        trouves.append({"dist_km": d, "label": nom})
+
+    # ── forme 2 : bloc ITRA — ligne « 12.5 km » puis le nom en dessous ───
+    if len(trouves) < 2:
+        trouves = []
+        i = 0
+        while i < len(lignes):
+            m = _CP_DIST_RE.match(lignes[i])
+            if m:
+                d = _cp_nombre(m.group(1))
+                nom = None
+                for k in range(i + 1, min(len(lignes), i + 6)):
+                    cand = lignes[k]
+                    if _CP_DIST_RE.match(cand):
+                        break
+                    if _CP_BRUIT_RE.match(cand) or len(cand) < 2:
+                        continue
+                    nom = cand
+                    break
+                if d is not None and nom:
+                    trouves.append({"dist_km": d, "label": nom})
+            i += 1
+
+    if not trouves:
+        return [], ("Aucun point reconnu. Une ligne par ravito, avec la distance et le nom — "
+                    "par exemple « 12.5 km Ravito Arzon » ou « Ravito Arzon ; 12.5 ».")
+
+    # ── nettoyage : tri, doublons, hors parcours ─────────────────────────
+    trouves.sort(key=lambda c: c["dist_km"])
+    nets, ecartes_dist, ecartes_dup = [], 0, 0
+    for c in trouves:
+        if total_dist_km and c["dist_km"] > float(total_dist_km) + 0.5:
+            ecartes_dist += 1
+            continue
+        if nets and abs(c["dist_km"] - nets[-1]["dist_km"]) < 0.05:
+            ecartes_dup += 1
+            continue
+        nets.append({"dist_km": round(c["dist_km"], 2),
+                     "label": c["label"][:60],
+                     "type": _cp_devine_type(c["label"])})
+    msg = f"{len(nets)} point(s) reconnu(s)"
+    if ecartes_dup:
+        msg += f" · {ecartes_dup} doublon(s) fusionné(s)"
+    if ecartes_dist:
+        msg += f" · {ecartes_dist} au-delà de la distance du parcours, écarté(s)"
+    return nets, msg + "."
+
 def parse_itra(raw):
     """Parse une page de résultats Live-trail/ITRA collée (checkpoints + temps cumulés)."""
     raw_lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
@@ -5234,6 +5683,8 @@ def fetch_daily_weather(lat, lon, date_obj):
                    "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
                    f"&timezone=Europe%2FParis&start_date={past}&end_date={past}")
             is_past = True
+        if not HAS_REQUESTS:
+            return None
         r = requests.get(url, timeout=12)
         d = r.json()
         daily = d.get("daily", {})
@@ -5300,8 +5751,19 @@ def build_prediction_cohort(athlete, profile_key, apply_fatigue, apply_temp, tem
 # Sauvegarde = copier ce fichier. Aucune donnée ne sort de la machine.
 # ══════════════════════════════════════════════════════════════
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coach_data.db")
-AUTH_ENABLED = True          # passe à False pour un usage strictement personnel sans écran de connexion
+# ── v10.1 : emplacement de la base et connexion, pilotables sans toucher au code ──
+# COACH_DB_PATH : sur un hébergement gratuit, le disque de l'application est
+#   souvent EFFACÉ à chaque redémarrage. Pointer la base vers un disque
+#   persistant (ou la sauvegarder via le bouton de l'onglet Historique) est la
+#   seule façon de ne pas perdre l'historique des athlètes.
+# COACH_AUTH : "0" pour un usage strictement personnel, sans écran de connexion.
+DB_PATH = os.environ.get("COACH_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "coach_data.db")
+try:
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+except Exception:
+    pass
+AUTH_ENABLED = os.environ.get("COACH_AUTH", "1").strip().lower() not in ("0", "false", "non", "off")
 PBKDF2_ROUNDS = 240_000
 
 def db_conn():
@@ -5831,8 +6293,42 @@ def history_ready():
     d'enregistrement ne s'affichent que dans ce cas."""
     return current_user() is not None and current_athlete_id() is not None
 
+LOCAL_USER = {"id": 1, "email": "local", "nom": "Coach"}
+
+def ensure_local_user():
+    """Mode sans connexion (COACH_AUTH=0) : un unique coach implicite, créé une
+    fois dans la base. L'historique fonctionne exactement pareil, sans écran de
+    connexion — utile en local, à proscrire dès que l'app est publique."""
+    if st.session_state.get("_auth_user"):
+        return st.session_state["_auth_user"]
+    try:
+        with db_conn() as c:
+            row = c.execute("SELECT id, name FROM users WHERE email = ?", ("local@local",)).fetchone()
+            if row is None:
+                _h, _s = hash_password(secrets.token_hex(16))   # compte non connectable
+                cur = c.execute(
+                    "INSERT INTO users(email,name,pw_hash,pw_salt,created_at) VALUES(?,?,?,?,?)",
+                    ("local@local", "Coach", _h, _s, _db_now()))
+                uid, nm = int(cur.lastrowid), "Coach"
+            else:
+                uid, nm = int(row[0]), row[1]
+        u = {"id": uid, "email": "local@local", "name": nm}
+        st.session_state["_auth_user"] = u
+        return u
+    except Exception as _e_loc:
+        st.warning(f"Mode local indisponible ({_e_loc}) — l'écran de connexion reste actif.")
+        return None
+
 def render_account_sidebar():
     """Panneau Compte + Athlète, en haut de la barre latérale."""
+    if not AUTH_ENABLED:
+        ensure_local_user()
+        st.markdown('<div class="sidebar-label">👤 Mode local — sans connexion</div>',
+                    unsafe_allow_html=True)
+        st.caption("Écran de connexion désactivé (COACH_AUTH=0). Toutes les données restent sur "
+                   "cette machine. À réactiver dès que l'app est accessible depuis Internet.")
+        render_athlete_picker()
+        return
     user = current_user()
     if user is None:
         st.markdown('<div class="sidebar-label">👤 Compte coach</div>', unsafe_allow_html=True)
@@ -5867,8 +6363,16 @@ def render_account_sidebar():
                    "l'enregistrement des analyses sont désactivés.")
         return
 
+    render_athlete_picker(user)
+
+def render_athlete_picker(user=None):
+    """Sélecteur d'athlète — partagé par le mode connecté et le mode local."""
+    user = user or current_user()
+    if user is None:
+        return
     seed_categories(user["id"])       # catégories de départ, créées une seule fois
-    st.markdown(f'<div class="sidebar-label">👤 {user["name"]}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-label">👤 {user.get("name") or user.get("nom") or "Coach"}</div>',
+                unsafe_allow_html=True)
     athletes = list_athletes(user["id"])
     names = [a["name"] for a in athletes]
     if athletes:
@@ -5893,6 +6397,8 @@ def render_account_sidebar():
                     st.session_state["_athlete_id"] = aid
                     st.session_state["_athlete_name"] = nm.strip()
                     st.rerun()
+    if not AUTH_ENABLED:
+        return
     with st.expander("🔐 Compte"):
         with st.form("pw_form", clear_on_submit=True):
             o = st.text_input("Mot de passe actuel", type="password")
@@ -5927,12 +6433,24 @@ with st.sidebar:
     sb_k_temp_cold=st.number_input("Sensibilité froid",value=0.0012,step=0.0002,format="%.4f",key="sb_ktc")
     st.caption("Ces paramètres n'affectent que les onglets 🧪 et ⚙️")
 
-main_tabs=st.tabs(["🏃 Prédiction de course","🧪 Tests d'endurance + VC","⚙️ Analyse entraînement","👥 Analyse de cohorte","📚 Historique"])
+# ── v10.1 : navigation PARESSEUSE ────────────────────────────────────────
+# st.tabs() a l'air pratique mais exécute le contenu des SIX onglets à chaque
+# interaction : bouger un curseur recalculait toute l'app. Une navigation par
+# sélection ne fait tourner que la section affichée — c'est le gain de vitesse
+# le plus important du fichier, et il ne change rien aux calculs.
+PAGES = ["🏃 Prédiction de course", "🧪 Tests d'endurance + VC", "⚙️ Analyse entraînement",
+         "👥 Analyse de cohorte", "📚 Historique", "🩺 Audit des données"]
+_page = st.segmented_control("Navigation", PAGES, default=PAGES[0], key="nav_page",
+                             label_visibility="collapsed")
+if _page is None:
+    _page = st.session_state.get("_nav_last", PAGES[0])
+st.session_state["_nav_last"] = _page
+st.markdown("")
 
 # ══════════════════════════════════════════════════════════════
 # ONGLET 0 — PRÉDICTION DE COURSE
 # ══════════════════════════════════════════════════════════════
-with main_tabs[0]:
+if _page == PAGES[0]:
     # v8.9 — un plan rechargé depuis l'historique réinjecte ses paramètres dans les
     # widgets AVANT leur création (Streamlit interdit de les modifier après).
     _pending_plan = st.session_state.pop("_pending_plan_params", None)
@@ -6052,7 +6570,7 @@ with main_tabs[0]:
                         with st.expander("📊 Détail par km — score technique"):
                             df_tech=pd.DataFrame(tech_segs)
                             cols_show=["km_start","km_end","label","tech_score","sinuosity","grade_max","grade_std","turns_score_km"]
-                            st.dataframe(df_tech[[c for c in cols_show if c in df_tech.columns]],use_container_width=True,hide_index=True)
+                            st.dataframe(df_tech[[c for c in cols_show if c in df_tech.columns]],width='stretch',hide_index=True)
                             fig_tech,ax_tech=plt.subplots(figsize=(11,3))
                             km_mids=[(s["km_start"]+s["km_end"])/2 for s in tech_segs]; scores=[s["tech_score"] for s in tech_segs]
                             colors_t=[C_DIM if s<0.25 else C_GREY if s<0.5 else C_RED_SOFT if s<0.75 else C_RED for s in scores]
@@ -6099,7 +6617,7 @@ with main_tabs[0]:
                 c3.metric("Couverture",f"{osm.get('coverage_pct',0):.0f}%  ({osm.get('ways_found',0)} ways)")
                 if osm.get("surface_counts"):
                     df_osm=pd.DataFrame(list(osm["surface_counts"].items()),columns=["Surface","Occurrences"])
-                    st.dataframe(df_osm,use_container_width=True,hide_index=True)
+                    st.dataframe(df_osm,width='stretch',hide_index=True)
                 SURFACE_OPTIONS["🤖 Détecté automatiquement (OSM)"]=osm.get("surface_mult_osm",1.06)
 
     st.markdown("---")
@@ -6277,7 +6795,7 @@ with main_tabs[0]:
                             "Allure recalibrée":pace_str(t_ideal/dist_km_r) if (use_recalibrated and dist_km_r>0) else "—",
                             "FC moy.":f"{r['hr_avg']} bpm" if r.get('hr_avg') else "—",
                             "Gain correction":f"-{seconds_to_hms(gain_s)}" if gain_s>0 else (f"+{seconds_to_hms(-gain_s)}" if gain_s<0 else "0")})
-    st.dataframe(pd.DataFrame(calib_rows),use_container_width=True)
+    st.dataframe(pd.DataFrame(calib_rows),width='stretch')
 
     refs_with_hr = [{"dur_s": hms_to_seconds(r.get("duration_hms_file") or r.get("temps","0")),
                      "hr_avg": r.get("hr_avg"), "hr_max": r.get("hr_max")}
@@ -6667,7 +7185,7 @@ with main_tabs[0]:
             cv=crossval_loo(refs_cv)
             if cv is None:st.warning("Au moins 3 références nécessaires.")
             else:
-                df_cv,mae,mape=cv;st.dataframe(df_cv,use_container_width=True)
+                df_cv,mae,mape=cv;st.dataframe(df_cv,width='stretch')
                 c1,c2=st.columns(2)
                 c1.metric("Erreur absolue moyenne",f"{seconds_to_hms(mae)} ({mae:.0f}s)")
                 c2.metric("MAPE",f"{mape:.2f} %")
@@ -6828,7 +7346,7 @@ with main_tabs[0]:
                 ax2.axhline(1.0,color=C_DIM,lw=0.8);ax2.set_xlabel("Kilomètre")
                 ax2.set_ylabel("Multiplicateur");ax2.set_title("Décomposition des facteurs")
                 ax2.legend();ax2.grid(alpha=0.3);st.pyplot(fig2);plt.close(fig2)
-            with res_t3:st.dataframe(df_out,use_container_width=True)
+            with res_t3:st.dataframe(df_out,width='stretch')
 
         # ── v9.1 : ravitaillements — arrêts prévus et feuille de route ───
         st.markdown("---")
@@ -6913,7 +7431,7 @@ with main_tabs[0]:
                                                if _r.get("allure_moy_depuis_depart_s_km") else "—",
                     })
                 df_sched = pd.DataFrame(_rows_sched)
-                st.dataframe(df_sched, use_container_width=True, hide_index=True)
+                st.dataframe(df_sched, width='stretch', hide_index=True)
                 st.download_button("⬇️ Feuille de route (CSV)", df_sched.to_csv(index=False).encode("utf-8"),
                                    file_name="feuille_de_route.csv", key="dl_sched")
                 st.caption("« Allure segment » est l'allure à tenir entre deux ravitaillements, hors arrêt. "
@@ -6974,26 +7492,131 @@ with main_tabs[0]:
         st.subheader("📍 Checkpoints & Ravitaillements")
         st.caption(f"Distance totale du parcours : **{total_dist_km:.2f} km**")
         if "checkpoints" not in st.session_state:st.session_state["checkpoints"]=[]
-        col_cp1,col_cp2,col_cp3=st.columns([2,2,1])
-        with col_cp1:cp_dist=st.number_input("Distance du checkpoint (km)",min_value=0.1,max_value=float(total_dist_km),value=min(5.0,float(total_dist_km)),step=0.1,key="cp_dist_input")
-        with col_cp2:cp_type=st.selectbox("Type",["🥤 Ravitaillement","⏱ Point de passage","🏔 Sommet","🔻 Col","🏁 Intermédiaire","⚠️ Point clé"],key="cp_type_input")
-        with col_cp3:cp_nom=st.text_input("Nom (optionnel)",value="",key="cp_nom_input",placeholder="ex: Ravito km7")
-        col_btn1,col_btn2=st.columns(2)
-        with col_btn1:
-            if st.button("➕ Ajouter ce checkpoint"):
-                cp_dist_m=cp_dist*1000.0
-                cp_lat=float(np.interp(cp_dist_m,cum_d_map,lats_m));cp_lon=float(np.interp(cp_dist_m,cum_d_map,lons_m))
-                y_gps_cp=[getattr(p,"elevation",0.0) or 0.0 for p in points]
-                cp_alt=float(np.interp(cp_dist_m,cum_d_map,y_gps_cp))
-                label=cp_nom.strip() if cp_nom.strip() else f"{cp_type} km {cp_dist:.1f}"
-                st.session_state["checkpoints"].append({"dist_km":cp_dist,"type":cp_type,"label":label,"lat":cp_lat,"lon":cp_lon,"alt":round(cp_alt),"arret_s":0.0})
-                st.success(f"✅ Checkpoint ajouté : {label}")
-        with col_btn2:
-            if st.button("🗑️ Effacer tous les checkpoints"):st.session_state["checkpoints"]=[]
-        checkpoints=st.session_state["checkpoints"]
-        if checkpoints:
-            df_cp=pd.DataFrame([{"Type":c["type"],"Nom":c["label"],"Distance":f"{c['dist_km']:.1f} km","Altitude GPS":f"{c['alt']} m"} for c in sorted(checkpoints,key=lambda x:x["dist_km"])])
-            st.dataframe(df_cp,use_container_width=True,hide_index=True)
+
+        # ── v10.2 : éditeur ISOLÉ ────────────────────────────────────────
+        # Avant, chaque ajout de ravito relançait toute la page : relecture du
+        # GPX, prédiction complète, carte satellite, terrain 3D. D'où les longues
+        # secondes d'attente à chaque point. st.fragment cantonne le rerun à ce
+        # bloc : l'ajout devient instantané, et le reste de la page n'est recalculé
+        # qu'au moment où on le demande explicitement.
+        @st.fragment
+        def _editeur_checkpoints(_cum_d_map, _lats_m, _lons_m, _alts_m, _total_km):
+            def _pos(dist_km):
+                dm = float(dist_km) * 1000.0
+                return (float(np.interp(dm, _cum_d_map, _lats_m)),
+                        float(np.interp(dm, _cum_d_map, _lons_m)),
+                        float(np.interp(dm, _cum_d_map, _alts_m)))
+
+            _t_saisie, _t_collage = st.tabs(["➕ Un par un", "📋 Coller une liste"])
+
+            with _t_saisie:
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    cp_dist = st.number_input("Distance du checkpoint (km)", min_value=0.1,
+                                              max_value=float(_total_km),
+                                              value=min(5.0, float(_total_km)), step=0.1,
+                                              key="cp_dist_input")
+                with c2:
+                    cp_type = st.selectbox("Type", ["🥤 Ravitaillement", "⏱ Point de passage",
+                                                    "🏔 Sommet", "🔻 Col", "🏁 Intermédiaire",
+                                                    "⚠️ Point clé"], key="cp_type_input")
+                with c3:
+                    cp_nom = st.text_input("Nom (optionnel)", value="", key="cp_nom_input",
+                                           placeholder="ex: Ravito km7")
+                if st.button("➕ Ajouter ce checkpoint", key="cp_add_one"):
+                    la, lo, al = _pos(cp_dist)
+                    lbl = cp_nom.strip() or f"{cp_type} km {cp_dist:.1f}"
+                    st.session_state["checkpoints"].append(
+                        {"dist_km": float(cp_dist), "type": cp_type, "label": lbl,
+                         "lat": la, "lon": lo, "alt": round(al), "arret_s": 0.0})
+                    st.toast(f"Ajouté : {lbl}")
+                    st.rerun(scope="fragment")
+
+            with _t_collage:
+                st.caption("Colle le road-book de l'organisateur, une page Live-trail/ITRA, ou "
+                           "deux colonnes d'un tableur. Une ligne par point, avec la distance et "
+                           "le nom — l'ordre des deux n'a pas d'importance.")
+                # le champ ne peut pas être vidé après coup (Streamlit l'interdit) :
+                # on change sa clé pour en recréer un neuf après la création des points
+                _pv = st.session_state.get("cp_paste_ver", 0)
+                _txt = st.text_area("Liste à coller", height=150, key=f"cp_paste_txt_{_pv}",
+                                    placeholder="12.5 km  Ravito du Lac\n28,4 km  Base vie Sarzeau\n"
+                                                "41 km  Col de la Croix")
+                _apercu, _msg = parse_checkpoints_colles(_txt, _total_km)
+                if _txt.strip():
+                    if _apercu:
+                        st.success(_msg)
+                        st.dataframe(pd.DataFrame([{
+                            "Distance": f"{c['dist_km']:.2f} km", "Nom": c["label"], "Type": c["type"],
+                        } for c in _apercu]), width='stretch', hide_index=True)
+                        _rc1, _rc2 = st.columns([1, 1])
+                        _remp = _rc1.checkbox("Remplacer les points existants", value=True,
+                                              key="cp_paste_replace")
+                        if _rc2.button(f"✅ Créer ces {len(_apercu)} point(s)", key="cp_paste_go",
+                                       type="primary"):
+                            _nouveaux = []
+                            for c in _apercu:
+                                la, lo, al = _pos(c["dist_km"])
+                                _nouveaux.append({"dist_km": c["dist_km"], "type": c["type"],
+                                                  "label": c["label"], "lat": la, "lon": lo,
+                                                  "alt": round(al), "arret_s": 0.0})
+                            if _remp:
+                                st.session_state["checkpoints"] = _nouveaux
+                            else:
+                                st.session_state["checkpoints"].extend(_nouveaux)
+                            st.session_state["cp_paste_ver"] = _pv + 1
+                            st.toast(f"{len(_nouveaux)} point(s) créé(s)")
+                            st.rerun(scope="fragment")
+                    else:
+                        st.warning(_msg)
+
+            _cps = sorted(st.session_state["checkpoints"], key=lambda x: float(x["dist_km"]))
+            if _cps:
+                st.markdown("###### Points enregistrés")
+                _ed = st.data_editor(
+                    pd.DataFrame([{"Distance (km)": float(c["dist_km"]), "Nom": c["label"],
+                                   "Type": c["type"], "Altitude": f"{c['alt']} m",
+                                   "Supprimer": False} for c in _cps]),
+                    width='stretch', hide_index=True, key="cp_table_editor",
+                    disabled=["Altitude"],
+                    column_config={
+                        "Distance (km)": st.column_config.NumberColumn(
+                            min_value=0.0, max_value=float(_total_km), step=0.1, format="%.2f"),
+                        "Type": st.column_config.SelectboxColumn(options=[
+                            "🥤 Ravitaillement", "⏱ Point de passage", "🏔 Sommet", "🔻 Col",
+                            "🏁 Intermédiaire", "⚠️ Point clé"]),
+                        "Supprimer": st.column_config.CheckboxColumn(help="Cocher puis Appliquer")})
+                _b1, _b2, _b3 = st.columns([1.2, 1, 1])
+                if _b1.button("💾 Appliquer les modifications", key="cp_apply"):
+                    _maj = []
+                    for _i, _r in _ed.iterrows():
+                        if bool(_r["Supprimer"]):
+                            continue
+                        _d = float(_r["Distance (km)"] or 0.0)
+                        la, lo, al = _pos(_d)
+                        _old = _cps[_i] if _i < len(_cps) else {}
+                        _maj.append({"dist_km": _d, "type": _r["Type"], "label": str(_r["Nom"]),
+                                     "lat": la, "lon": lo, "alt": round(al),
+                                     "arret_s": float(_old.get("arret_s", 0.0))})
+                    st.session_state["checkpoints"] = sorted(_maj, key=lambda x: x["dist_km"])
+                    st.toast("Modifications appliquées")
+                    st.rerun(scope="fragment")
+                if _b2.button("🗑️ Tout effacer", key="cp_clear"):
+                    st.session_state["checkpoints"] = []
+                    st.rerun(scope="fragment")
+                _b3.download_button("⬇️ Exporter (CSV)",
+                                    pd.DataFrame(_cps).to_csv(index=False).encode("utf-8"),
+                                    file_name="checkpoints.csv", mime="text/csv", key="cp_dl")
+                st.caption(f"**{len(_cps)} point(s)** · le reste de la page (prédiction, feuille de "
+                           "route, carte) se met à jour quand tu cliques sur « Recalculer » "
+                           "ci-dessous — c'est ce qui rend la saisie instantanée.")
+                if st.button("🔄 Recalculer toute la page avec ces points", key="cp_recompute",
+                             type="primary"):
+                    st.rerun()
+
+        _alts_m = [getattr(p, "elevation", 0.0) or 0.0 for p in points]
+        _editeur_checkpoints(cum_d_map, lats_m, lons_m, _alts_m, total_dist_km)
+        checkpoints = st.session_state["checkpoints"]
 
         st.markdown("---")
         with st.expander("🗺️ Carte satellite & Profil d'altitude",expanded=False):
@@ -7075,7 +7698,7 @@ with main_tabs[0]:
                         for cp in sorted(checkpoints,key=lambda x:x["dist_km"]):
                             t_passage=float(np.interp(cp["dist_km"],km_vals,t_cum_vals))
                             passage_rows.append({"Checkpoint":cp["label"],"Distance":f"{cp['dist_km']:.1f} km","Altitude":f"{cp['alt']} m","Temps prévu":seconds_to_hms(t_passage),"Allure moy.":pace_str(t_passage/max(0.001,cp["dist_km"]))+"/km" if cp["dist_km"]>0 else "—"})
-                        st.dataframe(pd.DataFrame(passage_rows),use_container_width=True,hide_index=True)
+                        st.dataframe(pd.DataFrame(passage_rows),width='stretch',hide_index=True)
 
         st.markdown("---")
         st.subheader("🌍 Vue 3D relief réel — style Google Earth")
@@ -7127,7 +7750,7 @@ with main_tabs[0]:
 # ══════════════════════════════════════════════════════════════
 # ONGLET 1 — TESTS D'ENDURANCE + VITESSE CRITIQUE
 # ══════════════════════════════════════════════════════════════
-with main_tabs[1]:
+if _page == PAGES[1]:
     st.title("🧪 Tests d'endurance + Vitesse Critique")
     st.caption("Évalue ta capacité aérobie, ta VC, ton D' et tes équivalences sur toutes distances.")
 
@@ -7368,7 +7991,7 @@ with main_tabs[1]:
             "Vitesse": f"{_r['distance'] / _r['temps'] * 3.6:.2f} km/h",
             "Allure ": pace_of(_r['distance'] / _r['temps'] * 3.6),
             "D+": f"{_r.get('D_up', 0):.0f} m",
-        } for _k, _r in enumerate(refs_vc_valid)]), use_container_width=True, hide_index=True)
+        } for _k, _r in enumerate(refs_vc_valid)]), width='stretch', hide_index=True)
         _n_vides = len(refs_vc) - len(refs_vc_valid)
         if _n_vides:
             st.caption(f"{_n_vides} emplacement(s) laissé(s) vide(s) : ignoré(s).")
@@ -7465,7 +8088,7 @@ with main_tabs[1]:
         st.subheader("⏱ Table de maintien (durée maximale par % de VC)")
         df_holding = build_holding_table(vc_ms, d_prime, refs_fit_vc, K_r)
         if not df_holding.empty:
-            st.dataframe(df_holding, use_container_width=True, hide_index=True)
+            st.dataframe(df_holding, width='stretch', hide_index=True)
 
         # ══ v9.8 : D′ balance — dépense et reconstitution de la réserve ══════
         st.markdown("---")
@@ -7519,7 +8142,7 @@ with main_tabs[1]:
             "Ce que ça permet ensuite": (
                 f"{r['metres'] / max(0.01, (vc_ms*1.10 - vc_ms)):.0f} s à 110 % de VC "
                 f"({pace_str(3600.0/(vc_ms*3.6*1.10))}/km)"),
-        } for r in _rows_rec]), use_container_width=True, hide_index=True)
+        } for r in _rows_rec]), width='stretch', hide_index=True)
         st.caption("Lecture : la reconstitution est exponentielle, donc les premiers pourcents reviennent "
                    "vite et les derniers coûtent très cher. Récupérer 95 % de D′ prend trois fois plus "
                    "longtemps que d'en récupérer 63 %.")
@@ -7652,7 +8275,7 @@ with main_tabs[1]:
                 st.warning("Au moins 3 références nécessaires pour la LOO.")
             else:
                 df_cv_r, mae_r, mape_r = cv_r
-                st.dataframe(df_cv_r, use_container_width=True, hide_index=True)
+                st.dataframe(df_cv_r, width='stretch', hide_index=True)
                 c1, c2 = st.columns(2)
                 c1.metric("MAE", f"{seconds_to_hms(mae_r)} ({mae_r:.0f}s)")
                 c2.metric("MAPE", f"{mape_r:.2f} %")
@@ -7683,7 +8306,7 @@ with main_tabs[1]:
             sv1 = thresholds["sv1"]; sv2 = thresholds["sv2"]
 
             with st.expander("📊 Données brutes par palier"):
-                st.dataframe(df_pal.round(2), use_container_width=True, hide_index=True)
+                st.dataframe(df_pal.round(2), width='stretch', hide_index=True)
 
             if not _has_o2:
                 st.caption("Seuils ventilatoires : voir la section « Profil métabolique » ci-dessous — "
@@ -7830,7 +8453,7 @@ with main_tabs[1]:
                     "Allure": pace_of(st.session_state[_skey].get(int(m["palier"]), 0.0)),
                 }.items() if _hr_col or k != "FC"} for m in _pv])
                 _edited = st.data_editor(
-                    _df_sp, hide_index=True, use_container_width=True,
+                    _df_sp, hide_index=True, width='stretch',
                     key=f"met_speed_editor_{gazoz_file.name}_{st.session_state.get(_vkey, 0)}",
                     disabled=[c for c in ["Palier", "Durée", "VCO₂ (L/min)", "VE (L/min)", "FC", "Allure"]
                               if c in _df_sp.columns],
@@ -7878,6 +8501,9 @@ with main_tabs[1]:
                 df_gz, mass_kg=_mass, vc_ms=_vc_met_kmh / 3.6, n_prior_tests=_n_prior, window_frac=_win_frac,
                 economy_ml_kg_km=_eco_manual, auto_calibrate_economy=(_eco_manual is None),
                 speed_by_stage=_speeds_manual)
+            # partagé avec l'onglet Audit : il relit, il ne recalcule pas
+            st.session_state["_audit_stages_met"] = _stages_met
+            st.session_state["_audit_infos_met"] = _infos_met
             if not _stages_met:
                 st.warning(f"Analyse métabolique impossible — {_infos_met.get('error', 'paliers inexploitables')}.")
             else:
@@ -7949,7 +8575,7 @@ with main_tabs[1]:
                                         else ("estimation de cadrage" if _est else "faible — à confirmer")),
                         })
                 if _rows_thr:
-                    st.dataframe(pd.DataFrame(_rows_thr), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_rows_thr), width='stretch', hide_index=True)
                 # détail des marqueurs : quel signal a donné quoi
                 for _k, _nm in (("vt1", "VT1"), ("vt2", "VT2")):
                     _mk = (_thr.get(_k) or {}).get("marqueurs") or []
@@ -7959,7 +8585,7 @@ with main_tabs[1]:
                                 "Marqueur": _m["nom"],
                                 "Situé à": f"{_m['x']} {_thr.get('axe_unite','')}",
                                 "Détail": _m["detail"],
-                            } for _m in _mk]), use_container_width=True, hide_index=True)
+                            } for _m in _mk]), width='stretch', hide_index=True)
                 if _thr.get("palier_mise_en_route"):
                     _pm = _thr["palier_mise_en_route"]
                     st.caption(f"Palier {_pm['palier']} écarté de la détection des seuils : sa ventilation est "
@@ -7988,7 +8614,7 @@ with main_tabs[1]:
                         "Allure": z["allure"],
                         "FC": z["fc"],
                         "Ce qu'on y travaille": z["role"],
-                    } for z in _z]), use_container_width=True, hide_index=True)
+                    } for z in _z]), width='stretch', hide_index=True)
                     if (_thr.get("vt1") or {}).get("source") == "estimé":
                         st.caption("La frontière Z1/Z2 repose sur le VT1 estimé : elle est à prendre comme un "
                                    "ordre de grandeur tant que VT1 n'a pas été mesuré. La frontière Z2/Z3, "
@@ -8006,7 +8632,7 @@ with main_tabs[1]:
                         "Repère": r["repere"], "Vitesse (km/h)": round(r["v"], 2),
                         "Allure": pace_str(3600.0 / r["v"]) + "/km",
                         "% VC": r["pct_vc"], "Origine": r["source"], "Attendu": r["attendu"],
-                    } for r in _hrows]), use_container_width=True, hide_index=True)
+                    } for r in _hrows]), width='stretch', hide_index=True)
                     st.caption("Hiérarchie physiologique de référence : VT1 < MLSS ≤ VT2 ≈ vitesse critique. "
                                "Le MLSS — dernier palier où le lactate se stabilise encore — tombe 4 à 10 % "
                                "sous la vitesse critique ; VT2 et la VC, eux, sont le plus souvent "
@@ -8034,9 +8660,9 @@ with main_tabs[1]:
                             "Vitesse du test à cette FC": fmt_kmh(c['v_masque'], 2, parentheses=True),
                             "Écart": f"{c['ecart_pct']:+.1f} %"
                                      + (" (FC hors plage testée)" if c["extrapole"] else ""),
-                        } for c in _cal["comparaisons"]]), use_container_width=True, hide_index=True)
+                        } for c in _cal["comparaisons"]]), width='stretch', hide_index=True)
                         if _cal["significatif"]:
-                            _f = 1.0 + _cal["ecart_moyen_pct"] / 100.0
+                            _fac_terrain = 1.0 + _cal["ecart_moyen_pct"] / 100.0
                             _v2m = (_thr.get("vt2") or {}).get("vitesse_kmh")
                             st.error(
                                 f"🚨 À FC égale, tu cours **{_cal['ecart_moyen_pct']:+.0f} %** plus vite sur le "
@@ -8045,7 +8671,7 @@ with main_tabs[1]:
                                 f"fichier qui n'est pas la vitesse réelle. Conséquence directe : les seuils de "
                                 f"ce test sont **fiables en FC, pas en allure**."
                                 + (f" Transposé au terrain à FC égale, VT2 correspondrait à environ "
-                                   f"**{_v2m*_f:.1f} km/h** ({pace_of(_v2m*_f)}) au lieu de "
+                                   f"**{_v2m*_fac_terrain:.1f} km/h** ({pace_of(_v2m*_fac_terrain)}) au lieu de "
                                    f"{_v2m:.1f} km/h ({pace_of(_v2m)})." if _v2m else ""))
                         else:
                             st.success("✅ Les deux échelles concordent : les allures issues du test sont "
@@ -8128,7 +8754,7 @@ with main_tabs[1]:
                     "Stabilité (CV %)": s["cv_pct"],
                     "Conf. seuils / dépense / substrats":
                         f"{s['conf_seuils']:.0f} / {s['conf_energie']:.0f} / {s['conf_substrats']:.0f} %",
-                } for s in _stages_met]), use_container_width=True, hide_index=True)
+                } for s in _stages_met]), width='stretch', hide_index=True)
                 if any(s["mode"] == "cho_exclusif" for s in _stages_met):
                     st.caption("⚠️ Paliers à RER > 1.00 : une partie du CO₂ provient du tamponnement des ions H⁺ "
                                "et non du métabolisme. L'app y bascule sur « glucides quasi exclusifs » et "
@@ -8153,7 +8779,7 @@ with main_tabs[1]:
                         "Autonomie sans manger": (seconds_to_hms(r["autonomie_h"] * 3600)
                                                   if r.get("autonomie_h") else "≥ 24 h"),
                         "Confiance": f"{r['confiance']:.0f} %" + (" (extrapolé)" if r["extrapole"] else ""),
-                    } for r in _plan_met]), use_container_width=True, hide_index=True)
+                    } for r in _plan_met]), width='stretch', hide_index=True)
                     st.markdown(
                         f'<div class="note-box">Réserves glycogéniques estimées : <b>{_pinfo["stores_g"]} g</b> '
                         f'({GLYCOGEN_G_PER_KG:.0f} g/kg), dont <b>{_pinfo["reserve_utile_g"]} g</b> réellement '
@@ -8320,7 +8946,7 @@ with main_tabs[1]:
                 "analyse — les références saisies à la main (sans fichier) n'ont pas de courbe d'allure à analyser.")
     else:
         df_bp = pd.DataFrame(_bp_rows)
-        st.dataframe(df_bp, use_container_width=True, hide_index=True)
+        st.dataframe(df_bp, width='stretch', hide_index=True)
 
         _valid = [r for r in _bp_rows if r["Qualité (R²)"] >= 0.3]
         if len(_valid) >= 2:
@@ -8353,7 +8979,7 @@ with main_tabs[1]:
 # ══════════════════════════════════════════════════════════════
 # ONGLET 2 — ANALYSE ENTRAÎNEMENT
 # ══════════════════════════════════════════════════════════════
-with main_tabs[2]:
+if _page == PAGES[2]:
     st.title("⚙️ Analyse d'entraînement")
     st.caption("Charge un fichier FIT, GPX, TCX ou CSV pour analyser une séance : FC, allure, dérive, intervalles.")
 
@@ -8474,7 +9100,7 @@ with main_tabs[2]:
                         "Δ FC": f"{q['derive_fc_bpm']:+.0f}" if q.get("derive_fc_bpm") is not None else "—",
                         "Cadence": q.get("cadence", "—"),
                     })
-                st.dataframe(pd.DataFrame(_rows_q), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_rows_q), width='stretch', hide_index=True)
                 _dv = _q_last.get("derive_vap_pct"); _da = _q_last.get("derive_allure_pct")
                 _dh = _q_last.get("derive_fc_bpm")
                 if _dv is not None and _dh is not None:
@@ -8574,7 +9200,7 @@ with main_tabs[2]:
                     "Allure": ((pace_str(z["allure_lo_s_km"]) + " – " + pace_str(z["allure_hi_s_km"]))
                                if z["allure_lo_s_km"] else "plus rapide que " + pace_str(z["allure_hi_s_km"])),
                     "Temps passé": seconds_to_hms(zz["temps_s"]), "% du temps": zz["pct"],
-                } for z, zz in zip(_zt, _zones_vc)]), use_container_width=True, hide_index=True)
+                } for z, zz in zip(_zt, _zones_vc)]), width='stretch', hide_index=True)
                 st.caption(f"Intensité médiane de la séance : **{_zinfo.get('pct_median', 0):.0f} % de la VC**. "
                            "Zones calibrées sur une mesure de terrain (la VC) plutôt que sur une FC max estimée.")
             else:
@@ -8778,7 +9404,7 @@ with main_tabs[2]:
                             "% marche": round(p["pct_walk"]) if p.get("pct_walk") is not None else "—",
                         })
                     df_tr = pd.DataFrame(rows_tr)
-                    st.dataframe(df_tr, use_container_width=True, hide_index=True)
+                    st.dataframe(df_tr, width='stretch', hide_index=True)
                     st.download_button("⬇️ Portions de terrain (CSV)",
                                        data=df_tr.to_csv(index=False).encode("utf-8"),
                                        file_name=f"portions_terrain_{train_file.name.split('.')[0]}.csv",
@@ -8833,7 +9459,7 @@ with main_tabs[2]:
                             "FC moy.":     f"{r['hr']['fc_avg']} bpm" if r["hr"].get("fc_avg") else "—",
                             "Dérive FC":   f"{r['hr']['drift_abs']:+.1f} bpm" if r["hr"].get("drift_abs") is not None else "—",
                         })
-                    st.dataframe(pd.DataFrame(rows_int), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rows_int), width='stretch', hide_index=True)
 
                     fig_int, ax_int = plt.subplots(figsize=(11, 4))
                     colors_int = CHART_CYCLE
@@ -8935,7 +9561,7 @@ with main_tabs[2]:
 # ══════════════════════════════════════════════════════════════
 # ONGLET 3 — ANALYSE DE COHORTE
 # ══════════════════════════════════════════════════════════════
-with main_tabs[3]:
+if _page == PAGES[3]:
     st.title("👥 Analyse de cohorte")
     st.caption("Centralise les splits de plusieurs coureurs sur une même course (Strava ou Live-trail), compare-les entre eux, et confronte-les à l'algorithme de prédiction calibré v8.1.")
 
@@ -9139,7 +9765,7 @@ with main_tabs[3]:
                         row[a["name"]] = seconds_to_hms(t) + (" (1er)" if t == min_t else f" (+{seconds_to_hms(t-min_t)})")
                     row["Moyenne"] = seconds_to_hms(sum(times)/len(times))
                     rows_cp.append(row)
-                st.dataframe(pd.DataFrame(rows_cp), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_cp), width='stretch', hide_index=True)
                 st.pyplot(plot_cohort_cp_chart(cohort_athletes_list, cohort_checkpoints_list))
 
             st.markdown("#### Détail par athlète")
@@ -9157,7 +9783,7 @@ with main_tabs[3]:
                                        "D+ seg (m)": sp["elev"], "FC": sp["hr"] if sp["hr"] else "—",
                                        "Écart vs allure moy.": ("+" if diff_sp>0 else "")+pace_str(abs(diff_sp))})
                     df_d = pd.DataFrame(rows_d)
-                    st.dataframe(df_d, use_container_width=True, hide_index=True, column_config={
+                    st.dataframe(df_d, width='stretch', hide_index=True, column_config={
                         "Écart vs allure moy.": st.column_config.TextColumn(
                             help="Différence entre l'allure de ce segment et l'allure MOYENNE de cet athlète sur toute "
                                  "la course (pas l'allure des autres athlètes). Négatif = segment couru plus vite que "
@@ -9258,7 +9884,7 @@ with main_tabs[3]:
                     diff_cp = t_real - t_pred
                     rows_cpc.append({"Checkpoint": cp["name"], "Km": cp["km"], "Réel": seconds_to_hms(t_real),
                                      "Prédit": seconds_to_hms(t_pred), "Écart": ("+" if diff_cp>0 else "-")+seconds_to_hms(abs(diff_cp))})
-                st.dataframe(pd.DataFrame(rows_cpc), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows_cpc), width='stretch', hide_index=True)
 
             st.markdown("#### Détail par segment")
             rows_seg = []
@@ -9268,7 +9894,7 @@ with main_tabs[3]:
                                  "Écart": ("+" if c["diff"]>0 else "")+pace_str(abs(c["diff"])),
                                  "Mult pente": round(c["gm"],3), "Mult fatigue": round(c["fm"],3), "Mult météo": round(c["tm"],3)})
             df_seg = pd.DataFrame(rows_seg)
-            st.dataframe(df_seg, use_container_width=True, hide_index=True)
+            st.dataframe(df_seg, width='stretch', hide_index=True)
             st.download_button("⬇️ Comparaison détaillée (CSV)", df_seg.to_csv(index=False).encode("utf-8"),
                                file_name=f"comparaison_algo_{cohort_selected['name']}.csv", key="cohort_dl_comparison")
 
@@ -9355,8 +9981,74 @@ with main_tabs[3]:
 # Lecture seule sur la base : aucun calcul n'est refait ici, on relit ce qui a
 # été enregistré au moment de l'analyse.
 # ══════════════════════════════════════════════════════════════
-with main_tabs[4]:
+if _page == PAGES[4]:
     st.title("📚 Historique")
+
+    # ── v10.1 : sauvegarde et restauration de TOUTE la base ──────────────
+    # Sur un hébergement gratuit, le disque de l'application est effacé à chaque
+    # redémarrage ou redéploiement. Ce bloc rend les données portables : un
+    # fichier que l'on télécharge, que l'on garde, et que l'on réinjecte.
+    with st.expander("💾 Sauvegarde de la base (à faire avant tout redéploiement)", expanded=False):
+        _c_b1, _c_b2 = st.columns(2)
+        with _c_b1:
+            st.markdown("**Sauvegarder**")
+            try:
+                _db_bytes = open(DB_PATH, "rb").read() if os.path.exists(DB_PATH) else b""
+            except Exception as _e_db:
+                _db_bytes = b""
+                st.error(f"Lecture impossible : {_e_db}")
+            if _db_bytes:
+                st.download_button(
+                    f"⬇️ Télécharger toute la base ({len(_db_bytes)/1024:.0f} Ko)",
+                    _db_bytes, file_name=f"coach_data_{date.today().isoformat()}.db",
+                    mime="application/octet-stream", key="dl_full_db")
+                st.caption("Contient athlètes, tests de VC, tests métaboliques, séances, courses et "
+                           "plans. C'est le fichier à conserver.")
+            else:
+                st.caption("Base vide ou introuvable — rien à sauvegarder pour l'instant.")
+        with _c_b2:
+            st.markdown("**Restaurer**")
+            _up_db = st.file_uploader("Fichier .db précédemment téléchargé", type=["db"],
+                                      key="restore_db_file")
+            if _up_db is not None:
+                _raw_db = _up_db.getvalue()
+                _ok_db, _msg_db = False, ""
+                try:                       # on vérifie que c'est bien une base SQLite lisible
+                    import tempfile as _tf
+                    with _tf.NamedTemporaryFile(suffix=".db", delete=False) as _tmp:
+                        _tmp.write(_raw_db); _tmp_path = _tmp.name
+                    with sqlite3.connect(_tmp_path) as _c_chk:
+                        _tables = {r[0] for r in _c_chk.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'")}
+                    _need = {"athletes", "vc_tests"}
+                    if _need.issubset(_tables):
+                        _ok_db = True
+                        _msg_db = f"{len(_tables)} tables reconnues."
+                    else:
+                        _msg_db = f"Tables attendues manquantes ({', '.join(sorted(_need - _tables))})."
+                except Exception as _e_chk:
+                    _msg_db = f"Fichier illisible : {_e_chk}"
+                if _ok_db:
+                    st.success(f"Fichier valide — {_msg_db}")
+                    st.warning("La restauration REMPLACE la base actuelle. Télécharge d'abord la "
+                               "sauvegarde ci-contre si tu veux la garder.")
+                    if st.checkbox("J'ai compris, remplacer la base actuelle", key="restore_db_ok") \
+                       and st.button("♻️ Restaurer maintenant", key="restore_db_btn"):
+                        try:
+                            db_backup("avant-restauration")
+                            with open(DB_PATH, "wb") as _f_db:
+                                _f_db.write(_raw_db)
+                            db_migrate()
+                            st.success("Base restaurée. Reconnecte-toi si besoin.")
+                            st.rerun()
+                        except Exception as _e_rst:
+                            st.error(f"Restauration impossible : {_e_rst}")
+                else:
+                    st.error(_msg_db)
+        st.caption(f"Emplacement actuel de la base : `{DB_PATH}` — modifiable avec la variable "
+                   f"d'environnement `COACH_DB_PATH` (utile si l'hébergeur fournit un disque "
+                   f"persistant).")
+
     _user = current_user()
     if _user is None:
         st.markdown('<div class="highlight-box">Connecte-toi dans la barre latérale pour retrouver '
@@ -9403,7 +10095,7 @@ with main_tabs[4]:
                     "K Riegel": round(r["k_riegel"], 3) if r["k_riegel"] else None,
                     "Réfs": r["n_refs"], "Notes": r["notes"] or "", "id": r["id"],
                 } for r in _vc])
-                st.dataframe(df_vc.drop(columns=["id"]), use_container_width=True, hide_index=True)
+                st.dataframe(df_vc.drop(columns=["id"]), width='stretch', hide_index=True)
 
                 _plot = [r for r in _vc if r.get("vc_ms")]
                 if len(_plot) >= 2:
@@ -9544,7 +10236,7 @@ with main_tabs[4]:
                     "Bascule (%)": round(r["trans_mid"], 1) if r["trans_mid"] is not None else None,
                     "VAP montée fin (%)": round(r["vap_last_montee"]) if r["vap_last_montee"] is not None else None,
                 } for r in _wk_f])
-                st.dataframe(df_wk, use_container_width=True, hide_index=True)
+                st.dataframe(df_wk, width='stretch', hide_index=True)
 
                 # ── évolution d'une mesure au choix ──────────────────────
                 _num_cols = {
@@ -9663,26 +10355,26 @@ with main_tabs[4]:
                             "D+ (m)": q.get("d_plus", "—"), "FC moy": q.get("fc_moy", "—"),
                             "Δ FC": f"{q['derive_fc_bpm']:+.0f}" if q.get("derive_fc_bpm") is not None else "—",
                             "Cadence": q.get("cadence", "—")} for q in _qq]),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                     if _rr_:
                         st.markdown("**Temps de maintien de cette séance**")
                         st.dataframe(pd.DataFrame([{
                             "Durée": seconds_to_hms(x["duree_s"]), "Distance (m)": x["distance_m"],
                             "Vitesse (km/h)": x["vitesse_kmh"], "Allure": pace_str(x["allure_s_km"]) + "/km",
                             "À partir de": seconds_to_hms(x["debut_s"])} for x in _rr_]),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                     if _zz:
                         st.markdown("**Zones cardiaques**")
                         st.dataframe(pd.DataFrame([{
                             "Zone": x["zone"], "Plage (bpm)": f"{x['bpm_min'] or '—'} – {x['bpm_max'] or '—'}",
                             "Temps": seconds_to_hms(x["temps_s"]), "% du temps": x["pct"]} for x in _zz]),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                     if _por:
                         st.markdown("**Portions de terrain enregistrées**")
-                        st.dataframe(pd.DataFrame(_por), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(_por), width='stretch', hide_index=True)
                     if _itv:
                         st.markdown("**Intervalles enregistrés**")
-                        st.dataframe(pd.DataFrame(_itv), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(_itv), width='stretch', hide_index=True)
                     _dc1, _dc2 = st.columns(2)
                     _cat_opts = ["— sans catégorie —"] + [c["name"] for c in _cats]
                     _cur_cat = _cat_by_id.get(_rec.get("category_id"), "— sans catégorie —")
@@ -9719,7 +10411,7 @@ with main_tabs[4]:
                              if (r["actual_s"] and r["predicted_s"]) else "—",
                     "id": r["id"],
                 } for r in _rc])
-                st.dataframe(df_rc.drop(columns=["id"]), use_container_width=True, hide_index=True)
+                st.dataframe(df_rc.drop(columns=["id"]), width='stretch', hide_index=True)
 
                 _done = [r for r in _rc if r.get("actual_s") and r.get("predicted_s")]
                 if len(_done) >= 2:
@@ -9763,17 +10455,17 @@ with main_tabs[4]:
                             "Départ": seconds_to_hms(c.get("depart_s", 0)),
                             "Allure segment": (pace_str(c["allure_segment_s_km"]) + "/km")
                                               if c.get("allure_segment_s_km") else "—"} for c in _cps]),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                     if _splits:
                         st.markdown("**Plan kilomètre par kilomètre (tel qu'enregistré)**")
                         df_sp = pd.DataFrame(_splits)
-                        st.dataframe(df_sp, use_container_width=True, hide_index=True, height=320)
+                        st.dataframe(df_sp, width='stretch', hide_index=True, height=320)
                         st.download_button("⬇️ Plan (CSV)", df_sp.to_csv(index=False).encode("utf-8"),
                                            file_name=f"plan_{(_rec_r['name'] or 'course').replace(' ','_')}.csv",
                                            key="hist_dl_plan")
                     if _cps and not (isinstance(_cps[0], dict) and "arrivee_s" in _cps[0]):
                         st.markdown("**Checkpoints (plan enregistré avant la feuille de route)**")
-                        st.dataframe(pd.DataFrame(_cps), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(_cps), width='stretch', hide_index=True)
                     with st.expander("⚙️ Paramètres du modèle utilisés"):
                         st.json(_params)
                     rr1, rr2, rr3 = st.columns(3)
@@ -9815,7 +10507,7 @@ with main_tabs[4]:
                     "FatMax (% VC)": round(r["fatmax_pct_vc"]) if r["fatmax_pct_vc"] else None,
                     "Économie (kcal/kg/km)": round(r["eco_kcal_kg_km"], 3) if r["eco_kcal_kg_km"] else None,
                     "Confiance": f"{r['confiance']:.0f} %" if r["confiance"] else "—",
-                } for r in _met]), use_container_width=True, hide_index=True)
+                } for r in _met]), width='stretch', hide_index=True)
 
                 _mplot = [r for r in _met if r.get("eco_kcal_kg_km") or r.get("fatmax_g_min")]
                 if len(_mplot) >= 2:
@@ -9869,7 +10561,7 @@ with main_tabs[4]:
                             "Lipides (g/min)": f"{x['fat_g_min']:.2f} [{x['fat_lo']:.2f}–{x['fat_hi']:.2f}]",
                             "kcal/h": x.get("kcal_h"), "kcal/kg/km": x.get("kcal_kg_km", "—"),
                             "Confiance": f"{x['confiance']:.0f} %"} for x in _st_m]),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                     if _fu_m:
                         st.markdown("**Plan nutritionnel enregistré**")
                         st.dataframe(pd.DataFrame([{
@@ -9880,7 +10572,7 @@ with main_tabs[4]:
                             "Apport conseillé (g/h)": x["apport_g_h"], "Déficit (g/h)": x["deficit_g_h"],
                             "Autonomie": f"{x['autonomie_h']} h" if x.get("autonomie_h") else "≥ 24 h",
                             "Confiance": f"{x['confiance']:.0f} %"} for x in _fu_m]),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                         st.download_button("⬇️ Plan nutritionnel (CSV)",
                                            pd.DataFrame(_fu_m).to_csv(index=False).encode("utf-8"),
                                            file_name=f"plan_nutrition_{_aname.replace(' ', '_')}.csv",
@@ -9938,3 +10630,122 @@ with main_tabs[4]:
                         st.success("Athlète supprimé."); st.rerun()
                     else:
                         st.error("Le nom saisi ne correspond pas.")
+
+# ══════════════════════════════════════════════════════════════
+# ONGLET 6 — AUDIT DES DONNÉES
+# Tout ce que produit l'app descend de quelques tests. Cet onglet remonte la
+# chaîne : il dit ce qui est faux, ce que ça contamine, et dans quel ordre
+# corriger. À lire AVANT de programmer quoi que ce soit.
+# ══════════════════════════════════════════════════════════════
+if _page == PAGES[5]:
+    st.title("🩺 Audit des données")
+    st.markdown(
+        '<div class="note-box">Une vitesse critique fausse ne provoque aucune erreur : elle se propage '
+        'en silence dans les zones, la nutrition et les simulations de séance. Cet onglet fait tourner '
+        'tous les contrôles croisés disponibles, les classe par <b>ce qu\'ils contaminent</b>, et donne '
+        'pour chacun le protocole exact du test à refaire.</div>', unsafe_allow_html=True)
+
+    _a_refs = st.session_state.get("refs_fit_vc") or []
+    _a_vc = st.session_state.get("vc_ms")
+    _a_dp = st.session_state.get("d_prime")
+    _a_r2 = st.session_state.get("r2_vc")
+    _a_stages = st.session_state.get("_audit_stages_met")
+    _a_infos = st.session_state.get("_audit_infos_met")
+    _a_thr = (_a_infos or {}).get("seuils")
+    _a_cal = calage_terrain(_a_stages, _a_refs) if (_a_stages and _a_refs) else None
+
+    _sources = []
+    _sources.append(("Tests de référence (VC / D′)", len(_a_refs),
+                     "onglet 🧪 Tests d'endurance, section 01-02"))
+    _sources.append(("Test au masque (seuils, substrats)", 1 if _a_infos else 0,
+                     "onglet 🧪 Tests d'endurance, section 03"))
+    st.dataframe(pd.DataFrame([{
+        "Source de données": n, "Chargée": ("✅ oui" if c else "— non"),
+        "Où la charger": w,
+    } for n, c, w in _sources]), width='stretch', hide_index=True)
+
+    if not _a_refs and not _a_infos:
+        st.info("Charge au moins un test dans l'onglet 🧪 **Tests d'endurance + VC** : l'audit se "
+                "remplit tout seul ensuite. Il ne recalcule rien, il relit ce qui a déjà été analysé.")
+    else:
+        _find, _syn = audit_athlete(_a_refs, _a_vc, _a_dp, _a_r2, _a_thr, _a_infos, _a_cal)
+        kpi_row([
+            ("Confiance globale", f"{_syn['score']} / 100",
+             ("aucune incohérence détectée" if not _find else
+              f"{_syn['n_bloquant']} bloquant · {_syn['n_important']} important · "
+              f"{_syn['n_mineur']} mineur")),
+            ("À corriger en premier",
+             (_syn["premier"]["titre"][:38] + "…") if _syn.get("premier") else "—",
+             (_syn["premier"]["domaine"] if _syn.get("premier") else "rien à signaler")),
+            ("Sorties contaminées", f"{len(_syn['contamines'])} / {len(AUDIT_SORTIES)}",
+             ", ".join(_syn["contamines"][:4]) + ("…" if len(_syn["contamines"]) > 4 else "")
+             if _syn["contamines"] else "aucune"),
+            ("Sorties fiables", f"{len(_syn['sains'])} / {len(AUDIT_SORTIES)}",
+             ", ".join(_syn["sains"][:4]) + ("…" if len(_syn["sains"]) > 4 else "")
+             if _syn["sains"] else "aucune pour l'instant"),
+        ])
+        if _syn["n_bloquant"]:
+            st.error(f"🚨 {_syn['verdict']}")
+        elif _syn["n_important"]:
+            st.warning(f"⚠️ {_syn['verdict']}")
+        else:
+            st.success(f"✅ {_syn['verdict']}")
+
+        _fig_a = plot_audit(_find, _syn)
+        if _fig_a is not None:
+            st.pyplot(_fig_a); plt.close("all")
+
+        if _find:
+            st.markdown("#### 📋 Dans quel ordre corriger")
+            st.caption("Classé par gravité, puis par le nombre de sorties touchées. Corriger le n° 1 "
+                       "suffit souvent à faire disparaître plusieurs alertes en dessous.")
+            _icone = {"bloquant": "🚨", "important": "⚠️", "mineur": "ℹ️"}
+            for _fd in _find:
+                with st.expander(f"{_icone.get(_fd['gravite'], '•')} **{_fd['rang']}. {_fd['titre']}** "
+                                 f"— {_fd['domaine']} · contamine "
+                                 f"{', '.join(_fd['contamine']) if _fd['contamine'] else '—'}",
+                                 expanded=(_fd["rang"] <= 2)):
+                    st.markdown(f"**Constat.** {_fd['constat']}")
+                    st.markdown(f"**Ce que ça fausse.** {_fd['consequence']}")
+                    st.markdown(f'<div class="note-box note-red"><b>À faire.</b> {_fd["action"]}</div>',
+                                unsafe_allow_html=True)
+
+            st.markdown("#### 📄 Fiche à emporter")
+            _fiche = [f"AUDIT DES DONNÉES — {current_athlete_name() or 'athlète'} — "
+                      f"{date.today().isoformat()}",
+                      f"Confiance globale : {_syn['score']}/100",
+                      f"{_syn['verdict']}", ""]
+            if _syn["contamines"]:
+                _fiche.append("À NE PAS UTILISER POUR PROGRAMMER : " + ", ".join(_syn["contamines"]))
+            if _syn["sains"]:
+                _fiche.append("UTILISABLE : " + ", ".join(_syn["sains"]))
+            _fiche.append("")
+            for _fd in _find:
+                _fiche += [f"{_fd['rang']}. [{_fd['gravite'].upper()}] {_fd['titre']}",
+                           f"   Constat  : {_fd['constat']}",
+                           f"   Fausse   : {_fd['consequence']}",
+                           f"   À faire  : {_fd['action']}", ""]
+            _txt_fiche = "\n".join(_fiche)
+            st.download_button("⬇️ Télécharger la fiche (texte)", _txt_fiche,
+                               file_name=f"audit_{(current_athlete_name() or 'athlete').replace(' ', '_')}"
+                                         f"_{date.today().isoformat()}.txt",
+                               mime="text/plain", key="audit_dl")
+            with st.expander("Aperçu de la fiche"):
+                st.code(_txt_fiche, language=None)
+        else:
+            st.success("Aucune incohérence détectée sur les données chargées.")
+
+        st.markdown("---")
+        st.markdown("#### 🧪 Le protocole qui rend tout fiable")
+        st.markdown(
+            '<div class="note-box">Deux séances suffisent à assainir toute la chaîne.<br><br>'
+            '<b>Séance 1 — vitesse critique.</b> Échauffement 20 min. Puis <b>3 min à fond</b>, départ '
+            'lancé, sur piste, en visant la distance maximale (pas un temps). Récupération complète '
+            '(20 min très facile). Puis <b>12 à 15 min à fond</b>, même exigence. Les deux dans la même '
+            'séance ou à 48 h d\'écart, mais toujours frais. C\'est le rapport entre les deux qui donne '
+            'D′ — un test court retenu écrase D′ et fausse tout le reste.<br><br>'
+            '<b>Séance 2 — masque.</b> Démarre <b>2 à 3 paliers plus bas</b> que d\'habitude : la '
+            'ventilation du premier palier doit être autour de 35-45 L/min, pas 60. Paliers de 3 min '
+            'plutôt qu\'une minute si tu veux exploiter les substrats. Et chronomètre le tapis sur une '
+            'distance connue avant de commencer, pour vérifier son étalonnage.</div>',
+            unsafe_allow_html=True)
